@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Makaretu.Dns.Multicast.New" Version="0.38.0" />
+    <PackageReference Include="Zeroconf" Version="3.7.16" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.2" />
+  </ItemGroup>
+</Project>

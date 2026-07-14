@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Streamsemble.Host</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Streamsemble.Core/Streamsemble.Core.csproj" />
+    <ProjectReference Include="../Streamsemble.Spotify/Streamsemble.Spotify.csproj" />
+    <ProjectReference Include="../Streamsemble.Cast.Stub/Streamsemble.Cast.Stub.csproj" />
+    <ProjectReference Include="../Streamsemble.AirPlay.Sender/Streamsemble.AirPlay.Sender.csproj" />
+    <ProjectReference Include="../Streamsemble.AirPlay.Receiver/Streamsemble.AirPlay.Receiver.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

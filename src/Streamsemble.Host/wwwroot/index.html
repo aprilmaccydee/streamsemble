@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Streamsemble</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --line:#2a2f3a; --fg:#e8eaed; --muted:#9aa0ac; --accent:#4f8cff; --on:#2ecc71; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+    header { padding:20px 24px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
+    header h1 { margin:0; font-size:20px; letter-spacing:.3px; }
+    header .sub { color:var(--muted); font-size:13px; }
+    main { max-width:760px; margin:0 auto; padding:24px; display:grid; gap:20px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; }
+    .card h2 { margin:0 0 14px; font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
+    .now { display:flex; flex-direction:column; gap:4px; }
+    .now .title { font-size:18px; font-weight:600; }
+    .now .artist { color:var(--muted); }
+    .now .src { display:inline-block; margin-top:6px; font-size:12px; color:var(--accent); }
+    .speaker { display:flex; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--line); }
+    .speaker:first-of-type { border-top:none; }
+    .speaker label { flex:1; cursor:pointer; }
+    .speaker .host { color:var(--muted); font-size:12px; }
+    .speaker .badge { font-size:11px; padding:2px 8px; border-radius:99px; background:#0d3d22; color:var(--on); border:1px solid #17512f; }
+    .speaker .proto { font-size:10px; padding:1px 6px; border-radius:99px; background:#1e2635; color:var(--muted); border:1px solid var(--line); vertical-align:2px; }
+    input[type=checkbox] { width:20px; height:20px; accent-color:var(--accent); cursor:pointer; }
+    .empty { color:var(--muted); font-style:italic; padding:8px 0; }
+    .vol { display:flex; align-items:center; gap:14px; }
+    .vol input[type=range] { flex:1; accent-color:var(--accent); }
+    .vol .pct { width:44px; text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; }
+    .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--muted); margin-right:6px; }
+    .dot.live { background:var(--on); box-shadow:0 0 8px var(--on); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Streamsemble</h1>
+    <span class="sub">multi-room audio hub</span>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Now playing</h2>
+      <div class="now" id="now">
+        <div class="empty">Nothing playing. Cast from Spotify, AirPlay, or another source.</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Volume</h2>
+      <div class="vol">
+        <input type="range" id="vol" min="0" max="100" value="50" />
+        <span class="pct" id="volpct">50%</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Output speakers <span id="scanning" class="sub" style="text-transform:none;letter-spacing:0"></span></h2>
+      <div id="speakers"><div class="empty">Searching for AirPlay speakers…</div></div>
+    </section>
+  </main>
+
+  <script>
+    let selectedIds = new Set();
+    let protocols = {};   // speaker id → detected protocol from /api/state
+    let volDragging = false;
+    const $ = (id) => document.getElementById(id);
+
+    async function postTargets() {
+      const targets = [...selectedIds].map(name => ({ name, protocol: protocols[name] || "Auto" }));
+      await fetch("/api/targets", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targets })
+      });
+      refresh();
+    }
+
+    async function postVolume(v) {
+      await fetch("/api/volume", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ volume: v })
+      });
+    }
+
+    function renderNow(s) {
+      const el = $("now");
+      const np = s.nowPlaying || {};
+      if (!s.activeSource && !np.title) {
+        el.innerHTML = '<div class="empty">Nothing playing. Cast from Spotify, AirPlay, or another source.</div>';
+        return;
+      }
+      el.innerHTML = `
+        <div class="title">${escapeHtml(np.title || "—")}</div>
+        <div class="artist">${escapeHtml([np.artist, np.album].filter(Boolean).join(" · ") || "")}</div>
+        <div class="src"><span class="dot ${s.activeSource ? "live" : ""}"></span>${escapeHtml(s.activeSource || "idle")}</div>`;
+    }
+
+    function renderSpeakers(s) {
+      const connected = new Set((s.connected || []).map(x => x.toLowerCase()));
+      const el = $("speakers");
+      const list = s.discovered || [];
+      if (list.length === 0) {
+        el.innerHTML = '<div class="empty">No AirPlay speakers found yet. Make sure they are on the same network.</div>';
+        return;
+      }
+      protocols = Object.fromEntries(list.map(sp => [sp.id, sp.protocol || "Auto"]));
+      el.innerHTML = list.map(sp => {
+        const checked = selectedIds.has(sp.id) ? "checked" : "";
+        const live = connected.has(sp.name.toLowerCase()) ? '<span class="badge">connected</span>' : "";
+        const proto = sp.protocol === "AirPlay2" ? "AirPlay 2" : "RAOP";
+        const safe = escapeHtml(sp.id).replace(/"/g, "&quot;");
+        return `<div class="speaker">
+          <input type="checkbox" id="sp_${cssId(sp.id)}" data-id="${safe}" ${checked} />
+          <label for="sp_${cssId(sp.id)}"><div>${escapeHtml(sp.name)} <span class="proto">${proto}</span></div><div class="host">${escapeHtml(sp.host)}:${sp.port}</div></label>
+          ${live}
+        </div>`;
+      }).join("");
+      el.querySelectorAll('input[type=checkbox]').forEach(cb => {
+        cb.addEventListener("change", () => {
+          const id = cb.dataset.id;
+          if (cb.checked) selectedIds.add(id); else selectedIds.delete(id);
+          postTargets();
+        });
+      });
+    }
+
+    async function refresh() {
+      try {
+        const s = await (await fetch("/api/state")).json();
+        // Keep selection in sync with server on first load / external change.
+        if (!window._selInit) {
+          selectedIds = new Set((s.selected || []).map(t => t.name).filter(Boolean));
+          window._selInit = true;
+        }
+        renderNow(s);
+        renderSpeakers(s);
+        if (!volDragging) {
+          const pct = Math.round((s.volume ?? 0.5) * 100);
+          $("vol").value = pct; $("volpct").textContent = pct + "%";
+        }
+      } catch (e) { /* transient */ }
+    }
+
+    $("vol").addEventListener("input", () => {
+      volDragging = true;
+      $("volpct").textContent = $("vol").value + "%";
+    });
+    $("vol").addEventListener("change", async () => {
+      await postVolume($("vol").value / 100);
+      volDragging = false;
+    });
+
+    function escapeHtml(s) { return (s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
+    function cssId(s) { return s.replace(/[^a-z0-9]/gi, "_"); }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

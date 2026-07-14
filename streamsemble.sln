@@ -1,0 +1,99 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{A8D12931-E547-4270-B22A-0F444E118428}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.AirPlay.Common", "src\Streamsemble.AirPlay.Common\Streamsemble.AirPlay.Common.csproj", "{F518282F-4BD3-4FF4-9AAD-4DADF0794665}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.AirPlay.Receiver", "src\Streamsemble.AirPlay.Receiver\Streamsemble.AirPlay.Receiver.csproj", "{B3E7BC74-6132-4632-A60F-799E44F25AE3}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.AirPlay.Sender", "src\Streamsemble.AirPlay.Sender\Streamsemble.AirPlay.Sender.csproj", "{A146BF7F-00F8-4096-9F36-2A0D8F91437B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Cast.Stub", "src\Streamsemble.Cast.Stub\Streamsemble.Cast.Stub.csproj", "{54B68690-BEDE-489F-87E2-836CBB49E9DB}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Core", "src\Streamsemble.Core\Streamsemble.Core.csproj", "{0ADC8BD0-CBA3-4A46-BD41-E7D42AD03201}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Discovery", "src\Streamsemble.Discovery\Streamsemble.Discovery.csproj", "{42369871-E23E-4088-B948-60A1B5599AFB}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Host", "src\Streamsemble.Host\Streamsemble.Host.csproj", "{1F0E1CCE-9B72-4EE8-96D2-F54E411D775F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Spotify", "src\Streamsemble.Spotify\Streamsemble.Spotify.csproj", "{D51B5CB1-5622-4AC9-A22E-E17E0CA1BB79}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Timing", "src\Streamsemble.Timing\Streamsemble.Timing.csproj", "{74D4BBEA-F687-4747-8FB5-6992EB695CD6}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{8B9A5A21-8812-494B-9282-46E103C7E317}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.AirPlay.Tests", "tests\Streamsemble.AirPlay.Tests\Streamsemble.AirPlay.Tests.csproj", "{A91BD999-B342-42A0-B87C-ACD163818B8A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Core.Tests", "tests\Streamsemble.Core.Tests\Streamsemble.Core.Tests.csproj", "{F5D83816-6C0F-40FD-9D0C-66332483D863}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F518282F-4BD3-4FF4-9AAD-4DADF0794665}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F518282F-4BD3-4FF4-9AAD-4DADF0794665}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F518282F-4BD3-4FF4-9AAD-4DADF0794665}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F518282F-4BD3-4FF4-9AAD-4DADF0794665}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B3E7BC74-6132-4632-A60F-799E44F25AE3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B3E7BC74-6132-4632-A60F-799E44F25AE3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B3E7BC74-6132-4632-A60F-799E44F25AE3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B3E7BC74-6132-4632-A60F-799E44F25AE3}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A146BF7F-00F8-4096-9F36-2A0D8F91437B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A146BF7F-00F8-4096-9F36-2A0D8F91437B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A146BF7F-00F8-4096-9F36-2A0D8F91437B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A146BF7F-00F8-4096-9F36-2A0D8F91437B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{54B68690-BEDE-489F-87E2-836CBB49E9DB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{54B68690-BEDE-489F-87E2-836CBB49E9DB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{54B68690-BEDE-489F-87E2-836CBB49E9DB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{54B68690-BEDE-489F-87E2-836CBB49E9DB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0ADC8BD0-CBA3-4A46-BD41-E7D42AD03201}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0ADC8BD0-CBA3-4A46-BD41-E7D42AD03201}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0ADC8BD0-CBA3-4A46-BD41-E7D42AD03201}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0ADC8BD0-CBA3-4A46-BD41-E7D42AD03201}.Release|Any CPU.Build.0 = Release|Any CPU
+		{42369871-E23E-4088-B948-60A1B5599AFB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{42369871-E23E-4088-B948-60A1B5599AFB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{42369871-E23E-4088-B948-60A1B5599AFB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{42369871-E23E-4088-B948-60A1B5599AFB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1F0E1CCE-9B72-4EE8-96D2-F54E411D775F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1F0E1CCE-9B72-4EE8-96D2-F54E411D775F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1F0E1CCE-9B72-4EE8-96D2-F54E411D775F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1F0E1CCE-9B72-4EE8-96D2-F54E411D775F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D51B5CB1-5622-4AC9-A22E-E17E0CA1BB79}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D51B5CB1-5622-4AC9-A22E-E17E0CA1BB79}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D51B5CB1-5622-4AC9-A22E-E17E0CA1BB79}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D51B5CB1-5622-4AC9-A22E-E17E0CA1BB79}.Release|Any CPU.Build.0 = Release|Any CPU
+		{74D4BBEA-F687-4747-8FB5-6992EB695CD6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{74D4BBEA-F687-4747-8FB5-6992EB695CD6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{74D4BBEA-F687-4747-8FB5-6992EB695CD6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{74D4BBEA-F687-4747-8FB5-6992EB695CD6}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A91BD999-B342-42A0-B87C-ACD163818B8A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A91BD999-B342-42A0-B87C-ACD163818B8A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A91BD999-B342-42A0-B87C-ACD163818B8A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A91BD999-B342-42A0-B87C-ACD163818B8A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F5D83816-6C0F-40FD-9D0C-66332483D863}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F5D83816-6C0F-40FD-9D0C-66332483D863}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F5D83816-6C0F-40FD-9D0C-66332483D863}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F5D83816-6C0F-40FD-9D0C-66332483D863}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{F518282F-4BD3-4FF4-9AAD-4DADF0794665} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{B3E7BC74-6132-4632-A60F-799E44F25AE3} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{A146BF7F-00F8-4096-9F36-2A0D8F91437B} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{54B68690-BEDE-489F-87E2-836CBB49E9DB} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{0ADC8BD0-CBA3-4A46-BD41-E7D42AD03201} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{42369871-E23E-4088-B948-60A1B5599AFB} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{1F0E1CCE-9B72-4EE8-96D2-F54E411D775F} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{D51B5CB1-5622-4AC9-A22E-E17E0CA1BB79} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{74D4BBEA-F687-4747-8FB5-6992EB695CD6} = {A8D12931-E547-4270-B22A-0F444E118428}
+		{A91BD999-B342-42A0-B87C-ACD163818B8A} = {8B9A5A21-8812-494B-9282-46E103C7E317}
+		{F5D83816-6C0F-40FD-9D0C-66332483D863} = {8B9A5A21-8812-494B-9282-46E103C7E317}
+	EndGlobalSection
+EndGlobal

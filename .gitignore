@@ -1,0 +1,22 @@
+bin/
+obj/
+recordings/
+*.user
+.DS_Store
+
+# Local debugging artifacts: packet captures, session logs, mic recordings.
+# These contain home-network details (device IDs, hostnames, pairing traffic)
+# and must never be published.
+debug/
+*.pcap
+*.log
+*.wav
+*.aacdump
+
+# Local pairing/identity state (normally in ~/.streamsemble, but never commit)
+homekit-pairings.json
+pin.txt
+
+# librespot cache/credentials if ever pointed into the repo
+credentials.json
+.librespot/
