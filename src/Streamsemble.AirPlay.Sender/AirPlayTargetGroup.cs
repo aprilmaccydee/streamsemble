@@ -70,6 +70,71 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _gmClock = gmClockArg;
         _logger = loggerArg;
         _selectedTargets.Changed += (_, _) => _ = ReconcileAsync(CancellationToken.None);
+        _ = HealthLoopAsync(_lifetime.Token);
+    }
+
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly Dictionary<string, DateTimeOffset> _retryAt = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Self-healing: a network stall (the WireGuard tunnel re-routing, a Wi-Fi
+    /// hiccup) kills every speaker session at once and nothing used to rebuild
+    /// them until the next source change. Sweep for sessions that observed
+    /// their own death, dispose them, and re-run the connect batch — which
+    /// re-anchors everything — while audio is flowing. Failed reconnects back
+    /// off so an unreachable speaker isn't hammered.
+    /// </summary>
+    private async Task HealthLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                List<KeyValuePair<string, ITargetSession>> dead;
+                lock (_gate)
+                {
+                    dead = _sessions.Where(kv => !kv.Value.IsAlive).ToList();
+                }
+
+                foreach (var (key, session) in dead)
+                {
+                    lock (_gate)
+                    {
+                        _sessions.Remove(key);
+                    }
+
+                    _logger.LogWarning("{Name}: session dead — will reconnect", session.DisplayName);
+                    try
+                    {
+                        session.Dispose();
+                    }
+                    catch
+                    {
+                        // Already broken; nothing useful to do.
+                    }
+
+                    if (session.RequiresPtp)
+                    {
+                        _gmClock.RemovePeer(session.DeviceAddress);
+                    }
+                }
+
+                bool anyMissing;
+                lock (_gate)
+                {
+                    anyMissing = _selectedTargets.Current.Any(t => !_sessions.ContainsKey(TargetKey(t)));
+                }
+
+                if (Streaming && anyMissing)
+                {
+                    await ReconcileAsync(ct).ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
     /// <summary>Display names of speakers currently connected and receiving audio.</summary>
@@ -211,12 +276,14 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
             foreach (var (key, target) in desired)
             {
                 bool present;
+                bool backingOff;
                 lock (_gate)
                 {
                     present = _sessions.ContainsKey(key);
+                    backingOff = _retryAt.TryGetValue(key, out var at) && at > DateTimeOffset.UtcNow;
                 }
 
-                if (!present)
+                if (!present && !backingOff)
                 {
                     missing.Add((key, target));
                 }
@@ -248,6 +315,21 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 var connected = await Task.WhenAll(missing.Select(async m =>
                     (m.Key, Session: await ConnectOneAsync(m.Target, ct, scan).ConfigureAwait(false)))).ConfigureAwait(false);
                 var joined = connected.Where(c => c.Session is not null).ToList();
+
+                lock (_gate)
+                {
+                    foreach (var (key, session) in connected)
+                    {
+                        if (session is null)
+                        {
+                            _retryAt[key] = DateTimeOffset.UtcNow.AddSeconds(15);
+                        }
+                        else
+                        {
+                            _retryAt.Remove(key);
+                        }
+                    }
+                }
 
                 // Serve OUR grandmaster clock to every joiner BEFORE audio
                 // flows — speakers won't render until timing is established,
@@ -843,5 +925,9 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _logger.LogInformation("AirPlay stream stopped");
     }
 
-    public async ValueTask DisposeAsync() => await StopStreamAsync().ConfigureAwait(false);
+    public async ValueTask DisposeAsync()
+    {
+        _lifetime.Cancel();
+        await StopStreamAsync().ConfigureAwait(false);
+    }
 }

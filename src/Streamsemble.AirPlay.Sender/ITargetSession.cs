@@ -23,6 +23,14 @@ public interface ITargetSession : IDisposable
     bool RequiresPtp { get; }
 
     /// <summary>
+    /// False once the session has observed its own death (event channel
+    /// closed, keepalives failing, audio transport gone) — the group's health
+    /// loop disposes it and reconnects. Default true for sessions that don't
+    /// track health.
+    /// </summary>
+    bool IsAlive => true;
+
+    /// <summary>
     /// Builds this device's on-wire datagram from the shared 12-byte RTP header
     /// and the raw PCM payload. RAOP wraps the PCM as AES-encrypted ALAC;
     /// AirPlay 2 sends ChaCha20-encrypted PCM — same header and timing for both.

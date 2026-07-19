@@ -33,6 +33,9 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     public IPAddress DeviceAddress { get; } = address;
     public bool RequiresPtp => true;
 
+    /// <summary>Set false at any observed death: the health loop reconnects us.</summary>
+    public bool IsAlive { get; private set; } = true;
+
     /// <summary>
     /// Buffered (type 103, AAC over TCP) vs realtime (type 96, ALAC over UDP).
     /// Decided during connect: config override, else /info audioLatencies —
@@ -352,6 +355,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 if (!await ReadExactAsync(stream, lengthHeader).ConfigureAwait(false))
                 {
                     logger.LogInformation("{Name}: event channel closed by receiver", DisplayName);
+                    IsAlive = false;
                     return;
                 }
 
@@ -360,6 +364,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 if (!await ReadExactAsync(stream, body).ConfigureAwait(false))
                 {
                     logger.LogInformation("{Name}: event channel closed mid-frame", DisplayName);
+                    IsAlive = false;
                     return;
                 }
 
@@ -909,6 +914,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         catch (Exception ex)
         {
             logger.LogWarning(ex, "{Name}: buffered audio pump stopped", DisplayName);
+            IsAlive = false;
         }
     }
 
@@ -1100,6 +1106,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
                 if (failures > 5)
                 {
+                    IsAlive = false;
                     return;
                 }
             }
