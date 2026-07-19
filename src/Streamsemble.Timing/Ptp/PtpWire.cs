@@ -173,6 +173,106 @@ public static class PtpWire
         return packet;
     }
 
+    // --- Grandmaster builders (receiver role) -------------------------------
+    //
+    // A real Mac sender only streams once the receiver's clock is visible, and
+    // its PTP stack is stricter than the speakers ours interops with above:
+    // every field below mirrors the living-room TV's grandmaster wire shape
+    // from debug/airplay-buffered/mac-to-tv-buffered-session.pcap (gPTP
+    // majorSdoId nibble, PTP_UNICAST|PTP_TWO_STEP flags, source port 32768,
+    // priority 248 announce with path-trace TLV), which that Mac slaved to.
+
+    private const ushort GmFlags = 0x0600; // PTP_UNICAST | PTP_TWO_STEP
+    private const ushort GmPortNumber = 32768;
+    public const byte GmPriority1 = 248;   // beats a Mac's 250, so we stay grandmaster
+
+    private static void WriteGmHeader(Span<byte> buf, PtpMessageType type, ushort sequenceId, ReadOnlySpan<byte> clockIdentity, ushort messageLength, sbyte logInterval)
+    {
+        WriteHeader(buf, type, sequenceId, clockIdentity, messageLength, GmFlags);
+        buf[0] = (byte)(0x10 | (byte)type); // majorSdoId 1: gPTP domain
+        BinaryPrimitives.WriteUInt16BigEndian(buf[28..], GmPortNumber);
+        buf[33] = (byte)logInterval;
+    }
+
+    /// <summary>Grandmaster Sync (event port): two-step, 8 Hz cadence.</summary>
+    public static byte[] BuildGmSync(ushort seq, ReadOnlySpan<byte> clockId)
+    {
+        var packet = new byte[44];
+        WriteGmHeader(packet, PtpMessageType.Sync, seq, clockId, 44, logInterval: -3);
+        return packet;
+    }
+
+    /// <summary>Grandmaster Follow_Up (general port): precise origin timestamp + gPTP Follow-Up Info TLV.</summary>
+    public static byte[] BuildGmFollowUp(ushort seq, ReadOnlySpan<byte> clockId, ulong seconds, uint nanos)
+    {
+        var tlv = BuildFollowUpInfoTlv();
+        var packet = new byte[44 + tlv.Length];
+        WriteGmHeader(packet, PtpMessageType.FollowUp, seq, clockId, (ushort)(44 + tlv.Length), logInterval: -3);
+        WriteTimestamp(packet.AsSpan(34), seconds, nanos);
+        tlv.CopyTo(packet.AsSpan(44));
+        return packet;
+    }
+
+    /// <summary>Grandmaster Delay_Resp (general port): echoes the slave's sequence + port identity with our receive timestamp.</summary>
+    public static byte[] BuildGmDelayResp(ReadOnlySpan<byte> delayReq, ReadOnlySpan<byte> clockId, ulong seconds, uint nanos)
+    {
+        var packet = new byte[54];
+        WriteGmHeader(packet, PtpMessageType.DelayResp, ParseSequence(delayReq), clockId, 54, logInterval: 0);
+        WriteTimestamp(packet.AsSpan(34), seconds, nanos);
+        delayReq[20..30].CopyTo(packet.AsSpan(44)); // requestingPortIdentity
+        return packet;
+    }
+
+    /// <summary>
+    /// Grandmaster Announce (general port): priority1/clockClass/priority2 all
+    /// 248 by default (TV-exact), path-trace TLV. Pass a lower priority1 to
+    /// out-rank receivers that themselves announce at 248 (Sonos, the TV) —
+    /// a 248-vs-248 tie falls to clock-identity comparison, which we can lose.
+    /// </summary>
+    public static byte[] BuildGmAnnounce(ushort seq, ReadOnlySpan<byte> clockId, byte priority1 = GmPriority1)
+    {
+        var packet = new byte[76];
+        WriteGmHeader(packet, PtpMessageType.Announce, seq, clockId, 76, logInterval: 0);
+        // 34..44 origin timestamp = 0; 44..46 currentUtcOffset = 0
+        packet[47] = priority1;
+        packet[48] = 248;  // grandmasterClockClass
+        packet[49] = 0xFE; // grandmasterClockAccuracy: unknown
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(50), 17258); // grandmasterClockVariance
+        packet[52] = 248;  // priority2
+        clockId[..8].CopyTo(packet.AsSpan(53)); // grandmaster identity
+        // 61..63 stepsRemoved = 0
+        packet[63] = 0xA0; // timeSource: internal oscillator
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(64), 0x0008); // path trace TLV
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(66), 8);
+        clockId[..8].CopyTo(packet.AsSpan(68));
+        return packet;
+    }
+
+    /// <summary>
+    /// Grandmaster Signaling (general port), sent alongside every Announce like
+    /// the TV does: message-interval request asking the slave for 8 Hz sync and
+    /// no announces (interval -128), zeroed target port identity.
+    /// </summary>
+    public static byte[] BuildGmSignaling(ushort seq, ReadOnlySpan<byte> clockId)
+    {
+        // TV-exact interval-request TLV: lengthField 12 (trailing 2 reserved
+        // bytes the sender-side builder omits).
+        var tlv = new byte[16];
+        BinaryPrimitives.WriteUInt16BigEndian(tlv, 0x0003);
+        BinaryPrimitives.WriteUInt16BigEndian(tlv.AsSpan(2), 12);
+        OrgGptp.CopyTo(tlv, 4);
+        tlv[7] = 0x00; tlv[8] = 0x00; tlv[9] = 0x02; // subtype Message Interval Request
+        tlv[10] = 0;              // linkDelayInterval
+        tlv[11] = unchecked((byte)(sbyte)-3);   // timeSyncInterval: 8 Hz
+        tlv[12] = unchecked((byte)(sbyte)-128); // announceInterval: stop
+        tlv[13] = 0x03;
+        var packet = new byte[44 + tlv.Length];
+        WriteGmHeader(packet, PtpMessageType.Signaling, seq, clockId, (ushort)(44 + tlv.Length), logInterval: 127);
+        // 34..44 target port identity: zeros
+        tlv.CopyTo(packet.AsSpan(44));
+        return packet;
+    }
+
     private static byte[] BuildFollowUpInfoTlv()
     {
         var buf = new byte[4 + 28];

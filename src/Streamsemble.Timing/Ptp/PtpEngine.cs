@@ -1,6 +1,6 @@
 using System.Diagnostics;
 using System.Net;
-using System.Net.Sockets;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 
 namespace Streamsemble.Timing.Ptp;
@@ -25,8 +25,8 @@ public sealed class PtpEngine : IDisposable
     private readonly byte[] _clockId;
     private readonly object _gate = new();
 
-    private Socket? _event;   // UDP 319
-    private Socket? _general; // UDP 320
+    private PtpPortMux? _mux;
+    private PtpPortMux.Consumer? _consumer;
     private CancellationTokenSource? _cts;
 
     // Shared slave-loop state (guarded by _gate).
@@ -101,22 +101,20 @@ public sealed class PtpEngine : IDisposable
 
     public static long NowUnixNanos() => BaseUnixNanos + (long)((Stopwatch.GetTimestamp() - BaseTicks) * NanosPerTick);
 
-    /// <summary>Binds 319/320 and starts the timing flow. Throws if the privileged ports can't be bound.</summary>
+    /// <summary>Starts the timing flow over the shared PTP ports. Throws if they can't be bound.</summary>
     public void Start()
     {
-        _event = Bind(PtpWire.EventPort);
-        _general = Bind(PtpWire.GeneralPort);
+        _mux = PtpPortMux.GetShared(_logger);
+        if (!_mux.EnsureBound())
+        {
+            throw new InvalidOperationException(
+                $"cannot bind UDP {PtpWire.EventPort}/{PtpWire.GeneralPort} for PTP");
+        }
+
+        _consumer = _mux.RegisterEngineRole();
         _cts = new CancellationTokenSource();
         _ = RunAsync(_cts.Token);
         _logger.LogInformation("PTP engine started toward master {Master} (event :{E}, general :{G})", _masterIp, PtpWire.EventPort, PtpWire.GeneralPort);
-    }
-
-    private static Socket Bind(int port)
-    {
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        socket.Bind(new IPEndPoint(IPAddress.Any, port));
-        return socket;
     }
 
     private async Task RunAsync(CancellationToken ct)
@@ -133,13 +131,13 @@ public sealed class PtpEngine : IDisposable
                 await SendSyncPairAsync(eventDest, generalDest, ++syncSeq, ct).ConfigureAwait(false);
                 if (i < 2)
                 {
-                    await _general!.SendToAsync(PtpWire.BuildAnnounce(++announceSeq, _clockId, 248, OurPriority1), generalDest, ct).ConfigureAwait(false);
+                    await _mux!.SendGeneralAsync(PtpWire.BuildAnnounce(++announceSeq, _clockId, 248, OurPriority1), generalDest, ct).ConfigureAwait(false);
                 }
 
                 await Task.Delay(125, ct).ConfigureAwait(false);
             }
 
-            await _general!.SendToAsync(PtpWire.BuildMacSignaling(++signalingSeq, _clockId), generalDest, ct).ConfigureAwait(false);
+            await _mux!.SendGeneralAsync(PtpWire.BuildMacSignaling(++signalingSeq, _clockId), generalDest, ct).ConfigureAwait(false);
 
             // Phase 2: wait for the receiver's Announce to learn its priority + clock id.
             var (remotePriority1, remoteClockId) = await AwaitRemoteAnnounceAsync(ct).ConfigureAwait(false);
@@ -161,7 +159,7 @@ public sealed class PtpEngine : IDisposable
             }
 
             MasterClockId = remoteClockId;
-            await _general!.SendToAsync(PtpWire.BuildStopSignaling(++signalingSeq, _clockId), generalDest, ct).ConfigureAwait(false);
+            await _mux!.SendGeneralAsync(PtpWire.BuildStopSignaling(++signalingSeq, _clockId), generalDest, ct).ConfigureAwait(false);
             _logger.LogInformation("PTP: yielded master, entering slave sync to {Master}", _masterIp);
 
             // Phase 4 (slave): consume the master's clock across both sockets.
@@ -209,9 +207,9 @@ public sealed class PtpEngine : IDisposable
 
     private async Task SendSyncPairAsync(IPEndPoint eventDest, IPEndPoint generalDest, ushort seq, CancellationToken ct)
     {
-        await _event!.SendToAsync(PtpWire.BuildSync(seq, _clockId), eventDest, ct).ConfigureAwait(false);
+        await _mux!.SendEventAsync(PtpWire.BuildSync(seq, _clockId), eventDest, ct).ConfigureAwait(false);
         var now = NowUnixNanos();
-        await _general!.SendToAsync(PtpWire.BuildFollowUp(seq, _clockId, (ulong)(now / 1_000_000_000L), (uint)(now % 1_000_000_000L)), generalDest, ct).ConfigureAwait(false);
+        await _mux!.SendGeneralAsync(PtpWire.BuildFollowUp(seq, _clockId, (ulong)(now / 1_000_000_000L), (uint)(now % 1_000_000_000L)), generalDest, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -226,7 +224,7 @@ public sealed class PtpEngine : IDisposable
             await SendSyncPairAsync(eventDest, generalDest, ++syncSeq, ct).ConfigureAwait(false);
             if (iteration++ % 8 == 0)
             {
-                await _general!.SendToAsync(PtpWire.BuildAnnounce(++announceSeq, _clockId, 248, OurPriority1), generalDest, ct).ConfigureAwait(false);
+                await _mux!.SendGeneralAsync(PtpWire.BuildAnnounce(++announceSeq, _clockId, 248, OurPriority1), generalDest, ct).ConfigureAwait(false);
             }
 
             await Task.Delay(125, ct).ConfigureAwait(false);
@@ -236,34 +234,33 @@ public sealed class PtpEngine : IDisposable
     /// <summary>Master mode: answer the slave's Delay_Req so it can measure path delay.</summary>
     private async Task MasterEventLoopAsync(IPEndPoint generalDest, CancellationToken ct)
     {
-        var buf = new byte[256];
         while (!ct.IsCancellationRequested)
         {
-            SocketReceiveFromResult result;
+            PtpPortMux.PtpPacket packet;
             try
             {
-                result = await _event!.ReceiveFromAsync(buf, new IPEndPoint(IPAddress.Any, 0), ct).ConfigureAwait(false);
+                packet = await _consumer!.Event.Reader.ReadAsync(ct).ConfigureAwait(false);
             }
             catch when (ct.IsCancellationRequested) { return; }
-            catch (SocketException) { continue; }
+            catch (ChannelClosedException) { return; }
 
-            var received = NowUnixNanos();
-            var type = PtpWire.ParseType(buf.AsSpan(0, result.ReceivedBytes));
-            var from = ((IPEndPoint)result.RemoteEndPoint).Address;
+            var received = packet.ReceivedNanos;
+            var type = PtpWire.ParseType(packet.Data);
+            var from = packet.From;
             if (_eventLog++ < 8)
             {
-                _logger.LogInformation("PTP master rx: {Type} from {From} ({Len} B)", type, from, result.ReceivedBytes);
+                _logger.LogInformation("PTP master rx: {Type} from {From} ({Len} B)", type, from, packet.Data.Length);
             }
 
-            if (!from.Equals(_masterIp) || type != PtpMessageType.DelayReq || result.ReceivedBytes < 34)
+            if (!from.Equals(_masterIp) || type != PtpMessageType.DelayReq || packet.Data.Length < 34)
             {
                 continue;
             }
 
-            var resp = PtpWire.BuildDelayResp(buf.AsSpan(0, result.ReceivedBytes), _clockId, (ulong)(received / 1_000_000_000L), (uint)(received % 1_000_000_000L));
+            var resp = PtpWire.BuildDelayResp(packet.Data, _clockId, (ulong)(received / 1_000_000_000L), (uint)(received % 1_000_000_000L));
             try
             {
-                await _general!.SendToAsync(resp, generalDest, ct).ConfigureAwait(false);
+                await _mux!.SendGeneralAsync(resp, generalDest, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -274,19 +271,18 @@ public sealed class PtpEngine : IDisposable
 
     private async Task<(byte Priority1, byte[] ClockId)> AwaitRemoteAnnounceAsync(CancellationToken ct)
     {
-        var buf = new byte[256];
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(3));
         try
         {
             while (!deadline.IsCancellationRequested)
             {
-                var result = await _general!.ReceiveFromAsync(buf, new IPEndPoint(IPAddress.Any, 0), deadline.Token).ConfigureAwait(false);
-                if (((IPEndPoint)result.RemoteEndPoint).Address.Equals(_masterIp)
-                    && result.ReceivedBytes >= 61
-                    && PtpWire.ParseType(buf) == PtpMessageType.Announce)
+                var packet = await _consumer!.General.Reader.ReadAsync(deadline.Token).ConfigureAwait(false);
+                if (packet.From.Equals(_masterIp)
+                    && packet.Data.Length >= 61
+                    && PtpWire.ParseType(packet.Data) == PtpMessageType.Announce)
                 {
-                    return (buf[47], buf[53..61]);
+                    return (packet.Data[47], packet.Data[53..61]);
                 }
             }
         }
@@ -300,22 +296,21 @@ public sealed class PtpEngine : IDisposable
 
     private async Task EventLoopAsync(IPEndPoint eventDest, CancellationToken ct)
     {
-        var buf = new byte[256];
         while (!ct.IsCancellationRequested)
         {
-            SocketReceiveFromResult result;
+            PtpPortMux.PtpPacket packet;
             try
             {
-                result = await _event!.ReceiveFromAsync(buf, new IPEndPoint(IPAddress.Any, 0), ct).ConfigureAwait(false);
+                packet = await _consumer!.Event.Reader.ReadAsync(ct).ConfigureAwait(false);
             }
             catch when (ct.IsCancellationRequested) { return; }
-            catch (SocketException) { continue; }
+            catch (ChannelClosedException) { return; }
 
-            var type = PtpWire.ParseType(buf.AsSpan(0, result.ReceivedBytes));
-            var from = ((IPEndPoint)result.RemoteEndPoint).Address;
+            var type = PtpWire.ParseType(packet.Data);
+            var from = packet.From;
             if (_eventLog++ < 8)
             {
-                _logger.LogInformation("PTP event rx: {Type} from {From} ({Len} B), matchMaster={Match}", type, from, result.ReceivedBytes, from.Equals(_masterIp));
+                _logger.LogInformation("PTP event rx: {Type} from {From} ({Len} B), matchMaster={Match}", type, from, packet.Data.Length, from.Equals(_masterIp));
             }
 
             if (!from.Equals(_masterIp))
@@ -328,17 +323,17 @@ public sealed class PtpEngine : IDisposable
                 case PtpMessageType.Sync:
                     lock (_gate)
                     {
-                        _t2 = NowUnixNanos();
+                        _t2 = packet.ReceivedNanos;
                     }
 
                     break;
-                case PtpMessageType.DelayResp when result.ReceivedBytes >= 44:
-                    var (s, n) = PtpWire.ParseTimestamp(buf.AsSpan(34, 10));
+                case PtpMessageType.DelayResp when packet.Data.Length >= 44:
+                    var (s, n) = PtpWire.ParseTimestamp(packet.Data.AsSpan(34, 10));
                     var t4 = (long)PtpWire.TimestampToNanos(s, n);
                     ComputeOffset(t4);
                     break;
                 case PtpMessageType.DelayResp:
-                    _logger.LogDebug("PTP: Delay_Resp too short ({Len} bytes)", result.ReceivedBytes);
+                    _logger.LogDebug("PTP: Delay_Resp too short ({Len} bytes)", packet.Data.Length);
                     break;
             }
         }
@@ -346,30 +341,29 @@ public sealed class PtpEngine : IDisposable
 
     private async Task GeneralLoopAsync(IPEndPoint eventDest, CancellationToken ct)
     {
-        var buf = new byte[256];
         while (!ct.IsCancellationRequested)
         {
-            SocketReceiveFromResult result;
+            PtpPortMux.PtpPacket packet;
             try
             {
-                result = await _general!.ReceiveFromAsync(buf, new IPEndPoint(IPAddress.Any, 0), ct).ConfigureAwait(false);
+                packet = await _consumer!.General.Reader.ReadAsync(ct).ConfigureAwait(false);
             }
             catch when (ct.IsCancellationRequested) { return; }
-            catch (SocketException) { continue; }
+            catch (ChannelClosedException) { return; }
 
-            var gtype = PtpWire.ParseType(buf.AsSpan(0, result.ReceivedBytes));
-            var gfrom = ((IPEndPoint)result.RemoteEndPoint).Address;
+            var gtype = PtpWire.ParseType(packet.Data);
+            var gfrom = packet.From;
             if (_generalLog++ < 8)
             {
-                _logger.LogInformation("PTP general rx: {Type} from {From} ({Len} B), matchMaster={Match}", gtype, gfrom, result.ReceivedBytes, gfrom.Equals(_masterIp));
+                _logger.LogInformation("PTP general rx: {Type} from {From} ({Len} B), matchMaster={Match}", gtype, gfrom, packet.Data.Length, gfrom.Equals(_masterIp));
             }
 
-            if (!gfrom.Equals(_masterIp) || result.ReceivedBytes < 44 || gtype != PtpMessageType.FollowUp)
+            if (!gfrom.Equals(_masterIp) || packet.Data.Length < 44 || gtype != PtpMessageType.FollowUp)
             {
                 continue;
             }
 
-            var (s, n) = PtpWire.ParseTimestamp(buf.AsSpan(34, 10));
+            var (s, n) = PtpWire.ParseTimestamp(packet.Data.AsSpan(34, 10));
             long t3;
             ushort seq;
             lock (_gate)
@@ -409,10 +403,10 @@ public sealed class PtpEngine : IDisposable
                 seq = ++_delayReqSeq;
             }
 
-            var packet = PtpWire.BuildDelayReq(seq, _clockId, (ulong)(t3 / 1_000_000_000L), (uint)(t3 % 1_000_000_000L));
+            var delayReq = PtpWire.BuildDelayReq(seq, _clockId, (ulong)(t3 / 1_000_000_000L), (uint)(t3 % 1_000_000_000L));
             try
             {
-                await _event!.SendToAsync(packet, eventDest, ct).ConfigureAwait(false);
+                await _mux!.SendEventAsync(delayReq, eventDest, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -445,7 +439,9 @@ public sealed class PtpEngine : IDisposable
     public void Dispose()
     {
         _cts?.Cancel();
-        _event?.Dispose();
-        _general?.Dispose();
+        if (_consumer is { } consumer)
+        {
+            _mux?.UnregisterEngineRole(consumer);
+        }
     }
 }

@@ -18,8 +18,12 @@ public sealed class AirPlayReceiverSource() : AudioSourceBase("AirPlay")
         return Task.CompletedTask;
     }
 
-    /// <summary>Entry point for the decoded-audio path to feed the pipeline (used once M3 lands).</summary>
+    /// <summary>Entry point for the decoded-audio path to feed the pipeline.</summary>
     internal void PushDecodedPcm(ReadOnlyMemory<byte> pcm) => EmitPcm(pcm);
 
     internal void MarkActive() => SetState(Core.Abstractions.SourceState.Active);
+
+    internal void MarkIdle() => SetState(Core.Abstractions.SourceState.Idle);
+
+    internal void PushMetadata(Core.Metadata.TrackMetadata metadata) => RaiseMetadata(metadata);
 }

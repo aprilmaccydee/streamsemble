@@ -25,11 +25,28 @@ public sealed class ServiceAdvertiser : IDisposable
 
     public void Advertise(string serviceType, string instanceName, int port, IReadOnlyDictionary<string, string> txt)
     {
-        var profile = new ServiceProfile(instanceName, serviceType, (ushort)port, [IPAddress.Loopback]);
-        profile.Resources.Clear();
+        // Routable IPv4 only — deliberately NOT the library default of every
+        // NIC address. The default publishes an AAAA with the link-local v6,
+        // macOS resolves that first and runs the whole AirPlay session against
+        // it; TCP survives, but the sender's audio UDP channel (NW connection
+        // to our advertised dataPort) silently refuses to dial a bare fe80 —
+        // engine runs, zero packets sent, no error anywhere. Every receiver a
+        // Mac demonstrably streams to resolves to a routable v4.
+        var addresses = MulticastService.GetIPAddresses()
+            .Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                && !IPAddress.IsLoopback(a)
+                && !a.ToString().StartsWith("169.254.", StringComparison.Ordinal))
+            .ToArray();
+        var profile = addresses.Length > 0
+            ? new ServiceProfile(instanceName, serviceType, (ushort)port, addresses)
+            : new ServiceProfile(instanceName, serviceType, (ushort)port);
+        // Only the TXT strings are replaced: the default txtvers=1 entry
+        // confuses AirPlay senders, which expect their own keys first.
+        var txtRecord = profile.Resources.OfType<TXTRecord>().First();
+        txtRecord.Strings.Clear();
         foreach (var (key, value) in txt)
         {
-            profile.AddProperty(key, value);
+            txtRecord.Strings.Add($"{key}={value}");
         }
 
         _discovery.Advertise(profile);

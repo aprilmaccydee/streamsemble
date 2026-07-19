@@ -41,6 +41,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     private readonly IMasterClock _clock;
     private readonly NtpTimingResponder _timingResponder;
     private readonly SelectedTargetStore _selectedTargets;
+    private readonly Timing.Ptp.PtpReceiverClock _gmClock;
     private readonly ILogger<AirPlayTargetGroup> _logger;
 
     private readonly object _gate = new();
@@ -58,6 +59,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         IMasterClock clockArg,
         NtpTimingResponder timingResponderArg,
         SelectedTargetStore selectedTargetsArg,
+        Timing.Ptp.PtpReceiverClock gmClockArg,
         ILogger<AirPlayTargetGroup> loggerArg)
     {
         _options = optionsArg;
@@ -65,6 +67,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _clock = clockArg;
         _timingResponder = timingResponderArg;
         _selectedTargets = selectedTargetsArg;
+        _gmClock = gmClockArg;
         _logger = loggerArg;
         _selectedTargets.Changed += (_, _) => _ = ReconcileAsync(CancellationToken.None);
     }
@@ -90,7 +93,6 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     }
 
     private ControlChannel? _control;
-    private Timing.Ptp.PtpEngine? _ptp;
     private UdpClient? _audioSocket;
     private Channel<PcmFrame>? _sendQueue;
     private CancellationTokenSource? _streamCts;
@@ -195,6 +197,10 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                     _logger.LogInformation("Dropping target {Name}", removed.DisplayName);
                     await removed.TeardownAsync(CancellationToken.None).ConfigureAwait(false);
                     removed.Dispose();
+                    if (removed.RequiresPtp)
+                    {
+                        _gmClock.RemovePeer(removed.DeviceAddress);
+                    }
                 }
             }
 
@@ -227,14 +233,20 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 var session = await ConnectOneAsync(target, ct).ConfigureAwait(false);
                 if (session is not null)
                 {
-                    // Start PTP and let it resolve BEFORE audio flows to a PTP
-                    // speaker — it won't render until timing is established
-                    // (matches how a real sender completes timing before playback).
+                    // Serve OUR grandmaster clock to the speaker BEFORE audio
+                    // flows — it won't render until timing is established. All
+                    // speakers (and inbound senders) discipline to this one
+                    // clock, so every anchor timeline is ours; disciplining to
+                    // a speaker's own clock only ever worked for THAT speaker
+                    // (first hub tests: TV-first → only TV played, Hall-first
+                    // → only Hall).
                     StartPtpIfNeeded(session);
-                    if (session.RequiresPtp && _ptp is not null)
+                    if (session.RequiresPtp)
                     {
-                        var ready = await _ptp.WaitForSyncAsync(TimeSpan.FromSeconds(4), ct).ConfigureAwait(false);
-                        _logger.LogInformation("{Name}: PTP grandmaster {State} before streaming", session.DisplayName, ready ? "resolved" : "unresolved (streaming anyway)");
+                        // Give the speaker one announce+sync round to yield its
+                        // own grandmaster candidacy and lock to us.
+                        await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                        _logger.LogInformation("{Name}: grandmaster clock served before streaming", session.DisplayName);
 
                         // FLUSH to the fresh anchor right before audio starts.
                         try
@@ -301,25 +313,23 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         return addresses;
     }
 
-    // gPTP grandmaster ports (319/320) are exclusive per host, so one engine
-    // serves the group, disciplined to the first PTP speaker's clock.
+    // The shared hub grandmaster serves every PTP speaker (announce p1=247
+    // out-ranks their own 248 candidacy; a 248 tie falls to clock-identity
+    // comparison, which we can lose to both the Sonos and the TV).
     private void StartPtpIfNeeded(ITargetSession session)
     {
-        if (!session.RequiresPtp || _ptp is not null)
+        if (!session.RequiresPtp)
         {
             return;
         }
 
-        try
+        if (!_gmClock.EnsureStarted())
         {
-            _ptp = new Timing.Ptp.PtpEngine(session.DeviceAddress, _logger);
-            _ptp.Start();
+            _logger.LogError("PTP clock could not start (ports 319/320 need root/CAP_NET_BIND_SERVICE); {Name} will not render audio", session.DisplayName);
+            return;
         }
-        catch (Exception ex)
-        {
-            _ptp = null;
-            _logger.LogError(ex, "PTP timing could not start (ports 319/320 need root/CAP_NET_BIND_SERVICE); {Name} will not render audio", session.DisplayName);
-        }
+
+        _gmClock.AddPeer(session.DeviceAddress, priority1: 247);
     }
 
     private async Task<ITargetSession?> ConnectOneAsync(AirPlayTargetOptions target, CancellationToken ct)
@@ -389,12 +399,9 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                     // a multi-room group shares one PTP grandmaster (SETPEERS).
                     GroupPeerAddresses = await ResolveGroupAddressesAsync(ct).ConfigureAwait(false),
                 };
-                // Buffered playback anchors to the PTP clock via SETRATEANCHORTIME
-                // once the first frame is ready; resolve the clock lazily since
-                // the PTP engine starts after connect.
-                ap2.AnchorClock = () => _ptp is { MasterClockId: { } clockId, AnchorNanos: { } anchorNanos }
-                    ? ((ulong)anchorNanos, clockId)
-                    : null;
+                // Buffered playback anchors to OUR grandmaster clock via
+                // SETRATEANCHORTIME once the first frame is ready.
+                ap2.AnchorClock = () => ((ulong)Timing.Ptp.PtpReceiverClock.NowNanos, _gmClock.ClockId);
                 await ap2.ConnectAsync(_timingResponder.Port, _control!.Port, _seq, startRtp, ct).ConfigureAwait(false);
                 session = ap2;
             }
@@ -493,14 +500,14 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                             continue;
                         }
 
-                        if (session.RequiresPtp && _ptp is { MasterClockId: { } clockId })
+                        if (session.RequiresPtp)
                         {
                             // PTP anchor semantics (per the working Rust sender):
                             // "this RTP timestamp corresponds to PTP-clock NOW" —
                             // the receiver adds its own negotiated latency. Only
                             // the per-device trim shifts the mapping.
-                            var anchorNanos = (ulong)(_ptp.NowMasterNanos + session.LatencyTrimMs * 1_000_000L);
-                            await _control!.SendPtpSyncAsync(session.ControlEndpoint, rtpTime, anchorNanos, nextRtp, clockId, first, ct).ConfigureAwait(false);
+                            var anchorNanos = (ulong)(Timing.Ptp.PtpReceiverClock.NowNanos + session.LatencyTrimMs * 1_000_000L);
+                            await _control!.SendPtpSyncAsync(session.ControlEndpoint, rtpTime, anchorNanos, nextRtp, _gmClock.ClockId, first, ct).ConfigureAwait(false);
                         }
                         else
                         {
@@ -712,8 +719,13 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
 
         _control?.Dispose();
         _control = null;
-        _ptp?.Dispose();
-        _ptp = null;
+        foreach (var session in SessionSnapshot())
+        {
+            if (session.RequiresPtp)
+            {
+                _gmClock.RemovePeer(session.DeviceAddress);
+            }
+        }
         _audioSocket?.Dispose();
         _audioSocket = null;
         _sendQueue = null;

@@ -12,6 +12,7 @@ using Streamsemble.Discovery;
 using Streamsemble.Host;
 using Streamsemble.Spotify;
 using Streamsemble.Timing;
+using Streamsemble.Timing.Ptp;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -32,6 +33,12 @@ builder.Services.AddSingleton<PlaybackStatus>();
 
 // Pipeline
 builder.Services.AddSingleton<ISourceArbiter, LastWriterWinsArbiter>();
+// ONE grandmaster clock for the whole hub: the receiver serves it to
+// inbound AirPlay senders and the speaker fan-out serves it to the group —
+// every SETRATEANCHORTIME timeline is this clock.
+builder.Services.AddSingleton(sp => new PtpReceiverClock(
+    AirPlayReceiverService.BuildClockId(AirPlayReceiverService.BuildIdentity("clock").DeviceId),
+    sp.GetRequiredService<ILogger<PtpReceiverClock>>()));
 builder.Services.AddSingleton<AirPlayTargetGroup>();
 builder.Services.AddSingleton<IAudioSink>(sp =>
 {
