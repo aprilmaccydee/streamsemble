@@ -70,16 +70,69 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
             Forward(() => sink.SetMetadataAsync(metadata, ct), "metadata");
         }
 
+        var dropQueued = 0;
+        var controlChain = Task.CompletedTask;
+        var controlGate = new object();
+
+        // Control ops must run IN ORDER, each completing before the next: a
+        // pause's rate-0/flush RTSP sequence takes up to seconds, and a
+        // fire-and-forget resume overtook it — the fresh rate-1 anchors went
+        // out first and the stale rate-0 then stopped the clocks again
+        // ("plays a second, dies" on quick pause/play).
+        void EnqueueControl(Func<Task> op, string what)
+        {
+            lock (controlGate)
+            {
+                var previous = controlChain;
+                controlChain = RunAsync();
+
+                async Task RunAsync()
+                {
+                    try
+                    {
+                        await previous.ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Logged by its own step.
+                    }
+
+                    try
+                    {
+                        await op().ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Sink rejected {What} update", what);
+                    }
+                }
+            }
+        }
+
         void OnState(object? _, SourceStateChanged change)
         {
-            // Buffered sinks hold seconds of already-shipped audio; without a
-            // flush, pause keeps playing until the speaker buffer drains and a
-            // track change plays the old song's tail first. The sink
-            // re-anchors its timeline on the next packet after the flush.
+            // Pause/idle: silence the speakers now (they hold seconds of
+            // already-shipped audio) but KEEP everything queued — it is
+            // unheard audio, and resume plays it first so the listener
+            // continues from where the sound stopped, not from the source's
+            // read-ahead position.
             if (change.NewState is SourceState.Paused or SourceState.Idle)
             {
-                Forward(() => sink.FlushAsync(ct), "flush");
+                EnqueueControl(() => sink.FlushAsync(dropQueuedAudio: false, ct), "flush");
             }
+            else if (change is { NewState: SourceState.Active, OldState: SourceState.Paused })
+            {
+                EnqueueControl(() => sink.ResumeAsync(ct), "resume");
+            }
+        }
+
+        void OnDiscontinuity(object? _, EventArgs __)
+        {
+            // Skip/new load: the queued tail belongs to the abandoned track.
+            // Drop it everywhere — the sink's queues via the drop-flush, the
+            // source's own queue via the frame loop (its single reader).
+            Interlocked.Exchange(ref dropQueued, 1);
+            EnqueueControl(() => sink.FlushAsync(dropQueuedAudio: true, ct), "drop-flush");
         }
 
         try
@@ -92,9 +145,19 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
             source.VolumeChanged += OnVolume;
             source.MetadataChanged += OnMetadata;
             source.StateChanged += OnState;
+            source.Discontinuity += OnDiscontinuity;
 
             await foreach (var frame in source.Frames.ReadAllAsync(ct).ConfigureAwait(false))
             {
+                if (Interlocked.Exchange(ref dropQueued, 0) == 1)
+                {
+                    while (source.Frames.TryRead(out _))
+                    {
+                    }
+
+                    continue; // the in-hand frame predates the cutover too
+                }
+
                 await sink.WriteAsync(frame, ct).ConfigureAwait(false);
             }
         }
@@ -111,6 +174,7 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
             source.VolumeChanged -= OnVolume;
             source.MetadataChanged -= OnMetadata;
             source.StateChanged -= OnState;
+            source.Discontinuity -= OnDiscontinuity;
             // Only clear if a newer loop hasn't already claimed the display.
             if (status.ActiveSource == source.Name)
             {

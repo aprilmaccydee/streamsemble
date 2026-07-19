@@ -56,5 +56,27 @@ public static class WebApi
             await sink.SetVolumeAsync(volume);
             return Results.Ok(new { volume });
         });
+
+        // Debug endpoints driving the TONE SOURCE's state exactly like
+        // librespot's player events drive the Spotify source — the pump then
+        // runs its real pause/resume/cutover paths, scriptable via curl
+        // against a recording receiver instead of debugged by ear.
+        app.MapPost("/api/debug/pause", (Streamsemble.Core.Audio.ToneSource tone) =>
+        {
+            tone.DebugPause();
+            return Results.Ok(new { op = "pause" });
+        });
+
+        app.MapPost("/api/debug/resume", (Streamsemble.Core.Audio.ToneSource tone) =>
+        {
+            tone.DebugResume();
+            return Results.Ok(new { op = "resume" });
+        });
+
+        app.MapPost("/api/debug/cutover", (Streamsemble.Core.Audio.ToneSource tone) =>
+        {
+            tone.DebugCutover();
+            return Results.Ok(new { op = "cutover" });
+        });
     }
 }

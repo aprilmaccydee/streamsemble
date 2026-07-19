@@ -87,14 +87,22 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 return;
             }
 
-            // Mid-session pause/skip: the receiver holds seconds of buffered
-            // audio it will otherwise play out. Drop everything up to the
-            // stream's current position — named explicitly, since some
-            // receivers 200 an empty-body flush without flushing — then
-            // re-anchor the next frame: without a new SETRATEANCHORTIME the
-            // receiver has no render time for post-flush packets and stays
-            // silent forever. The buffered stream runs its own seq/rtp
-            // counters; the caller's realtime counters don't apply here.
+            // Mid-session pause/skip: FLUSHBUFFERED drops what the receiver
+            // has queued, with the drop-point named explicitly (some receivers
+            // 200 an empty-body flush without flushing). The buffered stream
+            // runs its own seq/rtp counters; the caller's realtime counters
+            // don't apply here. The next frame re-anchors with rate=1 —
+            // without a fresh SETRATEANCHORTIME, post-flush packets have no
+            // render time and the receiver stays silent forever. No rate-0
+            // "stop" is sent: reference senders don't, a bare rate-0 made the
+            // legacy-framing Sonos skip and wedge, and the pipeline HOLD
+            // already guarantees nothing more arrives during the pause.
+            // Both fields always (shairport-family receivers treat a flush
+            // WITHOUT a flushUntil boundary as a no-op — an "empty flush"
+            // pauses nothing). Legacy framing carries no sequence numbers on
+            // the wire, but it does carry rtpTime, so flushUntilTS is the
+            // boundary a legacy receiver can act on; modern receivers match
+            // the 23-bit seq (masked on their side) plus the TS.
             var flush = new NSDictionary
             {
                 { "flushUntilSeq", new NSNumber((long)_bufferedHeadSeq) },
@@ -102,6 +110,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             };
             await _rtsp.RequestAsync("FLUSHBUFFERED", ct, "application/x-apple-binary-plist",
                 BinaryPropertyListWriter.WriteToArray(flush)).ConfigureAwait(false);
+
             _reanchorPending = true;
             return;
         }
@@ -831,9 +840,29 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             var ssrc = _bufferedAlac ? 0u : AacSsrc;
             var firstRtpTime = rtpTime;
             var framesSent = 0;
+            var framesDropped = 0L;
 
             await foreach (var frame in reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
+                // Cutover: this frame and everything queued behind it belong
+                // to the abandoned track — drop them (and account for them,
+                // or the age compensation drifts by the dropped span and the
+                // anchor lands early: constant starvation crackle).
+                if (_dropStalePending)
+                {
+                    _dropStalePending = false;
+                    var dropped = 1;
+                    while (reader.TryRead(out _))
+                    {
+                        dropped++;
+                    }
+
+                    framesDropped += dropped;
+                    anchored = false;
+                    logger.LogInformation("{Name}: dropped {Count} stale frames at cutover", DisplayName, dropped);
+                    continue;
+                }
+
                 // A mid-session flush (pause/skip) invalidated the anchor; the
                 // next frame re-anchors to "now" so playback restarts cleanly.
                 if (_reanchorPending)
@@ -850,10 +879,10 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 // "now" holds PCM captured ageSamples ago. Subtracting that age
                 // aligns acoustic output with the realtime path, which sends PCM
                 // the instant it arrives — no hardcoded skew.
-                if (!anchored && framesSent * samplesPerFrame >= 44100)
+                if (!_anchorHeld && !anchored && framesSent * samplesPerFrame >= 44100)
                 {
                     var ageSamples = _aac is { } aac
-                        ? Math.Max(0, aac.PcmSamplesIn - (long)framesSent * samplesPerFrame)
+                        ? Math.Max(0, aac.PcmSamplesIn - (framesSent + framesDropped) * samplesPerFrame)
                         : 0;
                     anchored = await SendAnchorAsync(rtpTime, ageSamples, ct).ConfigureAwait(false);
                     if (anchored && Environment.GetEnvironmentVariable("STREAMSEMBLE_TV_NUDGE") != "0")
@@ -1021,8 +1050,24 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     private int _anchorWaitLogged;
     private long _bufferedPacketsSent;
     private volatile bool _reanchorPending;
+    private volatile bool _dropStalePending;
     private volatile uint _bufferedHeadSeq;
     private volatile uint _bufferedHeadRtpTime;
+
+    /// <summary>Cutover: the buffered pump discards its queued (abandoned-track) frames and re-anchors.</summary>
+    public void RequestStaleDrop() => _dropStalePending = true;
+
+    private volatile bool _anchorHeld;
+
+    /// <summary>Pause: suppress (re-)anchoring — the receiver's clock is stopped (rate 0) and must stay stopped.</summary>
+    public void HoldAnchor() => _anchorHeld = true;
+
+    /// <summary>Resume: allow anchoring again; the next frame re-anchors to "now" and rendering restarts.</summary>
+    public void ReleaseAnchorHold()
+    {
+        _anchorHeld = false;
+        _reanchorPending = true;
+    }
 
     private CancellationTokenSource? _feedbackCts;
 

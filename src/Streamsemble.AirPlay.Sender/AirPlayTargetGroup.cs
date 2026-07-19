@@ -93,6 +93,9 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     }
 
     private ControlChannel? _control;
+    private volatile bool _dropQueuedFrames;
+    private volatile bool _holdFrames;
+    private int _pacingLog;
     private UdpClient? _audioSocket;
     private Channel<PcmFrame>? _sendQueue;
     private CancellationTokenSource? _streamCts;
@@ -204,6 +207,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 }
             }
 
+            var missing = new List<(string Key, AirPlayTargetOptions Target)>();
             foreach (var (key, target) in desired)
             {
                 bool present;
@@ -212,59 +216,79 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                     present = _sessions.ContainsKey(key);
                 }
 
-                if (present)
+                if (!present)
                 {
-                    continue;
+                    missing.Add((key, target));
                 }
+            }
 
-                // For a PTP speaker, restart the RTP timeline cleanly (fresh
+            if (missing.Count > 0)
+            {
+                // For PTP speakers, restart the RTP timeline cleanly (fresh
                 // anchor at _rtpBase, marker bit on the first packet) BEFORE
-                // connecting, so RECORD, FLUSH and audio all agree on the anchor.
-                // Real senders begin a fresh stream; some receivers won't render
-                // a mid-stream join otherwise. Auto may resolve to AirPlay 2
-                // during connect, so it gets the reset too.
-                if (!target.Protocol.Equals("Raop", StringComparison.OrdinalIgnoreCase))
+                // connecting, so RECORD, FLUSH and audio all agree on the
+                // anchor. Once per batch — every joiner shares it.
+                if (missing.Any(m => !m.Target.Protocol.Equals("Raop", StringComparison.OrdinalIgnoreCase)))
                 {
                     _timestampBase = null;
                     _sendMarker = true;
                     _lastSyncRtp = 0;
                 }
 
-                var session = await ConnectOneAsync(target, ct).ConfigureAwait(false);
-                if (session is not null)
+                // Sessions are fully independent (own TCP/pairing/SETUP), so
+                // the whole batch connects concurrently off ONE shared mDNS
+                // scan — sequential setup cost ~8 s per speaker (scan + pair +
+                // clock settle), all of it overlappable.
+                IReadOnlyList<Streamsemble.Discovery.ResolvedTarget>? scan = null;
+                if (missing.Any(m => m.Target.Host is null || m.Target.Protocol.Equals("Auto", StringComparison.OrdinalIgnoreCase)))
                 {
-                    // Serve OUR grandmaster clock to the speaker BEFORE audio
-                    // flows — it won't render until timing is established. All
-                    // speakers (and inbound senders) discipline to this one
-                    // clock, so every anchor timeline is ours; disciplining to
-                    // a speaker's own clock only ever worked for THAT speaker
-                    // (first hub tests: TV-first → only TV played, Hall-first
-                    // → only Hall).
-                    StartPtpIfNeeded(session);
-                    if (session.RequiresPtp)
-                    {
-                        // Give the speaker one announce+sync round to yield its
-                        // own grandmaster candidacy and lock to us.
-                        await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
-                        _logger.LogInformation("{Name}: grandmaster clock served before streaming", session.DisplayName);
+                    scan = await _browser.BrowseAsync(TimeSpan.FromSeconds(_options.Value.ScanSeconds), ct).ConfigureAwait(false);
+                }
 
-                        // FLUSH to the fresh anchor right before audio starts.
+                var connected = await Task.WhenAll(missing.Select(async m =>
+                    (m.Key, Session: await ConnectOneAsync(m.Target, ct, scan).ConfigureAwait(false)))).ConfigureAwait(false);
+                var joined = connected.Where(c => c.Session is not null).ToList();
+
+                // Serve OUR grandmaster clock to every joiner BEFORE audio
+                // flows — speakers won't render until timing is established,
+                // and disciplining to a speaker's own clock only ever worked
+                // for THAT speaker (TV-first → only TV played, Hall-first →
+                // only Hall). One announce+sync settle covers the batch.
+                foreach (var (_, session) in joined)
+                {
+                    StartPtpIfNeeded(session!);
+                }
+
+                if (joined.Any(c => c.Session!.RequiresPtp))
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                    _logger.LogInformation("grandmaster clock served to {Count} joiner(s) before streaming", joined.Count);
+
+                    // FLUSH each to the fresh anchor right before audio starts.
+                    await Task.WhenAll(joined.Where(c => c.Session!.RequiresPtp).Select(async c =>
+                    {
                         try
                         {
-                            await session.FlushAsync(_seq, _rtpBase, ct).ConfigureAwait(false);
+                            await c.Session!.FlushAsync(_seq, _rtpBase, ct).ConfigureAwait(false);
                         }
                         catch (Exception ex) when (ex is not OperationCanceledException)
                         {
-                            _logger.LogDebug(ex, "{Name}: FLUSH before streaming failed", session.DisplayName);
+                            _logger.LogDebug(ex, "{Name}: FLUSH before streaming failed", c.Session!.DisplayName);
+                        }
+                    })).ConfigureAwait(false);
+                }
+
+                if (joined.Count > 0)
+                {
+                    lock (_gate)
+                    {
+                        foreach (var (key, session) in joined)
+                        {
+                            _sessions[key] = session!;
                         }
                     }
 
-                    lock (_gate)
-                    {
-                        _sessions[key] = session;
-                    }
-
-                    // A joining speaker needs a fresh anchor (0x90) right away.
+                    // Joining speakers need a fresh anchor (0x90) right away.
                     _sendFirstSync = true;
                     _syncPending = true;
                 }
@@ -332,7 +356,10 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _gmClock.AddPeer(session.DeviceAddress, priority1: 247);
     }
 
-    private async Task<ITargetSession?> ConnectOneAsync(AirPlayTargetOptions target, CancellationToken ct)
+    private async Task<ITargetSession?> ConnectOneAsync(
+        AirPlayTargetOptions target,
+        CancellationToken ct,
+        IReadOnlyList<Streamsemble.Discovery.ResolvedTarget>? preScanned = null)
     {
         try
         {
@@ -356,7 +383,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 // by address so the feature bits can pick the protocol.
                 if (protocol.Equals("Auto", StringComparison.OrdinalIgnoreCase))
                 {
-                    var seen = await _browser.BrowseAsync(scanTime, ct).ConfigureAwait(false);
+                    var seen = preScanned ?? await _browser.BrowseAsync(scanTime, ct).ConfigureAwait(false);
                     if (seen.FirstOrDefault(t => t.Address.Equals(address)) is { } match)
                     {
                         (txt, airPlayPort) = (match.RaopTxt, match.AirPlayPort);
@@ -372,7 +399,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
             }
             else
             {
-                var discovered = await _browser.BrowseAsync(scanTime, ct).ConfigureAwait(false);
+                var discovered = preScanned ?? await _browser.BrowseAsync(scanTime, ct).ConfigureAwait(false);
                 var resolved = discovered.FirstOrDefault(t => t.DisplayName.Contains(target.Name!, StringComparison.OrdinalIgnoreCase))
                     ?? throw new IOException($"\"{target.Name}\" not found via mDNS (saw: {string.Join(", ", discovered.Select(d => d.DisplayName).DefaultIfEmpty("nothing"))})");
                 (address, port, txt, name, airPlayPort) = (resolved.Address, resolved.RaopPort, resolved.RaopTxt, resolved.DisplayName, resolved.AirPlayPort);
@@ -453,11 +480,38 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         {
             await foreach (var frame in queue.ReadAllAsync(ct).ConfigureAwait(false))
             {
+                // Pause hold: keep the in-hand frame and everything queued
+                // until resume (or a cutover drop) releases the pipeline.
+                if (_holdFrames)
+                {
+                    _logger.LogInformation("send loop holding");
+                    while (_holdFrames && !_dropQueuedFrames && !ct.IsCancellationRequested)
+                    {
+                        await Task.Delay(50, ct).ConfigureAwait(false);
+                    }
+
+                    _logger.LogInformation("send loop released");
+                }
+
+                if (_dropQueuedFrames)
+                {
+                    _dropQueuedFrames = false;
+                    var dropped = 1; // the in-hand frame predates the cutover
+                    while (queue.TryRead(out _))
+                    {
+                        dropped++;
+                    }
+
+                    _logger.LogDebug("dropped {Count} queued frames at cutover", dropped);
+                    continue;
+                }
+
                 if (_timestampBase is null)
                 {
                     _timestampBase = frame.Timestamp;
                     _anchorOffset = 0;
                     _anchorSeconds = _clock.NowSeconds + StartLeadSeconds;
+                    _logger.LogInformation("send timeline re-based (frame ts={Ts})", frame.Timestamp);
                 }
 
                 var offset = frame.Timestamp - _timestampBase.Value;
@@ -467,6 +521,11 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 // due at anchor + (N - anchorOffset)/rate.
                 var due = _anchorSeconds + (offset - _anchorOffset) / (double)SampleRate;
                 var wait = due - _clock.NowSeconds;
+                if (wait > 1.0 && ++_pacingLog % 50 == 1)
+                {
+                    _logger.LogWarning("pacing anomaly: frame due {Wait:F2}s ahead (offset={Offset})", wait, offset);
+                }
+
                 if (wait > 0.002)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(wait), ct).ConfigureAwait(false);
@@ -655,12 +714,53 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         }
     }
 
-    public async Task FlushAsync(CancellationToken ct = default)
+    public Task FlushAsync(CancellationToken ct = default) => FlushAsync(dropQueuedAudio: false, ct);
+
+    public Task ResumeAsync(CancellationToken ct = default)
+    {
+        _holdFrames = false;
+        foreach (var session in SessionSnapshot())
+        {
+            (session as AirPlay2.AirPlay2Session)?.ReleaseAnchorHold();
+        }
+
+        _logger.LogInformation("resumed — held frames released, re-anchor pending");
+        return Task.CompletedTask;
+    }
+
+    public async Task FlushAsync(bool dropQueuedAudio, CancellationToken ct = default)
     {
         if (!Streaming || _timestampBase is null)
         {
             _logger.LogDebug("flush skipped (streaming={Streaming}, anchored={Anchored})", Streaming, _timestampBase is not null);
             return;
+        }
+
+        if (dropQueuedAudio)
+        {
+            // Cutover (skip): everything queued belongs to the abandoned
+            // track. The send loop (the queue's single reader) drains on this
+            // flag; buffered sessions drop their encoder-pipe backlog too.
+            _dropQueuedFrames = true;
+            foreach (var session in SessionSnapshot())
+            {
+                (session as AirPlay2.AirPlay2Session)?.RequestStaleDrop();
+            }
+        }
+        else
+        {
+            // Pause: HOLD the pipeline. The queued tail is unheard audio the
+            // listener resumes into — but letting it stream out during the
+            // pause consumed the pending re-anchor seconds early (the tail
+            // audibly played) and left the eventual resume mapped to a stale
+            // timeline: every post-resume packet counted as late and was
+            // dropped — silence. Frames wait here and anchors stay suppressed
+            // until ResumeAsync releases both.
+            _holdFrames = true;
+            foreach (var session in SessionSnapshot())
+            {
+                (session as AirPlay2.AirPlay2Session)?.HoldAnchor();
+            }
         }
 
         // Reset the timeline FIRST — the next packet re-anchors and re-marks

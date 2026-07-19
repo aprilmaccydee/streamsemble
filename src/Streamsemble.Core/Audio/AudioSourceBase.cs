@@ -28,6 +28,7 @@ public abstract class AudioSourceBase(string name) : IAudioSource
     public ChannelReader<PcmFrame> Frames => _channel.Reader;
 
     public event EventHandler<SourceStateChanged>? StateChanged;
+    public event EventHandler? Discontinuity;
     public event EventHandler<TrackMetadata>? MetadataChanged;
     public event EventHandler<float>? VolumeChanged;
 
@@ -52,6 +53,8 @@ public abstract class AudioSourceBase(string name) : IAudioSource
         State = newState;
         StateChanged?.Invoke(this, change);
     }
+
+    protected void RaiseDiscontinuity() => Discontinuity?.Invoke(this, EventArgs.Empty);
 
     protected void RaiseMetadata(TrackMetadata metadata) => MetadataChanged?.Invoke(this, metadata);
 

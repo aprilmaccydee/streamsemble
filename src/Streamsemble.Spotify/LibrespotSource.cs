@@ -238,10 +238,24 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
                 SetState(Core.Abstractions.SourceState.Active);
                 break;
             case "paused":
-            case "loading":
                 if (State == Core.Abstractions.SourceState.Active)
                 {
                     SetState(Core.Abstractions.SourceState.Paused);
+                }
+
+                break;
+            case "loading":
+                // A user-initiated load (skip/new selection): the pipeline's
+                // queued tail belongs to the abandoned track — signal it for
+                // discard. Natural gapless endings emit no "loading", so song
+                // tails survive; plain pause keeps the tail for resume.
+                if (State != Core.Abstractions.SourceState.Idle)
+                {
+                    RaiseDiscontinuity();
+                    if (State == Core.Abstractions.SourceState.Active)
+                    {
+                        SetState(Core.Abstractions.SourceState.Paused);
+                    }
                 }
 
                 break;

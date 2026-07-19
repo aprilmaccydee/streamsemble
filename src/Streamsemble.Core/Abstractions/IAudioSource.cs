@@ -32,6 +32,16 @@ public interface IAudioSource
     ChannelReader<PcmFrame> Frames { get; }
 
     event EventHandler<SourceStateChanged>? StateChanged;
+
+    /// <summary>
+    /// A user-initiated playback cutover (skip/new load): everything queued
+    /// from before it belongs to abandoned content and should be discarded.
+    /// NOT raised for pause (the queued tail is unheard audio the listener
+    /// resumes into) or natural gapless track endings (the tail is the end
+    /// of the song).
+    /// </summary>
+    event EventHandler? Discontinuity;
+
     event EventHandler<TrackMetadata>? MetadataChanged;
 
     /// <summary>Volume in [0, 1] requested by the remote app.</summary>

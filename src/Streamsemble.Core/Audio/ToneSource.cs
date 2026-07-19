@@ -12,6 +12,29 @@ namespace Streamsemble.Core.Audio;
 public sealed class ToneSource() : AudioSourceBase("TestTone")
 {
     private CancellationTokenSource? _cts;
+    private volatile bool _paused;
+
+    /// <summary>Debug: behave exactly like librespot on pause — stop producing and go Paused.</summary>
+    public void DebugPause()
+    {
+        _paused = true;
+        SetState(Core.Abstractions.SourceState.Paused);
+    }
+
+    /// <summary>Debug: resume producing, exactly like librespot's play event.</summary>
+    public void DebugResume()
+    {
+        _paused = false;
+        SetState(Core.Abstractions.SourceState.Active);
+    }
+
+    /// <summary>Debug: a user track-change — discontinuity then playing.</summary>
+    public void DebugCutover()
+    {
+        RaiseDiscontinuity();
+        _paused = false;
+        SetState(Core.Abstractions.SourceState.Active);
+    }
 
     public override Task StopAsync(CancellationToken cancellationToken = default)
     {
@@ -49,10 +72,31 @@ public sealed class ToneSource() : AudioSourceBase("TestTone")
         var stopwatch = Stopwatch.StartNew();
         long generatedSamples = 0;
 
+        var pausedSamples = 0L;
+        var pauseStartedAt = 0.0;
         while (!_cts.Token.IsCancellationRequested)
         {
+            if (_paused)
+            {
+                // Track paused wall time so the realtime pacing doesn't try to
+                // catch up (librespot's clock similarly just stops).
+                if (pauseStartedAt == 0)
+                {
+                    pauseStartedAt = stopwatch.Elapsed.TotalSeconds;
+                }
+
+                await Task.Delay(50, _cts.Token).ConfigureAwait(false);
+                continue;
+            }
+
+            if (pauseStartedAt > 0)
+            {
+                pausedSamples += (long)((stopwatch.Elapsed.TotalSeconds - pauseStartedAt) * format.SampleRate);
+                pauseStartedAt = 0;
+            }
+
             // Stay at most `lookaheadSeconds` ahead of real time.
-            var realTimeSamples = (long)(stopwatch.Elapsed.TotalSeconds * format.SampleRate);
+            var realTimeSamples = (long)(stopwatch.Elapsed.TotalSeconds * format.SampleRate) - pausedSamples;
             if (generatedSamples > realTimeSamples + (long)(format.SampleRate * lookaheadSeconds))
             {
                 await Task.Delay(100, _cts.Token).ConfigureAwait(false);

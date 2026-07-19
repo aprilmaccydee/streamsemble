@@ -21,5 +21,18 @@ public interface IAudioSink
     /// <summary>Discard buffered/in-flight audio (seek, source switch, pause).</summary>
     Task FlushAsync(CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Flush with control over queued-but-unsent audio: dropQueuedAudio=true
+    /// (skip) discards it; false (pause) keeps it so playback resumes from
+    /// the audibly-last position. Default implementation ignores the flag.
+    /// </summary>
+    Task FlushAsync(bool dropQueuedAudio, CancellationToken cancellationToken = default) => FlushAsync(cancellationToken);
+
+    /// <summary>
+    /// Resume after a pause-flush: release held frames and re-anchor so the
+    /// preserved tail plays from the audibly-last position. No-op by default.
+    /// </summary>
+    Task ResumeAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
     Task StopStreamAsync(CancellationToken cancellationToken = default);
 }
