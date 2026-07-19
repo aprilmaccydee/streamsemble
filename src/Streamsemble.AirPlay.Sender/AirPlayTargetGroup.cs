@@ -659,27 +659,36 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     {
         if (!Streaming || _timestampBase is null)
         {
+            _logger.LogDebug("flush skipped (streaming={Streaming}, anchored={Anchored})", Streaming, _timestampBase is not null);
             return;
         }
 
-        foreach (var session in SessionSnapshot())
-        {
-            try
-            {
-                await session.FlushAsync(_seq, _rtpHead, ct).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogWarning(ex, "{Name}: flush failed", session.DisplayName);
-            }
-        }
-
-        // Next packet re-anchors the timeline and re-marks the stream.
+        // Reset the timeline FIRST — the next packet re-anchors and re-marks
+        // the stream regardless of how the per-speaker flushes fare. Holding
+        // this hostage to every speaker's RTSP responsiveness meant one slow
+        // receiver silently kept the whole group on the stale timeline.
         _timestampBase = null;
         _sendMarker = true;
         _sendFirstSync = true;
         _syncPending = true;
         _lastSyncRtp = 0;
+
+        var sessions = SessionSnapshot();
+        _logger.LogInformation("flushing {Count} target(s) (drop buffered audio, re-anchor)", sessions.Length);
+        await Task.WhenAll(sessions.Select(async session =>
+        {
+            try
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(TimeSpan.FromSeconds(2));
+                await session.FlushAsync(_seq, _rtpHead, timeout.Token).ConfigureAwait(false);
+                _logger.LogDebug("{Name}: flushed", session.DisplayName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "{Name}: flush failed", session.DisplayName);
+            }
+        })).ConfigureAwait(false);
     }
 
     public async Task StopStreamAsync(CancellationToken ct = default)

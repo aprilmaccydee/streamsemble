@@ -81,8 +81,28 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     {
         if (IsBuffered)
         {
-            // Buffered streams use FLUSHBUFFERED, and only to discard queued
-            // audio mid-session; a fresh stream has nothing to flush.
+            if (!_recordSent)
+            {
+                // A fresh stream has nothing to flush.
+                return;
+            }
+
+            // Mid-session pause/skip: the receiver holds seconds of buffered
+            // audio it will otherwise play out. Drop everything up to the
+            // stream's current position — named explicitly, since some
+            // receivers 200 an empty-body flush without flushing — then
+            // re-anchor the next frame: without a new SETRATEANCHORTIME the
+            // receiver has no render time for post-flush packets and stays
+            // silent forever. The buffered stream runs its own seq/rtp
+            // counters; the caller's realtime counters don't apply here.
+            var flush = new NSDictionary
+            {
+                { "flushUntilSeq", new NSNumber((long)_bufferedHeadSeq) },
+                { "flushUntilTS", new NSNumber((long)_bufferedHeadRtpTime) },
+            };
+            await _rtsp.RequestAsync("FLUSHBUFFERED", ct, "application/x-apple-binary-plist",
+                BinaryPropertyListWriter.WriteToArray(flush)).ConfigureAwait(false);
+            _reanchorPending = true;
             return;
         }
 
@@ -814,6 +834,14 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
             await foreach (var frame in reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
+                // A mid-session flush (pause/skip) invalidated the anchor; the
+                // next frame re-anchors to "now" so playback restarts cleanly.
+                if (_reanchorPending)
+                {
+                    _reanchorPending = false;
+                    anchored = false;
+                }
+
                 // Ship a chunk of audio before anchoring (receiver needs frames
                 // buffered, and PTP needs to have measured the offset), then
                 // anchor the CURRENT frame to now + group latency, compensated
@@ -838,6 +866,8 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 framesSent++;
                 seq = (seq + 1) & 0x7FFFFF;
                 rtpTime += samplesPerFrame;
+                _bufferedHeadSeq = seq;
+                _bufferedHeadRtpTime = rtpTime;
                 if (++_bufferedPacketsSent % 430 == 0)
                 {
                     logger.LogInformation("{Name}: buffered audio: {Count} packets (~{Secs:F0}s) sent", DisplayName, _bufferedPacketsSent, _bufferedPacketsSent * 1024.0 / 44100);
@@ -990,6 +1020,9 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
     private int _anchorWaitLogged;
     private long _bufferedPacketsSent;
+    private volatile bool _reanchorPending;
+    private volatile uint _bufferedHeadSeq;
+    private volatile uint _bufferedHeadRtpTime;
 
     private CancellationTokenSource? _feedbackCts;
 

@@ -55,14 +55,31 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
 
         void OnVolume(object? _, float volume)
         {
+            // Display only — source volume is NOT forwarded to the sink.
+            // librespot's softvol already applies the Spotify slider to the
+            // PCM itself; forwarding it to the speakers as well applied the
+            // volume twice (mid-slider became near-silence) and drove the
+            // speakers' real volume from every slider wiggle. Speaker volume
+            // is only ever set explicitly via the web UI/API.
             status.Volume = volume;
-            Forward(() => sink.SetVolumeAsync(volume, ct), "volume");
         }
 
         void OnMetadata(object? _, TrackMetadata metadata)
         {
             status.Metadata = metadata;
             Forward(() => sink.SetMetadataAsync(metadata, ct), "metadata");
+        }
+
+        void OnState(object? _, SourceStateChanged change)
+        {
+            // Buffered sinks hold seconds of already-shipped audio; without a
+            // flush, pause keeps playing until the speaker buffer drains and a
+            // track change plays the old song's tail first. The sink
+            // re-anchors its timeline on the next packet after the flush.
+            if (change.NewState is SourceState.Paused or SourceState.Idle)
+            {
+                Forward(() => sink.FlushAsync(ct), "flush");
+            }
         }
 
         try
@@ -74,6 +91,7 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
 
             source.VolumeChanged += OnVolume;
             source.MetadataChanged += OnMetadata;
+            source.StateChanged += OnState;
 
             await foreach (var frame in source.Frames.ReadAllAsync(ct).ConfigureAwait(false))
             {
@@ -92,6 +110,7 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
         {
             source.VolumeChanged -= OnVolume;
             source.MetadataChanged -= OnMetadata;
+            source.StateChanged -= OnState;
             // Only clear if a newer loop hasn't already claimed the display.
             if (status.ActiveSource == source.Name)
             {
