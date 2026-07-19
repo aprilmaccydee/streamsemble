@@ -6,70 +6,91 @@ AirPlay 2 speakers**, kept in sync. Built with the .NET Generic Host and
 dependency injection throughout.
 
 ```
- Spotify Connect ┐
+ Spotify Connect  ┐
  AirPlay 2 (recv) ┼─► arbiter ─► pump ─► AirPlayTargetGroup ─► speaker A
- Google Cast     ┘   (last-writer                          └─► speaker B
-                      -wins)                                      …
-                        │                         ▲
-                        └── one master clock ─────┘  NTP timing + per-second
-                            (shared timeline)        sync packets = multi-room sync
+ Google Cast      ┘   (last-writer                          └─► speaker B
+      ▲               -wins)                                       …
+      │                 │                         ▲
+ iPhone / Mac           └── ONE grandmaster ──────┘  PTP (319/320) + NTP timing
+ streams into the hub       clock (PtpPortMux)       + sync packets = multi-room
 ```
 
 ## What works today (verified)
 
 | Capability | Status | How it was verified |
 |---|---|---|
+| **AirPlay 2 receiver → hub → N speakers** | ✅ Working | iPhone picks "Streamsemble Hub" → hub decodes and fans out to three real speakers (2× Sonos + Philips Google TV) simultaneously; every `SETRATEANCHORTIME` accepted first try. |
+| **AirPlay 2 receiver, realtime (type 96, ALAC/UDP)** | ✅ Working | Real Mac (system output) and iPhone streamed into the receiver; ALAC → PCM → WAV at exactly 176.4 KB/s, zero decrypt/decode/lost packets. This is what the iOS/macOS *picker* always sends. |
+| **AirPlay 2 receiver, buffered (type 103, AAC/TCP)** | ✅ Working (loopback) | Own sender → receiver loopback: 111.8 s of 440 Hz recovered bit-clean (RMS 4632 vs 4634 theoretical). Music-app end-to-end still pending a live test. |
+| **HAP transient pairing server + FairPlay fp-setup** | ✅ Working | Real Mac and iPhone complete SRP pair-setup against `HapSrpServer` (BouncyCastle's SRP is wire-incompatible — never use it) and the canned-table FairPlay responder; sessions upgrade to the encrypted channel. |
+| **One hub grandmaster clock (PTP)** | ✅ Working | `PtpPortMux` owns UDP 319/320; `PtpReceiverClock` serves inbound senders (priority 248, TV-exact wire shape) *and* the speaker group (priority 247) from one clock id. Macs/iPhones demonstrably slave to it (continuous Delay_Req), and all speaker anchors validate on its timeline. |
 | **Spotify Connect source** | ✅ Working | librespot child process; the device "Streamsemble" appears in the Spotify app and streams S16LE PCM into the pipeline. |
 | **AirPlay 2 / RAOP sender → 1 speaker** | ✅ Working | Streamed a 440 Hz tone to shairport-sync; recovered a clean 440 Hz tone at the receiver. |
-| **Sender fan-out → N speakers, in sync** | ✅ Working | Two shairport-sync receivers; cross-correlation of their outputs showed **~1.8 ms** content skew — sub-audible, ~1 ms class. |
-| **Shared master clock + NTP timing responder + sync packets** | ✅ Working | The sender answers each speaker's timing queries and sends per-second sync packets from one clock; this is what holds the fan-out together. |
+| **Sender fan-out → N speakers, in sync** | ✅ Working | Real-device group (TV + Sonos) natively synced ≲25 ms with zero manual trims; earlier shairport-sync pair showed ~1.8 ms content skew by cross-correlation. |
 | **Retransmit / packet ring** | ✅ Working | Control channel answers RAOP resend requests from a shared plain-packet ring, re-framed per target. |
-| **HAP pairing crypto (transient SRP, X25519, Ed25519, ChaCha20, HKDF, TLV8)** | ✅ Working, unit-tested | 18 AirPlay tests incl. full SRP client↔server interop and the encrypted-channel/audio key derivation, matched to pair_ap constants. |
-| **AirPlay 2 HAP sender → HomePod** | ⚙️ Implemented, needs device test | Transient pair-setup, encrypted RTSP channel, realtime stream SETUP, and ChaCha20 audio packets are built to the pair_ap/OwnTone spec. Not yet run against real HomePod firmware — see below. |
-| **Volume & metadata forwarding** | ✅ Working | Spotify volume/track events → RAOP `SET_PARAMETER` (dB volume, DMAP metadata). |
+| **ALAC decoder (Apple reference port)** | ✅ Working, unit-tested | SCE/CPE/verbatim/partial frames, all three magic-cookie forms; byte-identical against ffmpeg-generated golden vectors. |
+| **Volume & metadata forwarding** | ✅ Working | Spotify volume/track events → RAOP `SET_PARAMETER` (dB volume, DMAP metadata). Inbound sender volume is observe-only by design. |
 | **Source arbitration** | ✅ Working | Last source to play wins; the previous source is asked to yield. Unit-tested. |
-| **DI / Generic Host / options / logging** | ✅ Working | Every component is constructor-injected; config via `appsettings.json` + command line. |
-| **Web UI: mDNS discovery + live speaker selection** | ✅ Working | Browser at `http://<host>:8088` lists discovered AirPlay speakers; ticking one connects it live (mid-stream join), unticking drops it; volume + now-playing shown. Verified end-to-end against shairport-sync. |
-| **AirPlay receiver mDNS advertisement** | ✅ Working | Hub appears under `_airplay._tcp` / `_raop._tcp` (`dns-sd -B`). |
+| **Web UI: mDNS discovery + live speaker selection** | ✅ Working | Browser at `http://<host>:8088` lists discovered AirPlay speakers; ticking one connects it live (mid-stream join), unticking drops it; volume + now-playing shown. |
 | **Google Cast source** | ⚠️ Stub (by design) | See limitation below. |
+
+## Protocol notes (hard-won, save yourself the week)
+
+- **The receiver cannot choose the stream type.** macOS/iOS system output
+  (the picker) computes ALAC *realtime* for every audio-class receiver —
+  including a real Sonos — before ever connecting; Music-class senders use
+  *buffered*. No TXT record or `/info` shape flips it, so a receiver must
+  accept type 96 to be usable from the picker.
+- **Modern senders bind audio transport only via `streamConnections`.** The
+  AirPlay 3.x-sdk stream `SETUP` carries `streamConnections` /
+  `streamConnectionID`; the reply must mirror them with our RTP/RTCP ports.
+  The legacy `dataPort`/`controlPort` keys are ignored — without the mirror
+  the sender's UDP channels die unbound ~10 ms after creation, with the
+  session otherwise healthy and **no error logged anywhere on either side**.
+- **Advertise routable IPv4 only.** mDNS AAAA records with a link-local v6
+  get resolved first by macOS; TCP survives but NW-UDP silently refuses to
+  dial a bare `fe80::` — audio goes nowhere.
+- **Never discipline the group to a speaker's clock.** Both Sonos and
+  Google-TV-class receivers are grandmaster-capable announcers (priority
+  248); whichever wins plays and every other speaker rejects anchors on a
+  timeline it can't see. The hub must *be* the grandmaster for everything —
+  and must announce to speakers at priority 247, since a 248 tie falls to
+  clock-identity comparison you can lose.
+- **Nothing may hold UDP 319/320 on a machine that *sends* picker-AirPlay** —
+  macOS aborts its own sessions instantly if the ports are taken. Fine on a
+  dedicated hub box; check `lsof -nP -iUDP:319 -iUDP:320` when debugging.
+- Debugging on macOS: `/usr/bin/log show --predicate 'process ==
+  "AirPlayXPCHelper"'` shows the sender's engine/transport decisions
+  (activation options, chosen `AudioEngineType`, per-connection dials).
 
 ## Deliberately incomplete
 
-- **AirPlay 2 *receiver* audio path (M3).** The receiver advertises and the
-  source slot is wired, but inbound **pairing (SRP transient pair-setup,
-  pair-verify), fp-setup (FairPlay), PTP timing, and the buffered-audio
-  decrypt/AAC-decode path are not implemented.** Disabled by default
-  (`AirPlayReceiver:Enabled=false`) so iOS doesn't show a device that can't
-  finish connecting. Reference implementations to port from: goplay2 and
-  shairport-sync.
 - **AirPlay 2 HAP sender for HomePods (M4) — built, needs a real HomePod to
-  finish.** A target with `Protocol: AirPlay2` now runs the full HAP path:
-  transient SRP pair-setup, HKDF-derived encrypted RTSP control channel
-  (`HapCipherStream`), realtime stream SETUP (type 96, `shk` audio key), and
-  per-packet ChaCha20-Poly1305 audio (`AirPlay2AudioCipher`) — all matched
-  constant-for-constant to pair_ap/OwnTone and unit-tested for internal
-  correctness. What remains is wire verification against actual HomePod
-  firmware: the SETUP plist field set is the most likely thing to need tuning
-  (Apple ignores/rejects unexpected keys), and there is no HomePod in the dev
-  environment to iterate against. RAOP (`Protocol: Auto`/`Raop`) remains the
-  verified path for third-party AirPlay 2 speakers. Reference: OwnTone
-  `outputs/airplay.c` + pair_ap.
+  finish.** A target with `Protocol: AirPlay2` runs the full HAP path
+  (transient SRP, encrypted RTSP, stream SETUP, per-packet ChaCha20), matched
+  constant-for-constant to pair_ap/OwnTone and unit-tested. What remains is
+  wire verification against actual HomePod firmware. Sonos/TV-class AirPlay 2
+  speakers and RAOP remain the verified paths.
 - **Google Cast playback.** Not implementable against official sender apps: a
   Cast receiver must complete CastV2 DeviceAuth with a **Google-CA-signed device
   certificate**, which senders verify. An emulated receiver is discovered but
   always rejected. `ICastSource` keeps the slot wired for any future licensed
   path.
+- **Receiver odds and ends:** Music-app (buffered) inbound not yet tested
+  end-to-end against a real Mac; multi-speaker sync *tightness* with a phone
+  source not yet measured (the chirp-calibration rig exists); persistent
+  HomeKit pairing not offered (transient PIN pairing only).
 
 ## Project layout
 
 | Project | Role |
 |---|---|
 | `Streamsemble.Core` | Format, `PcmFrame`, ring buffer, `IAudioSource`/`IAudioSink`/`ISourceArbiter`, arbiter, pump, WAV/null/tone sinks & sources. Zero protocol deps. |
-| `Streamsemble.Timing` | `IMasterClock` and the NTP timing responder — the sync foundation. |
-| `Streamsemble.Discovery` | mDNS browse (`_raop._tcp`) and advertise. |
-| `Streamsemble.AirPlay.Common` | (M3/M4) shared RTSP/plist/TLV8 + HAP pairing crypto. |
-| `Streamsemble.AirPlay.Sender` | RAOP session, RTP send, control/sync channel, `AirPlayTargetGroup` fan-out sink. |
-| `Streamsemble.AirPlay.Receiver` | Receiver source + mDNS advertisement (scaffolding). |
+| `Streamsemble.Timing` | `IMasterClock`, NTP timing responder, and the PTP stack: `PtpPortMux` (single owner of 319/320), `PtpReceiverClock` (the hub grandmaster), wire builders pinned by tests. |
+| `Streamsemble.Discovery` | mDNS browse and advertise (routable-IPv4-only records). |
+| `Streamsemble.AirPlay.Common` | Shared RTSP/plist/TLV8 + HAP pairing crypto, client and server side (`HapSrpServer`, transient pair-setup, FairPlay responder). |
+| `Streamsemble.AirPlay.Sender` | RAOP + AirPlay 2 sessions, RTP send, control/sync channel, `AirPlayTargetGroup` fan-out sink. |
+| `Streamsemble.AirPlay.Receiver` | Full receiver: RTSP server, session handling, realtime (ALAC) + buffered (AAC) audio servers, receiver source. |
 | `Streamsemble.Spotify` | Supervised librespot child process → PCM + events. |
 | `Streamsemble.Cast.Stub` | `ICastSource` stub. |
 | `Streamsemble.Host` | Console app: Generic Host, DI wiring, config. |
@@ -96,9 +117,13 @@ Prerequisites: **.NET 8 SDK**, and **librespot** on `PATH` for the Spotify
 source (`brew install librespot`).
 
 ```bash
-# Spotify → record to WAV (no speakers needed):
+# The full hub: AirPlay in (pick "Streamsemble Hub" on your phone) → speakers out.
+# Needs root/CAP_NET_BIND_SERVICE for PTP ports 319/320.
 dotnet run --project src/Streamsemble.Host -- \
-  --Streamsemble:Sink=Wav
+  --Streamsemble:Sink=AirPlay \
+  --AirPlayReceiver:Enabled=true --AirPlayReceiver:Name="Streamsemble Hub" \
+  --AirPlaySender:Targets:0:Name="Kitchen"     --AirPlaySender:Targets:0:Protocol=AirPlay2 --AirPlaySender:Targets:0:StreamMode=Buffered \
+  --AirPlaySender:Targets:1:Name="Living room TV" --AirPlaySender:Targets:1:Protocol=AirPlay2 --AirPlaySender:Targets:1:StreamMode=Buffered
 
 # Spotify → two AirPlay speakers, in sync (resolve by name via mDNS):
 dotnet run --project src/Streamsemble.Host -- \
@@ -106,37 +131,50 @@ dotnet run --project src/Streamsemble.Host -- \
   --AirPlaySender:Targets:0:Name="Living Room" \
   --AirPlaySender:Targets:1:Name="Kitchen"
 
+# AirPlay in → record to WAV (no speakers needed):
+dotnet run --project src/Streamsemble.Host -- \
+  --Streamsemble:Sink=Wav --AirPlayReceiver:Enabled=true --Spotify:Enabled=false
+
 # Test tone (click track) → speaker, no Spotify:
 dotnet run --project src/Streamsemble.Host -- \
   --Streamsemble:TestTone=true --Streamsemble:Sink=AirPlay --Spotify:Enabled=false \
   --AirPlaySender:Targets:0:Host=192.168.1.50
 ```
 
-Then open Spotify and pick **Streamsemble** as the playback device.
+For Spotify, open the app and pick **Streamsemble** as the playback device.
+
+> ⚠️ Don't run the receiver on a machine you also AirPlay *from* via the
+> system picker: the hub's PTP clock owns UDP 319/320, and macOS aborts its
+> own outbound AirPlay sessions when anything holds those ports. Streaming
+> from *other* devices (phones, other Macs) to a hub on this machine is fine.
 
 ### Configuration (`src/Streamsemble.Host/appsettings.json`)
 
 - `Streamsemble:DeviceName` — advertised name.
 - `Streamsemble:Sink` — `AirPlay` | `Wav` | `Null`.
-- `AirPlaySender:Targets[]` — `{ Name | Host, Port, Protocol, Encryption, LatencyTrimMs }`.
+- `AirPlaySender:Targets[]` — `{ Name | Host, Port, Protocol, StreamMode, Encryption, LatencyTrimMs }`.
+  `StreamMode: Buffered` is the verified mode for AirPlay 2 speakers.
   `LatencyTrimMs` manually trims one speaker's alignment if a vendor's reported
   latency is off.
+- `AirPlayReceiver:Enabled`, `AirPlayReceiver:Name` — the inbound AirPlay hub.
 - `Spotify:Enabled`, `Spotify:LibrespotPath`, `Spotify:Bitrate`.
-- `AirPlayReceiver:Enabled` — leave `false` until M3.
 
 ## Testing
 
 ```bash
-dotnet test          # ring buffer, arbiter, ALAC packer
+dotnet test    # 45 AirPlay tests + core: SRP client↔server interop, ALAC
+               # decoder vs ffmpeg golden vectors, PTP grandmaster wire pins,
+               # ring buffer, arbiter, packers
 ```
 
-The multi-room sync was verified end-to-end with two local shairport-sync
-receivers (one bound to IPv4, one to IPv6 on port 5000) and an FFT
-cross-correlation of their captured output; see the "What works" table.
+Multi-room sync was verified end-to-end on real devices (TV + Sonos,
+≲25 ms native alignment) and earlier with two local shairport-sync receivers
+and FFT cross-correlation (~1.8 ms).
 
 ## Linux deployment notes
 
-Everything is cross-platform. The librespot event helper uses `curl`
-(present on typical Linux hosts). A future AirPlay 2 receiver's PTP responder
-needs ports 319/320 (`setcap CAP_NET_BIND_SERVICE` or root) and conflicts with
-any nqptp/shairport-sync on the same host.
+Everything is cross-platform; the receiver has run on Ubuntu 24.04 arm64
+(`dotnet publish -r linux-arm64 --self-contained`). The PTP clock needs
+ports 319/320 (`setcap CAP_NET_BIND_SERVICE` or root) and conflicts with any
+nqptp/shairport-sync on the same host. The librespot event helper uses
+`curl` (present on typical Linux hosts).
