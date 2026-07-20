@@ -799,6 +799,16 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     /// <summary>Set by the group: returns (PTP now in UNIX nanos, grandmaster clock id) once timing is up.</summary>
     public Func<(ulong Nanos, byte[] ClockId)?>? AnchorClock { get; set; }
 
+    /// <summary>
+    /// Set by the group: the epoch's canonical capture→nanos anchor. When set,
+    /// SETRATEANCHORTIME derives from it so this session joins the incumbents'
+    /// timeline instead of re-anchoring against "now".
+    /// </summary>
+    public GroupTimelineAnchor? GroupAnchor { get; set; }
+
+    /// <summary>Capture-counter position just past the last PCM handed to this session.</summary>
+    private long _pcmCaptureEnd;
+
     private bool _bufferedAlac;
     private readonly System.Threading.Channels.Channel<byte[]> _alacFrames =
         System.Threading.Channels.Channel.CreateBounded<byte[]>(new System.Threading.Channels.BoundedChannelOptions(256)
@@ -808,9 +818,16 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest,
         });
 
-    /// <summary>Live PCM in (s16le 44100 stereo); the pump encodes and ships it.</summary>
-    public ValueTask WritePcmAsync(ReadOnlyMemory<byte> pcm, CancellationToken ct)
+    /// <summary>
+    /// Live PCM in (s16le 44100 stereo); the pump encodes and ships it.
+    /// <paramref name="captureTimestamp"/> is the shared capture-counter
+    /// position of the first sample (PcmFrame.Timestamp) — the common index
+    /// space the group anchor maps onto.
+    /// </summary>
+    public ValueTask WritePcmAsync(ReadOnlyMemory<byte> pcm, long captureTimestamp, CancellationToken ct)
     {
+        Volatile.Write(ref _pcmCaptureEnd, captureTimestamp + pcm.Length / 4);
+
         if (_bufferedAlac)
         {
             // One PcmFrame (352 samples) per call — pack directly, no encoder.
@@ -889,7 +906,11 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                     var ageSamples = _aac is { } aac
                         ? Math.Max(0, aac.PcmSamplesIn - (framesSent + framesDropped) * samplesPerFrame)
                         : 0;
-                    anchored = await SendAnchorAsync(rtpTime, ageSamples, ct).ConfigureAwait(false);
+                    // Capture-counter index of the frame being anchored (ALAC
+                    // has no encoder pipeline; its packed-queue skew was never
+                    // tracked and stays untracked).
+                    var captureSample = Volatile.Read(ref _pcmCaptureEnd) - ageSamples;
+                    anchored = await SendAnchorAsync(rtpTime, ageSamples, captureSample, ct).ConfigureAwait(false);
                     if (anchored && Environment.GetEnvironmentVariable("STREAMSEMBLE_TV_NUDGE") != "0")
                     {
                         await SendNowPlayingAsync(firstRtpTime, rtpTime, ct).ConfigureAwait(false);
@@ -1014,9 +1035,12 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
     /// <summary>
     /// SETRATEANCHORTIME rate=1: "RTP timestamp X plays at network time T" on
-    /// the grandmaster timeline — this is what actually starts playback.
+    /// the grandmaster timeline — this is what actually starts playback. The
+    /// mapping is derived from the group's epoch anchor when one exists, so a
+    /// late joiner lands on the incumbents' timeline; only the first anchor of
+    /// an epoch derives from "now".
     /// </summary>
-    private async Task<bool> SendAnchorAsync(uint rtpTime, long contentAgeSamples, CancellationToken ct)
+    private async Task<bool> SendAnchorAsync(uint rtpTime, long contentAgeSamples, long captureSample, CancellationToken ct)
     {
         var clock = AnchorClock?.Invoke();
         if (clock is not { } anchor)
@@ -1033,8 +1057,35 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         // pipeline delay, measured live); schedule it that much earlier so PCM
         // captured at T plays at exactly T + group latency on every receiver.
         var ageNanos = (ulong)(contentAgeSamples * 1_000_000_000L / 44100);
-        var nanos = anchor.Nanos + (ulong)(GroupPresentationLatencySeconds * 1_000_000_000) + (ulong)(LatencyTrimMs * 1_000_000L) - ageNanos;
+        var proposed = anchor.Nanos + (ulong)(GroupPresentationLatencySeconds * 1_000_000_000) - ageNanos;
         logger.LogInformation("{Name}: anchor content age {Ms:F0} ms (encoder pipeline), compensating", DisplayName, contentAgeSamples * 1000.0 / 44100);
+
+        var baseNanos = proposed;
+        if (GroupAnchor is { } groupAnchor)
+        {
+            var (mappedNanos, established, debtMs) = groupAnchor.Map(captureSample, proposed);
+            baseNanos = mappedNanos;
+            if (!established)
+            {
+                logger.LogInformation(
+                    "{Name}: anchor mapped onto group epoch ({Debt:F0} ms source-gap debt inherited)",
+                    DisplayName, debtMs);
+                // A mapped render time at/behind "now" can't be played: the
+                // epoch anchor is stale (a missed group reset) or the debt
+                // outgrew the presentation window. Re-establish from now —
+                // audibly out of group sync, but playing, and loud in the log.
+                if (baseNanos < anchor.Nanos + 500_000_000UL)
+                {
+                    logger.LogWarning(
+                        "{Name}: group epoch anchor unusable (mapped anchor {Ms:F0} ms behind now) — re-establishing",
+                        DisplayName, ((long)anchor.Nanos - (long)baseNanos) / 1e6);
+                    groupAnchor.Reset();
+                    (baseNanos, _, _) = groupAnchor.Map(captureSample, proposed);
+                }
+            }
+        }
+
+        var nanos = baseNanos + (ulong)(LatencyTrimMs * 1_000_000L);
         var fracNanos = nanos % 1_000_000_000;
         var frac64 = (ulong)(((UInt128)fracNanos << 64) / 1_000_000_000);
 

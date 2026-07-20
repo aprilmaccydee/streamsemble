@@ -173,6 +173,14 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     private long? _timestampBase;
     private double _anchorSeconds;
     private long _anchorOffset;
+
+    /// <summary>
+    /// Epoch anchor shared by every buffered session: late joiners map onto
+    /// the incumbents' capture→nanos timeline instead of anchoring at "now".
+    /// Reset wherever the WHOLE group re-anchors (the same places that null
+    /// _timestampBase); never on per-session joins/reconnects.
+    /// </summary>
+    private readonly AirPlay2.GroupTimelineAnchor _groupAnchor = new();
     private uint _rtpHead;
     private long _packetsSent;
     private long _rateCount;
@@ -200,6 +208,15 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         }
 
         _timingResponder.Start(_options.Value.TimingPort);
+
+        // The hold/drop latches are group state and survive a stream teardown:
+        // a network blip mid-pause (source → Idle sets the hold, then the
+        // arbiter stops the stream) left the NEXT stream starting held — the
+        // send loop sat in "holding" forever with every connection healthy,
+        // and the release could never come because resume only fired on
+        // Paused→Active. A fresh stream starts with a clean slate.
+        _holdFrames = false;
+        _dropQueuedFrames = false;
 
         _seq = (ushort)Random.Shared.Next(ushort.MaxValue);
         _rtpBase = (uint)Random.Shared.Next();
@@ -291,15 +308,30 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
 
             if (missing.Count > 0)
             {
+                bool anyLive;
+                lock (_gate)
+                {
+                    anyLive = _sessions.Count > 0;
+                }
+
                 // For PTP speakers, restart the RTP timeline cleanly (fresh
                 // anchor at _rtpBase, marker bit on the first packet) BEFORE
                 // connecting, so RECORD, FLUSH and audio all agree on the
-                // anchor. Once per batch — every joiner shares it.
-                if (missing.Any(m => !m.Target.Protocol.Equals("Raop", StringComparison.OrdinalIgnoreCase)))
+                // anchor — but ONLY when nobody is rendering (fresh start or
+                // whole-group reconnect). With audio live, a joiner adopts the
+                // running timeline (its RECORD hint is _rtpHead) and the group
+                // must not be disturbed: nulling _timestampBase mid-stream
+                // delays all subsequent sends by StartLead (0.25 s) without
+                // re-anchoring anyone, so the health loop retrying an absent
+                // speaker every ~20 s bled the receivers' 2 s buffered cushion
+                // dry — audio stuttered and died mid-track while packets kept
+                // flowing.
+                if (!anyLive && missing.Any(m => !m.Target.Protocol.Equals("Raop", StringComparison.OrdinalIgnoreCase)))
                 {
                     _timestampBase = null;
                     _sendMarker = true;
                     _lastSyncRtp = 0;
+                    _groupAnchor.Reset();
                 }
 
                 // Sessions are fully independent (own TCP/pairing/SETUP), so
@@ -509,8 +541,11 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                     GroupPeerAddresses = await ResolveGroupAddressesAsync(ct).ConfigureAwait(false),
                 };
                 // Buffered playback anchors to OUR grandmaster clock via
-                // SETRATEANCHORTIME once the first frame is ready.
+                // SETRATEANCHORTIME once the first frame is ready, mapped
+                // through the group's epoch anchor so late joiners land on
+                // the incumbents' timeline.
                 ap2.AnchorClock = () => ((ulong)Timing.Ptp.PtpReceiverClock.NowNanos, _gmClock.ClockId);
+                ap2.GroupAnchor = _groupAnchor;
                 await ap2.ConnectAsync(_timingResponder.Port, _control!.Port, _seq, startRtp, ct).ConfigureAwait(false);
                 session = ap2;
             }
@@ -667,7 +702,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                     {
                         try
                         {
-                            await bufferedSession.WritePcmAsync(pcm, ct).ConfigureAwait(false);
+                            await bufferedSession.WritePcmAsync(pcm, frame.Timestamp, ct).ConfigureAwait(false);
                         }
                         catch (Exception ex) when (ex is not OperationCanceledException)
                         {
@@ -854,6 +889,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _sendFirstSync = true;
         _syncPending = true;
         _lastSyncRtp = 0;
+        _groupAnchor.Reset();
 
         var sessions = SessionSnapshot();
         _logger.LogInformation("flushing {Count} target(s) (drop buffered audio, re-anchor)", sessions.Length);
