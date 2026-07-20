@@ -26,12 +26,12 @@ dependency injection throughout.
 | **One hub grandmaster clock (PTP)** | ✅ Working | `PtpPortMux` owns UDP 319/320; `PtpReceiverClock` serves inbound senders (priority 248, TV-exact wire shape) *and* the speaker group (priority 247) from one clock id. Macs/iPhones demonstrably slave to it (continuous Delay_Req), and all speaker anchors validate on its timeline. |
 | **Spotify Connect source** | ✅ Working | librespot child process; the device "Streamsemble" appears in the Spotify app and streams S16LE PCM into the pipeline. |
 | **AirPlay 2 / RAOP sender → 1 speaker** | ✅ Working | Streamed a 440 Hz tone to shairport-sync; recovered a clean 440 Hz tone at the receiver. |
-| **Sender fan-out → N speakers, in sync** | ✅ Working | Real-device group (TV + Sonos) natively synced ≲25 ms with zero manual trims; earlier shairport-sync pair showed ~1.8 ms content skew by cross-correlation. |
+| **Sender fan-out → N speakers, in sync** | ✅ Working | Real-device group (TV + Sonos) natively synced ≲25 ms with zero manual trims; earlier shairport-sync pair showed ~1.8 ms content skew by cross-correlation. Late joiners map onto the group's epoch anchor (`GroupTimelineAnchor`) instead of anchoring at "now", so a speaker joining mid-stream lands on the house timeline. |
 | **Retransmit / packet ring** | ✅ Working | Control channel answers RAOP resend requests from a shared plain-packet ring, re-framed per target. |
 | **ALAC decoder (Apple reference port)** | ✅ Working, unit-tested | SCE/CPE/verbatim/partial frames, all three magic-cookie forms; byte-identical against ffmpeg-generated golden vectors. |
-| **Volume & metadata forwarding** | ✅ Working | Spotify volume/track events → RAOP `SET_PARAMETER` (dB volume, DMAP metadata). Inbound sender volume is observe-only by design. |
+| **Volume & metadata forwarding** | ✅ Working | Spotify volume/track events → RAOP `SET_PARAMETER` (dB volume, DMAP metadata). Per-speaker volume is also read back from the device (`GET_PARAMETER`, on connect + periodic) and settable per speaker from the web UI. Inbound sender volume is observe-only by design. |
 | **Source arbitration** | ✅ Working | Last source to play wins; the previous source is asked to yield. Unit-tested. |
-| **Web UI: mDNS discovery + live speaker selection** | ✅ Working | Browser at `http://<host>:8088` lists discovered AirPlay speakers; ticking one connects it live (mid-stream join), unticking drops it; volume + now-playing shown. |
+| **Web UI: discovery, selection, volume, sync telemetry** | ✅ Working | Browser at `http://<host>:8088` lists discovered AirPlay speakers; ticking one connects it live (mid-stream join), unticking drops it. Per-speaker + averaged global volume, live sync/latency graphic, and a technical panel (anchor state, buffer lead, PTP lock, epoch). |
 | **Google Cast source** | ⚠️ Stub (by design) | See limitation below. |
 
 ## Protocol notes (hard-won, save yourself the week)
@@ -40,7 +40,10 @@ dependency injection throughout.
   (the picker) computes ALAC *realtime* for every audio-class receiver —
   including a real Sonos — before ever connecting; Music-class senders use
   *buffered*. No TXT record or `/info` shape flips it, so a receiver must
-  accept type 96 to be usable from the picker.
+  accept type 96 to be usable from the picker. (Observed in
+  `AirPlayXPCHelper` engine logs, 2026-07-19: `engine RTAudio, audioFormat
+  0x40000` even when targeting the Sonos; see `ReceiverFeatures.cs`. The
+  Mac→Sonos/TV *buffered* pcaps in `debug/` are Music-app sessions.)
 - **Modern senders bind audio transport only via `streamConnections`.** The
   AirPlay 3.x-sdk stream `SETUP` carries `streamConnections` /
   `streamConnectionID`; the reply must mirror them with our RTP/RTCP ports.
@@ -67,10 +70,14 @@ dependency injection throughout.
 
 - **AirPlay 2 HAP sender for HomePods (M4) — built, needs a real HomePod to
   finish.** A target with `Protocol: AirPlay2` runs the full HAP path
-  (transient SRP, encrypted RTSP, stream SETUP, per-packet ChaCha20), matched
-  constant-for-constant to pair_ap/OwnTone and unit-tested. What remains is
-  wire verification against actual HomePod firmware. Sonos/TV-class AirPlay 2
-  speakers and RAOP remain the verified paths.
+  (encrypted RTSP, stream SETUP, per-packet ChaCha20), matched
+  constant-for-constant to pair_ap/OwnTone and unit-tested. Pairing is
+  transient SRP by default, or **verified HomeKit PIN pairing** with a
+  persisted identity (`STREAMSEMBLE_PAIR=1`, PIN via
+  `~/.streamsemble/pin.txt`) — the path TV-class receivers require before
+  they render. What remains is wire verification against actual HomePod
+  firmware. Sonos/TV-class AirPlay 2 speakers and RAOP remain the verified
+  paths.
 - **Google Cast playback.** Not implementable against official sender apps: a
   Cast receiver must complete CastV2 DeviceAuth with a **Google-CA-signed device
   certificate**, which senders verify. An emulated receiver is discovered but
@@ -100,25 +107,47 @@ dependency injection throughout.
 Run the host and open **`http://localhost:8088`** (also reachable from a phone
 on the same LAN at `http://<host-ip>:8088`). The page:
 
-- lists AirPlay speakers **discovered live via mDNS** (`_raop._tcp`),
+- lists AirPlay speakers **discovered live via mDNS** (`_raop._tcp` +
+  `_airplay._tcp`, so AirPlay-2-only devices like TVs appear too),
 - lets you **tick speakers to play to them** — selection is applied to the
   running fan-out group immediately, so a speaker can join or leave *while audio
   is playing*, staying in sync via the shared clock,
-- shows the active source, now-playing metadata, and a master volume slider.
+- shows **per-speaker volume sliders** fed by the device's own reported volume
+  (read-only `GET_PARAMETER` on connect + periodic refresh, so changes made
+  from the speaker's own app show up); the global slider reports the **mean of
+  the live speaker volumes** and sets all speakers when moved,
+- shows the active source and now-playing metadata plus the live pipeline
+  state (playing / paused-with-pipeline-held / stopped, send-queue depth,
+  anchored count, packet rate),
+- draws a **sync & latency graphic**: per-speaker render-head lead vs the
+  group presentation-latency target with sparkline history, lock/cushion
+  badges, and a hover tooltip (encoder pipeline age, inherited join debt,
+  last PTP `Delay_Req`),
+- ends with a **technical details panel**: group epoch anchor, grandmaster
+  clock id, and a per-session table (mode, pairing, anchor state, trims,
+  reported latency, timeline id).
 
-The REST API behind it (usable directly): `GET /api/state`,
+The REST API behind it (usable directly): `GET /api/state` (now includes
+`speakers[]` per-session telemetry and a group `telemetry` object),
 `POST /api/targets` (`{ "targets": [ { "name": "Living Room" } ] }`),
-`POST /api/volume` (`{ "volume": 0.7 }`). Configured `AirPlaySender:Targets`
-seed the initial selection, so headless/config-only operation still works.
+`POST /api/volume` (`{ "volume": 0.7 }`, all speakers), and
+`POST /api/speakers/volume` (`{ "name": "Kitchen", "volume": 0.4 }`, one
+speaker). Configured `AirPlaySender:Targets` seed the initial selection, so
+headless/config-only operation still works.
 
 ## Running
 
-Prerequisites: **.NET 8 SDK**, and **librespot** on `PATH` for the Spotify
-source (`brew install librespot`).
+Prerequisites: **.NET 8 SDK**, and **librespot** for the Spotify source
+(`brew install librespot`, found on `PATH` by default; point
+`Spotify:LibrespotPath` at a custom binary). For unattended running, build the
+resilience fork (`tools/librespot-resilience.patch`) — stock librespot exits
+when Spotify's server drops the session; the fork re-announces and reclaims
+playback.
 
 ```bash
 # The full hub: AirPlay in (pick "Streamsemble Hub" on your phone) → speakers out.
-# Needs root/CAP_NET_BIND_SERVICE for PTP ports 319/320.
+# PTP ports 319/320: macOS allows binding them unprivileged; Linux needs
+# root or CAP_NET_BIND_SERVICE.
 dotnet run --project src/Streamsemble.Host -- \
   --Streamsemble:Sink=AirPlay \
   --AirPlayReceiver:Enabled=true --AirPlayReceiver:Name="Streamsemble Hub" \
@@ -157,12 +186,17 @@ For Spotify, open the app and pick **Streamsemble** as the playback device.
   `LatencyTrimMs` manually trims one speaker's alignment if a vendor's reported
   latency is off.
 - `AirPlayReceiver:Enabled`, `AirPlayReceiver:Name` — the inbound AirPlay hub.
-- `Spotify:Enabled`, `Spotify:LibrespotPath`, `Spotify:Bitrate`.
+- `Spotify:Enabled`, `Spotify:LibrespotPath`, `Spotify:Bitrate`,
+  `Spotify:ExtraArgs` (passed through to librespot, e.g. `--volume-ctrl fixed`).
+- Verified HomeKit pairing for strict receivers (TVs): set
+  `STREAMSEMBLE_PAIR=1`, then write the on-screen PIN to
+  `~/.streamsemble/pin.txt` when prompted; the identity persists for future
+  connects.
 
 ## Testing
 
 ```bash
-dotnet test    # 45 AirPlay tests + core: SRP client↔server interop, ALAC
+dotnet test    # 56 tests (AirPlay + core): SRP client↔server interop, ALAC
                # decoder vs ffmpeg golden vectors, PTP grandmaster wire pins,
                # ring buffer, arbiter, packers
 ```
