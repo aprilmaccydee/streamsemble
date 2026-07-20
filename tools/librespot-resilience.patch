@@ -1,0 +1,346 @@
+diff --git a/connect/src/spirc.rs b/connect/src/spirc.rs
+index fec6057..0e42a89 100644
+--- a/connect/src/spirc.rs
++++ b/connect/src/spirc.rs
+@@ -19,9 +19,13 @@ use crate::{
+     protocol::{
+         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
+         context::Context,
++        context_player_options::ContextPlayerOptions as TransferPlayerOptions,
++        context_track::ContextTrack,
+         explicit_content_pubsub::UserAttributesUpdate,
+-        player::ProvidedTrack,
++        playback::Playback as TransferPlayback,
++        player::{PlayerState, ProvidedTrack},
+         playlist4_external::PlaylistModificationInfo,
++        session::Session as TransferSession,
+         social_connect_v2::SessionUpdate,
+         transfer_state::TransferState,
+         user_attributes::UserAttributesMutation,
+@@ -103,6 +107,10 @@ struct SpircTask {
+     /// is set when transferring, and used after resolving the contexts to finish the transfer
+     pub transfer_state: Option<TransferState>,
+ 
++    /// play session id of a previous spirc instance in this process whose
++    /// orphaned cluster state we may take back (see [ConnectConfig::reclaim_session_id])
++    reclaim_session_id: Option<String>,
++
+     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
+     /// when no other future resolves, otherwise resets the delay
+     update_volume: bool,
+@@ -144,6 +152,10 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
+ const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
+ // to reduce updates to remote, we group some request by waiting for a set amount of time
+ const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
++// how often the event loop wakes to re-check `session.is_invalid()` — without
++// this, a silently died session is only noticed at the next dealer/player
++// event, which can be tens of seconds later
++const SESSION_INVALID_POLL: Duration = Duration::from_secs(2);
+ 
+ /// The spotify connect handle
+ pub struct Spirc {
+@@ -176,6 +188,7 @@ impl Spirc {
+         debug!("new Spirc[{spirc_id}]");
+ 
+         let emit_set_queue_events = config.emit_set_queue_events;
++        let reclaim_session_id = config.reclaim_session_id.clone();
+         let connect_state = ConnectState::new(config, &session);
+ 
+         let connection_id_update = session
+@@ -258,6 +271,7 @@ impl Spirc {
+             session,
+ 
+             transfer_state: None,
++            reclaim_session_id,
+             update_volume: false,
+             update_state: false,
+ 
+@@ -585,22 +599,28 @@ impl SpircTask {
+                         }
+                     }
+                 },
++                // wake the loop periodically so the `while` guard re-evaluates
++                // `session.is_invalid()` promptly after a silent session death
++                _ = async { sleep(SESSION_INVALID_POLL).await } => {},
+                 else => break
+             }
+         }
+ 
+         if !self.shutdown && self.connect_state.is_active() {
+-            warn!("unexpected shutdown");
+-            if let Err(why) = self.handle_disconnect().await {
+-                error!("error during disconnecting: {why}")
+-            }
++            // Unexpected shutdown — typically the AP session died underneath
++            // us and the main task is about to relaunch spirc. Deliberately
++            // keep the connect state: deleting it removes this device as the
++            // cluster's active player, detaching every client, and the
++            // relaunched spirc could then never recognize the state as its
++            // own (see handle_connection_id_update).
++            warn!("unexpected shutdown — keeping connect state for takeover after relaunch");
++        } else {
++            // this should clear the active session id, leaving an empty state
++            if let Err(why) = self.session.spclient().delete_connect_state_request().await {
++                error!("error during connect state deletion: {why}")
++            };
+         }
+ 
+-        // this should clear the active session id, leaving an empty state
+-        if let Err(why) = self.session.spclient().delete_connect_state_request().await {
+-            error!("error during connect state deletion: {why}")
+-        };
+-
+         self.session.dealer().close().await;
+     }
+ 
+@@ -911,30 +931,114 @@ impl SpircTask {
+ 
+         let same_session = cluster.player_state.session_id == self.session.session_id()
+             || cluster.player_state.session_id.is_empty();
+-        if !cluster.active_device_id.is_empty() || !same_session {
++        let active_is_us = cluster.active_device_id == self.session.device_id();
++        // After an unexpected spirc relaunch the session id can never match
++        // (every session is new) and the server clears active_device_id the
++        // moment our old dealer connection dies — but it keeps the last
++        // player_state we reported, including its play session id. If that id
++        // matches the session we ran before the relaunch, the orphaned state
++        // is ours to take back.
++        let reclaim_ours = (cluster.active_device_id.is_empty() || active_is_us)
++            && self
++                .reclaim_session_id
++                .as_deref()
++                .is_some_and(|old| !old.is_empty() && cluster.player_state.session_id == old);
++        let state_is_ours = active_is_us || reclaim_ours;
++
++        if (!cluster.active_device_id.is_empty() || !same_session) && !state_is_ours {
+             info!(
+                 "active device is <{}> with session <{}>",
+                 cluster.active_device_id, cluster.player_state.session_id
+             );
+             return Ok(());
+-        } else if cluster.transfer_data.is_empty() {
+-            debug!("got empty transfer state, do nothing");
+-            return Ok(());
++        }
++
++        use protobuf::Message;
++
++        let transfer = if !cluster.transfer_data.is_empty() {
++            match TransferState::parse_from_bytes(&cluster.transfer_data) {
++                Ok(transfer_state) => Some(transfer_state),
++                Err(why) => {
++                    error!("failed to take over control: {why}");
++                    None
++                }
++            }
++        } else if reclaim_ours && cluster.player_state.track.is_some() {
++            // no transfer_data after a relaunch — rebuild the transfer from
++            // the player_state the server retained for us
++            Some(Self::transfer_from_orphaned_state(&cluster.player_state))
+         } else {
++            debug!("got empty transfer state, do nothing");
++            None
++        };
++
++        if let Some(transfer_state) = transfer {
+             info!(
+-                "trying to take over control automatically, session_id: {}",
++                "trying to take over control automatically{}, session_id: {}",
++                if state_is_ours && !same_session {
++                    " (reclaiming after relaunch)"
++                } else {
++                    ""
++                },
+                 cluster.player_state.session_id
+-            )
++            );
++            self.handle_transfer(transfer_state)?
+         }
+ 
+-        use protobuf::Message;
++        Ok(())
++    }
+ 
+-        match TransferState::parse_from_bytes(&cluster.transfer_data) {
+-            Ok(transfer_state) => self.handle_transfer(transfer_state)?,
+-            Err(why) => error!("failed to take over control: {why}"),
++    /// Rebuild a [TransferState] from the player state the server retained
++    /// for this device. After an unexpected relaunch the cluster carries no
++    /// transfer_data — only the last player_state we reported — so a reclaim
++    /// has to reconstruct the transfer payload itself. The queue is not part
++    /// of player_state and is lost; the context is re-resolved from its uri.
++    fn transfer_from_orphaned_state(player_state: &PlayerState) -> TransferState {
++        let mut transfer = TransferState::new();
++
++        let mut options = TransferPlayerOptions::new();
++        if let Some(o) = player_state.options.as_ref() {
++            options.set_shuffling_context(o.shuffling_context);
++            options.set_repeating_context(o.repeating_context);
++            options.set_repeating_track(o.repeating_track);
+         }
++        transfer.options = MessageField::some(options);
++
++        let mut playback = TransferPlayback::new();
++        playback.set_timestamp(player_state.timestamp);
++        playback.set_is_paused(player_state.is_paused);
++        // handle_transfer only advances the position by the time elapsed
++        // since `timestamp` when position_as_of_timestamp > 0, but our last
++        // report usually went out right at track start with position 0 —
++        // clamp a playing track to 1 ms so the elapsed time isn't discarded
++        // and the track doesn't restart from the top
++        let position = player_state
++            .position_as_of_timestamp
++            .clamp(0, i32::MAX.into()) as i32;
++        playback.set_position_as_of_timestamp(if player_state.is_paused {
++            position
++        } else {
++            position.max(1)
++        });
+ 
+-        Ok(())
++        if let Some(track) = player_state.track.as_ref() {
++            let mut current_track = ContextTrack::new();
++            current_track.set_uri(track.uri.clone());
++            if !track.uid.is_empty() {
++                current_track.set_uid(track.uid.clone());
++            }
++            current_track.metadata = track.metadata.clone();
++            playback.current_track = MessageField::some(current_track);
++        }
++        transfer.playback = MessageField::some(playback);
++
++        let mut context = Context::new();
++        context.set_uri(player_state.context_uri.clone());
++        let mut session = TransferSession::new();
++        session.context = MessageField::some(context);
++        transfer.current_session = MessageField::some(session);
++
++        transfer
+     }
+ 
+     fn handle_user_attributes_update(&mut self, update: UserAttributesUpdate) {
+diff --git a/connect/src/state.rs b/connect/src/state.rs
+index f810d85..3d4993f 100644
+--- a/connect/src/state.rs
++++ b/connect/src/state.rs
+@@ -92,6 +92,14 @@ pub struct ConnectConfig {
+     pub volume_steps: u16,
+     /// Emit `SetQueue` player events when the queue changes (default: false)
+     pub emit_set_queue_events: bool,
++    /// Play session id of a previous spirc instance in this process whose
++    /// orphaned cluster state this instance may take back (default: None)
++    ///
++    /// After an unexpected session death the server clears the cluster's
++    /// active_device_id but keeps the last reported player_state, including
++    /// its session id. A relaunched spirc can recognize that state as its
++    /// own only by comparing against the dead session's id.
++    pub reclaim_session_id: Option<String>,
+ }
+ 
+ impl Default for ConnectConfig {
+@@ -104,6 +112,7 @@ impl Default for ConnectConfig {
+             disable_volume: false,
+             volume_steps: 64,
+             emit_set_queue_events: false,
++            reclaim_session_id: None,
+         }
+     }
+ }
+diff --git a/core/src/audio_key.rs b/core/src/audio_key.rs
+index 42cad43..03bfbfd 100644
+--- a/core/src/audio_key.rs
++++ b/core/src/audio_key.rs
+@@ -79,6 +79,34 @@ impl AudioKeyManager {
+     }
+ 
+     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
++        // A single 1.5 s shot loses the race right after a session (re)connect,
++        // when the server routinely answers the first key request late or not
++        // at all — and a lost key kills the whole track. Retry a couple of
++        // times before giving up; a dead session fails fast in send anyway.
++        const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
++        const KEY_REQUEST_ATTEMPTS: u32 = 3;
++
++        let mut last_error = None;
++        for attempt in 1..=KEY_REQUEST_ATTEMPTS {
++            match self.request_once(track, file, KEY_RESPONSE_TIMEOUT).await {
++                Ok(key) => return Ok(key),
++                Err(e) => {
++                    warn!("audio key request attempt {attempt}/{KEY_REQUEST_ATTEMPTS} failed: {e}");
++                    last_error = Some(e);
++                }
++            }
++        }
++
++        error!("Audio key response timeout");
++        Err(last_error.unwrap_or_else(|| AudioKeyError::Timeout.into()))
++    }
++
++    async fn request_once(
++        &self,
++        track: SpotifyId,
++        file: FileId,
++        timeout: Duration,
++    ) -> Result<AudioKey, Error> {
+         let (tx, rx) = oneshot::channel();
+ 
+         let seq = self.lock(move |inner| {
+@@ -88,10 +116,11 @@ impl AudioKeyManager {
+         });
+ 
+         self.send_key_request(seq, track, file)?;
+-        const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+-        match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
++        match tokio::time::timeout(timeout, rx).await {
+             Err(_) => {
+-                error!("Audio key response timeout");
++                // drop the stale pending entry so a late reply isn't
++                // mistaken for a live request
++                self.lock(|inner| inner.pending.remove(&seq));
+                 Err(AudioKeyError::Timeout.into())
+             }
+             Ok(k) => k?,
+diff --git a/src/main.rs b/src/main.rs
+index 16ba194..bd41519 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1535,6 +1535,7 @@ async fn get_setup() -> Setup {
+             disable_volume,
+             volume_steps,
+             emit_set_queue_events: false,
++            reclaim_session_id: None,
+         }
+     };
+ 
+@@ -1896,6 +1897,9 @@ async fn main() {
+     let mut spirc: Option<Spirc> = None;
+     let mut spirc_task: Option<Pin<_>> = None;
+     let mut auto_connect_times: Vec<Instant> = vec![];
++    // play session id of a spirc that died unexpectedly, so its relaunched
++    // successor can recognize the orphaned cluster state as its own
++    let mut orphaned_session_id: Option<String> = None;
+     let mut discovery = None;
+     let mut connecting = false;
+     let mut _event_handler: Option<EventHandler> = None;
+@@ -2047,7 +2051,8 @@ async fn main() {
+                     player.set_session(session.clone());
+                 }
+ 
+-                let connect_config = setup.connect_config.clone();
++                let mut connect_config = setup.connect_config.clone();
++                connect_config.reclaim_session_id = orphaned_session_id.take();
+ 
+                 let (spirc_, spirc_task_) = match Spirc::new(connect_config,
+                                                                 session.clone(),
+@@ -2074,6 +2079,11 @@ async fn main() {
+ 
+                 warn!("Spirc shut down unexpectedly");
+ 
++                // remember the dead session's play session id — the cluster
++                // still carries it in player_state, and it is the only way
++                // the relaunched spirc can recognize that state as its own
++                orphaned_session_id = Some(session.session_id());
++
+                 let mut reconnect_exceeds_rate_limit = || {
+                     auto_connect_times.retain(|&t| t.elapsed() < RECONNECT_RATE_LIMIT_WINDOW);
+                     auto_connect_times.len() > RECONNECT_RATE_LIMIT
