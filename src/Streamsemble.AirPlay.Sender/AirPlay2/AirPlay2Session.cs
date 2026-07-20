@@ -71,11 +71,38 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
     public void NoteRtpTime(uint rtpTime) => _lastKnownRtpTime = rtpTime;
 
+    public float? LastKnownVolume { get; private set; }
+
     public async Task SetVolumeAsync(float linear, CancellationToken ct)
     {
         var db = linear <= 0.001f ? -144.0 : -30.0 + linear * 30.0;
         var body = System.Text.Encoding.ASCII.GetBytes($"volume: {db:F6}\r\n");
-        await _rtsp.RequestAsync("SET_PARAMETER", ct, "text/parameters", body).ConfigureAwait(false);
+        var response = await _rtsp.RequestAsync("SET_PARAMETER", ct, "text/parameters", body).ConfigureAwait(false);
+        if (response.IsSuccess)
+        {
+            LastKnownVolume = Math.Clamp(linear, 0f, 1f);
+        }
+    }
+
+    public async Task<float?> GetVolumeAsync(CancellationToken ct)
+    {
+        try
+        {
+            var body = System.Text.Encoding.ASCII.GetBytes("volume\r\n");
+            var response = await _rtsp.RequestAsync("GET_PARAMETER", ct, "text/parameters", body).ConfigureAwait(false);
+            if (!response.IsSuccess || VolumeParameters.ParseDb(response.Body) is not { } db)
+            {
+                return null;
+            }
+
+            LastKnownVolume = VolumeParameters.DbToLinear(db);
+            return LastKnownVolume;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogDebug(ex, "{Name}: GET_PARAMETER volume failed", DisplayName);
+            return null;
+        }
     }
 
     public Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct) => Task.CompletedTask;
@@ -846,7 +873,9 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         {
             var seq = (uint)Random.Shared.Next() & 0x7FFFFF;
             var rtpTime = (uint)Random.Shared.Next();
-            var anchored = false;
+            _anchored = false;
+            _bufferedFramesSent = 0;
+            _bufferedFramesDropped = 0;
 
             if (!UsesLegacyBufferedFraming)
             {
@@ -861,8 +890,6 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             var samplesPerFrame = _bufferedAlac ? 352u : AacEncoderPipe.SamplesPerFrame;
             var ssrc = _bufferedAlac ? 0u : AacSsrc;
             var firstRtpTime = rtpTime;
-            var framesSent = 0;
-            var framesDropped = 0L;
 
             await foreach (var frame in reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
@@ -879,8 +906,8 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                         dropped++;
                     }
 
-                    framesDropped += dropped;
-                    anchored = false;
+                    _bufferedFramesDropped += dropped;
+                    _anchored = false;
                     logger.LogInformation("{Name}: dropped {Count} stale frames at cutover", DisplayName, dropped);
                     continue;
                 }
@@ -890,7 +917,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 if (_reanchorPending)
                 {
                     _reanchorPending = false;
-                    anchored = false;
+                    _anchored = false;
                 }
 
                 // Ship a chunk of audio before anchoring (receiver needs frames
@@ -901,24 +928,24 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 // "now" holds PCM captured ageSamples ago. Subtracting that age
                 // aligns acoustic output with the realtime path, which sends PCM
                 // the instant it arrives — no hardcoded skew.
-                if (!_anchorHeld && !anchored && framesSent * samplesPerFrame >= 44100)
+                if (!_anchorHeld && !_anchored && _bufferedFramesSent * samplesPerFrame >= 44100)
                 {
                     var ageSamples = _aac is { } aac
-                        ? Math.Max(0, aac.PcmSamplesIn - (framesSent + framesDropped) * samplesPerFrame)
+                        ? Math.Max(0, aac.PcmSamplesIn - (_bufferedFramesSent + _bufferedFramesDropped) * samplesPerFrame)
                         : 0;
                     // Capture-counter index of the frame being anchored (ALAC
                     // has no encoder pipeline; its packed-queue skew was never
                     // tracked and stays untracked).
                     var captureSample = Volatile.Read(ref _pcmCaptureEnd) - ageSamples;
-                    anchored = await SendAnchorAsync(rtpTime, ageSamples, captureSample, ct).ConfigureAwait(false);
-                    if (anchored && Environment.GetEnvironmentVariable("STREAMSEMBLE_TV_NUDGE") != "0")
+                    _anchored = await SendAnchorAsync(rtpTime, ageSamples, captureSample, ct).ConfigureAwait(false);
+                    if (_anchored && Environment.GetEnvironmentVariable("STREAMSEMBLE_TV_NUDGE") != "0")
                     {
                         await SendNowPlayingAsync(firstRtpTime, rtpTime, ct).ConfigureAwait(false);
                     }
                 }
 
                 await SendBufferedPacketAsync(tcp, seq, rtpTime, ssrc, frame, ct).ConfigureAwait(false);
-                framesSent++;
+                _bufferedFramesSent++;
                 seq = (seq + 1) & 0x7FFFFF;
                 rtpTime += samplesPerFrame;
                 _bufferedHeadSeq = seq;
@@ -1065,6 +1092,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         {
             var (mappedNanos, established, debtMs) = groupAnchor.Map(captureSample, proposed);
             baseNanos = mappedNanos;
+            _lastInheritedDebtMs = established ? 0 : debtMs;
             if (!established)
             {
                 logger.LogInformation(
@@ -1101,6 +1129,13 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         logger.LogInformation(
             "{Name}: SETRATEANCHORTIME {Status} (rtpTime={Rtp}, secs={Secs}, timeline={Timeline})",
             DisplayName, response.StatusCode, rtpTime, nanos / 1_000_000_000, Convert.ToHexString(anchor.ClockId));
+        if (response.IsSuccess)
+        {
+            _lastAnchorRtp = rtpTime;
+            _lastAnchorNanos = nanos;
+            _lastTimelineId = Convert.ToHexString(anchor.ClockId);
+        }
+
         return response.IsSuccess;
     }
 
@@ -1110,6 +1145,55 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     private volatile bool _dropStalePending;
     private volatile uint _bufferedHeadSeq;
     private volatile uint _bufferedHeadRtpTime;
+    private volatile bool _anchored;
+    private long _bufferedFramesSent;
+    private long _bufferedFramesDropped;
+    private uint _lastAnchorRtp;
+    private ulong _lastAnchorNanos;
+    private volatile string? _lastTimelineId;
+    private double? _lastInheritedDebtMs;
+
+    /// <summary>
+    /// How far ahead of "now" the receiver's render head is: the presentation
+    /// time of the last buffered packet shipped, minus grandmaster now. This is
+    /// the cushion the receiver is holding — steady-state it should sit at the
+    /// group presentation latency (2 s) minus the encoder pipeline age.
+    /// </summary>
+    public double? BufferAheadMs
+    {
+        get
+        {
+            if (!IsBuffered || !_anchored)
+            {
+                return null;
+            }
+
+            var deltaSamples = unchecked(_bufferedHeadRtpTime - _lastAnchorRtp);
+            var presentationNanos = (long)_lastAnchorNanos + (long)deltaSamples * 1_000_000_000L / 44100;
+            return (presentationNanos - Timing.Ptp.PtpReceiverClock.NowNanos) / 1e6;
+        }
+    }
+
+    public SessionTelemetry GetTelemetry()
+    {
+        var samplesPerFrame = _bufferedAlac ? 352L : AacEncoderPipe.SamplesPerFrame;
+        double? encoderAgeMs = _aac is { } aac
+            ? Math.Max(0, aac.PcmSamplesIn - (_bufferedFramesSent + _bufferedFramesDropped) * samplesPerFrame) * 1000.0 / 44100
+            : null;
+        return new SessionTelemetry(
+            Protocol: "AirPlay 2",
+            Mode: IsBuffered ? (_bufferedAlac ? "buffered ALAC" : "buffered AAC") : "realtime ALAC",
+            Pairing: _pairingMode,
+            Alive: IsAlive,
+            LatencyTrimMs: LatencyTrimMs,
+            ReportedLatencyMs: ReportedAudioLatencySamples * 1000.0 / 44100,
+            Anchored: IsBuffered ? _anchored && !_anchorHeld && !_reanchorPending : null,
+            BufferAheadMs: BufferAheadMs,
+            EncoderAgeMs: IsBuffered ? encoderAgeMs : null,
+            InheritedDebtMs: _lastInheritedDebtMs,
+            BufferedPacketsSent: _bufferedPacketsSent,
+            TimelineId: _lastTimelineId);
+    }
 
     /// <summary>Cutover: the buffered pump discards its queued (abandoned-track) frames and re-anchors.</summary>
     public void RequestStaleDrop() => _dropStalePending = true;

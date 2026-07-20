@@ -5,38 +5,115 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Streamsemble</title>
   <style>
-    :root { color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --line:#2a2f3a; --fg:#e8eaed; --muted:#9aa0ac; --accent:#4f8cff; --on:#2ecc71; }
+    :root {
+      color-scheme: dark;
+      --bg:#0f1115; --card:#1a1d24; --line:#2a2f3a; --fg:#e8eaed; --sec:#c3c2b7; --muted:#9aa0ac;
+      --accent:#3987e5;            /* series blue (dark step) — bars, sparklines, controls */
+      --good:#0ca30c; --warn:#fab219; --serious:#ec835a; --critical:#d03b3b;
+      --on:#2ecc71;
+    }
     * { box-sizing: border-box; }
     body { margin:0; font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--fg); }
-    header { padding:20px 24px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
+    header { padding:20px 0; border-bottom:1px solid var(--line); }
+    .hwrap { max-width:1040px; margin:0 auto; padding:0 24px; display:flex; align-items:baseline; gap:12px; }
     header h1 { margin:0; font-size:20px; letter-spacing:.3px; }
     header .sub { color:var(--muted); font-size:13px; }
-    main { max-width:760px; margin:0 auto; padding:24px; display:grid; gap:20px; }
+    /* minmax(0,1fr) tracks: a plain auto/1fr column lets a wide child (the
+       nowrap tech table) blow the track out past the container, dragging every
+       card off-center. Zero minimum pins tracks to the container width and the
+       table scrolls inside its own wrapper instead. */
+    main { max-width:1040px; margin:0 auto; padding:24px; display:grid; gap:20px; grid-template-columns:minmax(0,1fr); }
+    main > * { min-width:0; }
+    .toprow { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:20px; align-items:start; }
+    .toprow > * { min-width:0; }
+    @media (max-width:920px) { .toprow { grid-template-columns:minmax(0,1fr); } }
     .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; }
     .card h2 { margin:0 0 14px; font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
+    .num { font-variant-numeric: tabular-nums; }
+
+    /* Now playing */
     .now { display:flex; flex-direction:column; gap:4px; }
     .now .title { font-size:18px; font-weight:600; }
     .now .artist { color:var(--muted); }
-    .now .src { display:inline-block; margin-top:6px; font-size:12px; color:var(--accent); }
+    .staterow { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:center; }
+    .chip { display:inline-flex; align-items:center; gap:6px; font-size:12px; padding:3px 10px; border-radius:99px; border:1px solid var(--line); background:#1e2635; color:var(--sec); }
+    .chip .ic { font-size:11px; }
+    .chip.play { border-color:#175127; }
+    .chip.play .ic { color:var(--good); }
+    .chip.pause .ic { color:var(--warn); }
+    .chip.stop .ic { color:var(--muted); }
+
+    /* Volume */
+    .vol { display:flex; align-items:center; gap:14px; }
+    .vol input[type=range] { flex:1; accent-color:var(--accent); }
+    .vol .pct { width:48px; text-align:right; color:var(--sec); }
+    .volnote { color:var(--muted); font-size:12px; margin-top:4px; }
+    .spvol { display:flex; align-items:center; gap:14px; padding:9px 0 0; }
+    .spvol .name { flex:0 0 132px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .spvol .name .sub { color:var(--muted); font-size:11px; display:block; }
+    .spvol input[type=range] { flex:1; accent-color:var(--accent); }
+    .spvol input[type=range]:disabled { opacity:.35; }
+    .spvol .pct { width:48px; text-align:right; color:var(--sec); }
+    .voldivider { border-top:1px solid var(--line); margin:14px 0 4px; }
+
+    /* Sync & latency */
+    .groupline { color:var(--muted); font-size:12px; margin-bottom:14px; line-height:1.7; }
+    .groupline b { color:var(--sec); font-weight:500; }
+    .sync-row { display:grid; grid-template-columns: 200px 1fr 132px; gap:14px; align-items:center; padding:10px 0; border-top:1px solid var(--line); }
+    .sync-row:first-of-type { border-top:none; }
+    .sync-id .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .sync-id .md { color:var(--muted); font-size:11px; }
+    .badge { display:inline-flex; align-items:center; gap:5px; font-size:11px; margin-top:3px; color:var(--sec); }
+    .badge .ic { font-size:10px; }
+    .badge.good .ic { color:var(--good); }
+    .badge.warn .ic { color:var(--warn); }
+    .badge.serious .ic { color:var(--serious); }
+    .badge.mut .ic { color:var(--muted); }
+    .bullet { position:relative; height:34px; }
+    .bullet .track { position:absolute; left:0; right:0; top:12px; height:10px; border-radius:4px; background:#232833; }
+    .bullet .fill { position:absolute; left:0; top:12px; height:10px; border-radius:4px; background:var(--accent); min-width:2px; transition:width .6s linear; }
+    .bullet .tick { position:absolute; top:8px; width:2px; height:18px; background:var(--sec); border-radius:1px; }
+    .bullet .ticklabel { position:absolute; top:-6px; transform:translateX(-50%); font-size:10px; color:var(--muted); }
+    .bullet .val { position:absolute; right:0; top:-7px; font-size:11px; color:var(--sec); }
+    .spark { display:block; }
+    .spark polyline { fill:none; stroke:var(--accent); stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+    .spark line { stroke:var(--line); stroke-width:1; }
+    .empty { color:var(--muted); font-style:italic; padding:8px 0; }
+
+    /* Speakers (selection) */
     .speaker { display:flex; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--line); }
     .speaker:first-of-type { border-top:none; }
     .speaker label { flex:1; cursor:pointer; }
     .speaker .host { color:var(--muted); font-size:12px; }
-    .speaker .badge { font-size:11px; padding:2px 8px; border-radius:99px; background:#0d3d22; color:var(--on); border:1px solid #17512f; }
+    .speaker .cbadge { font-size:11px; padding:2px 8px; border-radius:99px; background:#0d3d22; color:var(--on); border:1px solid #17512f; }
     .speaker .proto { font-size:10px; padding:1px 6px; border-radius:99px; background:#1e2635; color:var(--muted); border:1px solid var(--line); vertical-align:2px; }
     input[type=checkbox] { width:20px; height:20px; accent-color:var(--accent); cursor:pointer; }
-    .empty { color:var(--muted); font-style:italic; padding:8px 0; }
-    .vol { display:flex; align-items:center; gap:14px; }
-    .vol input[type=range] { flex:1; accent-color:var(--accent); }
-    .vol .pct { width:44px; text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; }
-    .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--muted); margin-right:6px; }
-    .dot.live { background:var(--on); box-shadow:0 0 8px var(--on); }
+
+    /* Technical details */
+    details > summary { cursor:pointer; color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.6px; list-style:none; }
+    details > summary::before { content:"▸ "; }
+    details[open] > summary::before { content:"▾ "; }
+    .techgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:10px 18px; margin:14px 0 4px; }
+    .tech dt { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.4px; }
+    .tech dd { margin:1px 0 0; font-size:13px; color:var(--fg); }
+    .techtablewrap { overflow-x:auto; margin-top:12px; }
+    table.techtable { border-collapse:collapse; width:100%; font-size:12px; white-space:nowrap; }
+    table.techtable th { text-align:left; color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.4px; padding:6px 12px 6px 0; border-bottom:1px solid var(--line); }
+    table.techtable td { padding:6px 12px 6px 0; border-bottom:1px solid var(--line); color:var(--sec); font-variant-numeric:tabular-nums; }
+    table.techtable td:first-child { color:var(--fg); }
+
+    /* Tooltip */
+    #tip { position:fixed; z-index:10; pointer-events:none; background:#0b0d12; border:1px solid var(--line); border-radius:8px; padding:8px 11px; font-size:12px; color:var(--sec); display:none; max-width:280px; box-shadow:0 4px 16px rgba(0,0,0,.5); }
+    #tip .t { color:var(--fg); font-weight:600; margin-bottom:3px; }
+    #tip .num { color:var(--fg); }
   </style>
 </head>
 <body>
   <header>
-    <h1>Streamsemble</h1>
-    <span class="sub">multi-room audio hub</span>
+    <div class="hwrap">
+      <h1>Streamsemble</h1>
+      <span class="sub">multi-room audio hub</span>
+    </div>
   </header>
   <main>
     <section class="card">
@@ -44,26 +121,50 @@
       <div class="now" id="now">
         <div class="empty">Nothing playing. Cast from Spotify, AirPlay, or another source.</div>
       </div>
+      <div class="staterow" id="staterow"></div>
+    </section>
+
+    <div class="toprow">
+      <section class="card">
+        <h2>Volume</h2>
+        <div class="vol">
+          <input type="range" id="vol" min="0" max="100" value="50" />
+          <span class="pct num" id="volpct">50%</span>
+        </div>
+        <div class="volnote" id="volnote"></div>
+        <div class="voldivider" id="voldivider" style="display:none"></div>
+        <div id="speakervols"></div>
+      </section>
+
+      <section class="card">
+        <h2>Output speakers <span id="scanning" class="sub" style="text-transform:none;letter-spacing:0"></span></h2>
+        <div id="speakers"><div class="empty">Searching for AirPlay speakers…</div></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>Sync &amp; latency</h2>
+      <div class="groupline" id="groupline"></div>
+      <div id="syncrows"><div class="empty">No speakers connected.</div></div>
     </section>
 
     <section class="card">
-      <h2>Volume</h2>
-      <div class="vol">
-        <input type="range" id="vol" min="0" max="100" value="50" />
-        <span class="pct" id="volpct">50%</span>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Output speakers <span id="scanning" class="sub" style="text-transform:none;letter-spacing:0"></span></h2>
-      <div id="speakers"><div class="empty">Searching for AirPlay speakers…</div></div>
+      <details id="techdetails" open>
+        <summary>Technical details</summary>
+        <dl class="techgrid tech" id="techgroup"></dl>
+        <div class="techtablewrap" id="techsessions"></div>
+      </details>
     </section>
   </main>
+  <div id="tip"></div>
 
   <script>
     let selectedIds = new Set();
-    let protocols = {};   // speaker id → detected protocol from /api/state
+    let protocols = {};          // speaker id → detected protocol from /api/state
     let volDragging = false;
+    const speakerDragging = new Set();   // names of per-speaker sliders mid-drag
+    const leadHistory = new Map();       // name → [{ahead, target}] (client-side, ~2 min)
+    const HISTORY_MAX = 120;
     const $ = (id) => document.getElementById(id);
 
     async function postTargets() {
@@ -82,18 +183,257 @@
       });
     }
 
+    async function postSpeakerVolume(name, v) {
+      await fetch("/api/speakers/volume", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, volume: v })
+      });
+    }
+
+    // ---- Now playing + play/pause state ------------------------------------
+
     function renderNow(s) {
       const el = $("now");
       const np = s.nowPlaying || {};
       if (!s.activeSource && !np.title) {
         el.innerHTML = '<div class="empty">Nothing playing. Cast from Spotify, AirPlay, or another source.</div>';
+      } else {
+        el.innerHTML = `
+          <div class="title">${escapeHtml(np.title || "—")}</div>
+          <div class="artist">${escapeHtml([np.artist, np.album].filter(Boolean).join(" · ") || "")}</div>`;
+      }
+
+      const t = s.telemetry || {};
+      const speakers = s.speakers || [];
+      const state = !t.streaming ? { cls: "stop", ic: "■", label: "stopped — no outbound stream" }
+                  : t.holding    ? { cls: "pause", ic: "⏸", label: "paused — pipeline held, anchors suppressed" }
+                  :                { cls: "play", ic: "▶", label: "playing" };
+      const anchoredCount = speakers.filter(sp => sp.anchored === true).length;
+      const bufferedCount = speakers.filter(sp => sp.anchored !== null && sp.anchored !== undefined).length;
+      const chips = [
+        `<span class="chip ${state.cls}"><span class="ic">${state.ic}</span>${escapeHtml(state.label)}</span>`,
+        `<span class="chip">source: ${escapeHtml(s.activeSource || "idle")}</span>`,
+      ];
+      if (t.streaming) {
+        chips.push(`<span class="chip num">queue ${t.sendQueueDepth}/128 frames</span>`);
+        if (bufferedCount > 0) chips.push(`<span class="chip num">anchored ${anchoredCount}/${bufferedCount} buffered</span>`);
+        if (t.realtimePacketRate > 0) chips.push(`<span class="chip num">${t.realtimePacketRate.toFixed(0)} pkt/s realtime</span>`);
+      }
+      $("staterow").innerHTML = chips.join("");
+    }
+
+    // ---- Volume ------------------------------------------------------------
+
+    function toDb(linear) { return linear <= 0.001 ? -144 : -30 + linear * 30; }
+
+    function renderVolume(s) {
+      if (!volDragging) {
+        const pct = Math.round((s.volume ?? 0.5) * 100);
+        $("vol").value = pct; $("volpct").textContent = pct + "%";
+      }
+      const live = s.speakers || [];
+      $("volnote").textContent = s.volumeIsAverage
+        ? `average of ${live.filter(sp => sp.volume != null).length} connected speaker${live.filter(sp => sp.volume != null).length === 1 ? "" : "s"} — moving it sets all speakers`
+        : "no live speaker volumes yet — moving it sets all speakers on connect";
+
+      // Selected-but-not-connected speakers get a disabled placeholder row.
+      const liveNames = new Set(live.map(sp => sp.name.toLowerCase()));
+      const pending = (s.selected || []).map(t => t.name).filter(Boolean)
+        .filter(n => !liveNames.has(n.toLowerCase()));
+
+      $("voldivider").style.display = live.length + pending.length > 0 ? "" : "none";
+      if (speakerDragging.size > 0) return;   // don't rebuild rows mid-drag
+
+      const rows = live.map(sp => {
+        const known = sp.volume != null;
+        const pct = known ? Math.round(sp.volume * 100) : 50;
+        const db = known ? toDb(sp.volume) : null;
+        const sub = known ? `${db <= -100 ? "muted" : db.toFixed(1) + " dB"} · ${escapeHtml(sp.mode)}` : "volume unknown";
+        return `<div class="spvol">
+          <span class="name">${escapeHtml(sp.name)}<span class="sub">${sub}</span></span>
+          <input type="range" min="0" max="100" value="${pct}" data-name="${escapeAttr(sp.name)}" />
+          <span class="pct num">${known ? pct + "%" : "—"}</span>
+        </div>`;
+      }).concat(pending.map(n => `<div class="spvol">
+          <span class="name">${escapeHtml(n)}<span class="sub">connecting…</span></span>
+          <input type="range" min="0" max="100" value="50" disabled />
+          <span class="pct num">—</span>
+        </div>`));
+      $("speakervols").innerHTML = rows.join("");
+
+      $("speakervols").querySelectorAll("input[type=range]:not(:disabled)").forEach(slider => {
+        const name = slider.dataset.name;
+        slider.addEventListener("input", () => {
+          speakerDragging.add(name);
+          slider.parentElement.querySelector(".pct").textContent = slider.value + "%";
+        });
+        slider.addEventListener("change", async () => {
+          await postSpeakerVolume(name, slider.value / 100);
+          speakerDragging.delete(name);
+          refresh();
+        });
+      });
+    }
+
+    // ---- Sync & latency graphic --------------------------------------------
+
+    function fmtMs(v) { return v == null ? "—" : (Math.abs(v) >= 1000 ? (v / 1000).toFixed(2) + " s" : Math.round(v) + " ms"); }
+    function fmtClock(unixSeconds) {
+      if (!unixSeconds) return "—";
+      const d = new Date(unixSeconds * 1000);
+      return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+    }
+
+    function syncBadge(sp, t) {
+      if (sp.anchored === undefined || sp.anchored === null) {   // realtime path
+        if (sp.aheadMs == null) return { cls: "mut", ic: "○", label: t.holding ? "held (paused)" : "idle" };
+        return { cls: "good", ic: "●", label: "paced on shared clock" };
+      }
+      if (!sp.anchored) return { cls: "warn", ic: "◌", label: t.holding ? "held (paused)" : "anchoring…" };
+      if (sp.timelineId && t.ptpClockId && sp.timelineId !== t.ptpClockId)
+        return { cls: "serious", ic: "⚠", label: "timeline mismatch" };
+      if (sp.ptpLockAgeSeconds != null && sp.ptpLockAgeSeconds > 15)
+        return { cls: "warn", ic: "◔", label: `clock quiet ${Math.round(sp.ptpLockAgeSeconds)}s` };
+      return { cls: "good", ic: "●", label: "locked to group timeline" };
+    }
+
+    function cushionBadge(sp) {
+      if (sp.aheadMs == null || !sp.targetLeadMs) return null;
+      const ratio = sp.aheadMs / sp.targetLeadMs;
+      if (ratio >= 0.6) return { cls: "good", ic: "●", label: "cushion healthy" };
+      if (ratio >= 0.3) return { cls: "warn", ic: "◔", label: "cushion low" };
+      return { cls: "serious", ic: "⚠", label: "cushion critical" };
+    }
+
+    function sparkline(history, target) {
+      if (!history || history.length < 2) return "";
+      const w = 120, h = 30, max = Math.max(target * 1.35, ...history.map(p => p.ahead || 0));
+      const pts = history.map((p, i) =>
+        `${(i / (HISTORY_MAX - 1) * w).toFixed(1)},${(h - 2 - Math.max(0, Math.min(1, (p.ahead || 0) / max)) * (h - 4)).toFixed(1)}`).join(" ");
+      const ty = h - 2 - Math.max(0, Math.min(1, target / max)) * (h - 4);
+      return `<svg class="spark" width="${w}" height="${h}" role="img" aria-label="render lead, last 2 minutes">
+        <line x1="0" y1="${ty.toFixed(1)}" x2="${w}" y2="${ty.toFixed(1)}"></line>
+        <polyline points="${pts}"></polyline></svg>`;
+    }
+
+    function renderSync(s) {
+      const t = s.telemetry || {};
+      const speakers = s.speakers || [];
+
+      const epoch = t.epoch
+        ? `epoch anchored at <b class="num">${fmtClock(t.epoch.anchorUnixSeconds)}</b> (capture sample <b class="num">${t.epoch.captureSample.toLocaleString()}</b>)`
+        : "no epoch anchor (idle or realtime-only)";
+      $("groupline").innerHTML = `group presentation latency <b class="num">${fmtMs(t.presentationLatencyMs)}</b> ·
+        PTP grandmaster <b class="num">${escapeHtml(t.ptpClockId || "—")}</b> · ${epoch}`;
+
+      if (speakers.length === 0) {
+        $("syncrows").innerHTML = '<div class="empty">No speakers connected.</div>';
         return;
       }
-      el.innerHTML = `
-        <div class="title">${escapeHtml(np.title || "—")}</div>
-        <div class="artist">${escapeHtml([np.artist, np.album].filter(Boolean).join(" · ") || "")}</div>
-        <div class="src"><span class="dot ${s.activeSource ? "live" : ""}"></span>${escapeHtml(s.activeSource || "idle")}</div>`;
+
+      // Client-side history for the sparklines.
+      for (const sp of speakers) {
+        if (!leadHistory.has(sp.name)) leadHistory.set(sp.name, []);
+        const h = leadHistory.get(sp.name);
+        h.push({ ahead: sp.aheadMs, target: sp.targetLeadMs });
+        if (h.length > HISTORY_MAX) h.shift();
+      }
+      for (const name of [...leadHistory.keys()])
+        if (!speakers.some(sp => sp.name === name)) leadHistory.delete(name);
+
+      $("syncrows").innerHTML = speakers.map(sp => {
+        const scale = sp.targetLeadMs * 1.5;
+        const fillPct = sp.aheadMs == null ? 0 : Math.max(0, Math.min(1, sp.aheadMs / scale)) * 100;
+        const tickPct = Math.max(0, Math.min(1, sp.targetLeadMs / scale)) * 100;
+        const sync = syncBadge(sp, t);
+        const cushion = cushionBadge(sp);
+        const dev = sp.aheadMs == null ? null : sp.aheadMs - sp.targetLeadMs;
+        return `<div class="sync-row" data-name="${escapeAttr(sp.name)}">
+          <div class="sync-id">
+            <div class="nm">${escapeHtml(sp.name)}</div>
+            <div class="md">${escapeHtml(sp.protocol)} · ${escapeHtml(sp.mode)}</div>
+            <div class="badge ${sync.cls}"><span class="ic">${sync.ic}</span>${escapeHtml(sync.label)}</div>
+            ${cushion ? `<div class="badge ${cushion.cls}"><span class="ic">${cushion.ic}</span>${escapeHtml(cushion.label)}</div>` : ""}
+          </div>
+          <div class="bullet" data-tip="1">
+            <span class="val num">${sp.aheadMs == null ? "no signal" : `lead ${fmtMs(sp.aheadMs)} (Δ ${dev >= 0 ? "+" : "−"}${fmtMs(Math.abs(dev))})`}</span>
+            <div class="track"></div>
+            <div class="fill" style="width:${fillPct.toFixed(1)}%"></div>
+            <div class="tick" style="left:${tickPct.toFixed(1)}%"></div>
+            <div class="ticklabel num" style="left:${tickPct.toFixed(1)}%">target ${fmtMs(sp.targetLeadMs)}</div>
+          </div>
+          <div>${sparkline(leadHistory.get(sp.name), sp.targetLeadMs)}</div>
+        </div>`;
+      }).join("");
     }
+
+    // ---- Tooltip for the sync bars -----------------------------------------
+
+    let lastState = null;
+    document.addEventListener("mousemove", (e) => {
+      const bullet = e.target.closest && e.target.closest("[data-tip]");
+      const tip = $("tip");
+      if (!bullet || !lastState) { tip.style.display = "none"; return; }
+      const name = bullet.closest(".sync-row").dataset.name;
+      const sp = (lastState.speakers || []).find(x => x.name === name);
+      if (!sp) { tip.style.display = "none"; return; }
+      const dev = sp.aheadMs == null ? null : sp.aheadMs - sp.targetLeadMs;
+      tip.innerHTML = `<div class="t">${escapeHtml(sp.name)}</div>
+        render lead <span class="num">${fmtMs(sp.aheadMs)}</span> · target <span class="num">${fmtMs(sp.targetLeadMs)}</span><br/>
+        Δ vs target <span class="num">${dev == null ? "—" : (dev >= 0 ? "+" : "−") + fmtMs(Math.abs(dev))}</span><br/>
+        ${sp.encoderAgeMs != null ? `encoder pipeline age <span class="num">${fmtMs(sp.encoderAgeMs)}</span><br/>` : ""}
+        ${sp.inheritedDebtMs != null ? `join debt inherited <span class="num">${fmtMs(sp.inheritedDebtMs)}</span><br/>` : ""}
+        ${sp.latencyTrimMs ? `latency trim <span class="num">${sp.latencyTrimMs} ms</span><br/>` : ""}
+        ${sp.ptpLockAgeSeconds != null ? `last PTP Delay_Req <span class="num">${sp.ptpLockAgeSeconds.toFixed(1)} s ago</span>` : ""}`;
+      tip.style.display = "block";
+      const pad = 14;
+      tip.style.left = Math.min(e.clientX + pad, window.innerWidth - tip.offsetWidth - 8) + "px";
+      tip.style.top = Math.min(e.clientY + pad, window.innerHeight - tip.offsetHeight - 8) + "px";
+    });
+
+    // ---- Technical details --------------------------------------------------
+
+    function renderTech(s) {
+      const t = s.telemetry || {};
+      const dd = (k, v) => `<div><dt>${k}</dt><dd class="num">${v}</dd></div>`;
+      $("techgroup").innerHTML =
+        dd("stream state", !t.streaming ? "stopped" : t.holding ? "paused (held)" : "streaming") +
+        dd("active source", escapeHtml(s.activeSource || "—")) +
+        dd("send queue", `${t.sendQueueDepth ?? 0}/128 frames`) +
+        dd("realtime packets", `${(t.realtimePacketsSent ?? 0).toLocaleString()} @ ${(t.realtimePacketRate ?? 0).toFixed(0)}/s`) +
+        dd("RTP head", t.rtpHead ?? "—") +
+        dd("PTP grandmaster", escapeHtml(t.ptpClockId || "—")) +
+        dd("presentation latency", fmtMs(t.presentationLatencyMs)) +
+        dd("group epoch", t.epoch ? `${fmtClock(t.epoch.anchorUnixSeconds)} @ sample ${t.epoch.captureSample.toLocaleString()}` : "not established");
+
+      const speakers = s.speakers || [];
+      if (speakers.length === 0) { $("techsessions").innerHTML = ""; return; }
+      const rows = speakers.map(sp => `<tr>
+        <td>${escapeHtml(sp.name)}</td>
+        <td>${escapeHtml(sp.protocol)}</td>
+        <td>${escapeHtml(sp.mode)}</td>
+        <td>${escapeHtml(sp.pairing || "—")}</td>
+        <td>${sp.alive ? "yes" : "DEAD"}</td>
+        <td>${sp.volume != null ? Math.round(sp.volume * 100) + "% (" + (toDb(sp.volume) <= -100 ? "mute" : toDb(sp.volume).toFixed(1) + " dB") + ")" : "—"}</td>
+        <td>${sp.anchored === undefined || sp.anchored === null ? "n/a" : sp.anchored ? "yes" : "no"}</td>
+        <td>${fmtMs(sp.aheadMs)}</td>
+        <td>${fmtMs(sp.targetLeadMs)}</td>
+        <td>${fmtMs(sp.encoderAgeMs)}</td>
+        <td>${fmtMs(sp.inheritedDebtMs)}</td>
+        <td>${sp.latencyTrimMs || 0} ms</td>
+        <td>${sp.reportedLatencyMs ? fmtMs(sp.reportedLatencyMs) : "—"}</td>
+        <td>${(sp.bufferedPacketsSent ?? 0) > 0 ? sp.bufferedPacketsSent.toLocaleString() : "—"}</td>
+        <td>${sp.ptpLockAgeSeconds != null ? sp.ptpLockAgeSeconds.toFixed(1) + " s" : "—"}</td>
+        <td>${escapeHtml(sp.timelineId || "—")}</td>
+      </tr>`).join("");
+      $("techsessions").innerHTML = `<table class="techtable">
+        <thead><tr><th>speaker</th><th>proto</th><th>mode</th><th>pairing</th><th>alive</th><th>volume</th>
+        <th>anchored</th><th>lead</th><th>target</th><th>enc age</th><th>join debt</th><th>trim</th>
+        <th>dev latency</th><th>buf pkts</th><th>PTP req</th><th>timeline</th></tr></thead>
+        <tbody>${rows}</tbody></table>`;
+    }
+
+    // ---- Speaker selection (unchanged behavior) ----------------------------
 
     function renderSpeakers(s) {
       const connected = new Set((s.connected || []).map(x => x.toLowerCase()));
@@ -106,11 +446,10 @@
       protocols = Object.fromEntries(list.map(sp => [sp.id, sp.protocol || "Auto"]));
       el.innerHTML = list.map(sp => {
         const checked = selectedIds.has(sp.id) ? "checked" : "";
-        const live = connected.has(sp.name.toLowerCase()) ? '<span class="badge">connected</span>' : "";
+        const live = connected.has(sp.name.toLowerCase()) ? '<span class="cbadge">connected</span>' : "";
         const proto = sp.protocol === "AirPlay2" ? "AirPlay 2" : "RAOP";
-        const safe = escapeHtml(sp.id).replace(/"/g, "&quot;");
         return `<div class="speaker">
-          <input type="checkbox" id="sp_${cssId(sp.id)}" data-id="${safe}" ${checked} />
+          <input type="checkbox" id="sp_${cssId(sp.id)}" data-id="${escapeAttr(sp.id)}" ${checked} />
           <label for="sp_${cssId(sp.id)}"><div>${escapeHtml(sp.name)} <span class="proto">${proto}</span></div><div class="host">${escapeHtml(sp.host)}:${sp.port}</div></label>
           ${live}
         </div>`;
@@ -124,20 +463,22 @@
       });
     }
 
+    // ---- Poll loop ---------------------------------------------------------
+
     async function refresh() {
       try {
         const s = await (await fetch("/api/state")).json();
+        lastState = s;
         // Keep selection in sync with server on first load / external change.
         if (!window._selInit) {
           selectedIds = new Set((s.selected || []).map(t => t.name).filter(Boolean));
           window._selInit = true;
         }
         renderNow(s);
+        renderVolume(s);
+        renderSync(s);
+        renderTech(s);
         renderSpeakers(s);
-        if (!volDragging) {
-          const pct = Math.round((s.volume ?? 0.5) * 100);
-          $("vol").value = pct; $("volpct").textContent = pct + "%";
-        }
       } catch (e) { /* transient */ }
     }
 
@@ -148,13 +489,15 @@
     $("vol").addEventListener("change", async () => {
       await postVolume($("vol").value / 100);
       volDragging = false;
+      refresh();
     });
 
     function escapeHtml(s) { return (s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
+    function escapeAttr(s) { return escapeHtml(s); }
     function cssId(s) { return s.replace(/[^a-z0-9]/gi, "_"); }
 
     refresh();
-    setInterval(refresh, 2000);
+    setInterval(refresh, 1000);
   </script>
 </body>
 </html>

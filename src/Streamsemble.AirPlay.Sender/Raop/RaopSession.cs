@@ -123,13 +123,50 @@ public sealed class RaopSession(string displayName, IPAddress address, int rtspP
 
     public void NoteRtpTime(uint rtpTime) => _lastKnownRtpTime = rtpTime;
 
+    public float? LastKnownVolume { get; private set; }
+
     public async Task SetVolumeAsync(float linear, CancellationToken ct)
     {
         // RAOP volume is dB attenuation: -30 (quietest) … 0, with -144 = mute.
         var db = linear <= 0.001f ? -144.0 : -30.0 + linear * 30.0;
         var body = Encoding.ASCII.GetBytes($"volume: {db:F6}\r\n");
         Ensure(await _rtsp.RequestAsync("SET_PARAMETER", ct, "text/parameters", body).ConfigureAwait(false), "SET_PARAMETER volume");
+        LastKnownVolume = Math.Clamp(linear, 0f, 1f);
     }
+
+    public async Task<float?> GetVolumeAsync(CancellationToken ct)
+    {
+        try
+        {
+            var response = await _rtsp.RequestAsync("GET_PARAMETER", ct, "text/parameters", Encoding.ASCII.GetBytes("volume\r\n")).ConfigureAwait(false);
+            if (!response.IsSuccess || VolumeParameters.ParseDb(response.Body) is not { } db)
+            {
+                return null;
+            }
+
+            LastKnownVolume = VolumeParameters.DbToLinear(db);
+            return LastKnownVolume;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogDebug(ex, "{Name}: GET_PARAMETER volume failed", DisplayName);
+            return null;
+        }
+    }
+
+    public SessionTelemetry GetTelemetry() => new(
+        Protocol: "RAOP",
+        Mode: Encrypted ? "realtime ALAC (AES)" : "realtime ALAC",
+        Pairing: null,
+        Alive: true,
+        LatencyTrimMs: LatencyTrimMs,
+        ReportedLatencyMs: ReportedLatency * 1000.0 / 44100,
+        Anchored: null,
+        BufferAheadMs: null,
+        EncoderAgeMs: null,
+        InheritedDebtMs: null,
+        BufferedPacketsSent: 0,
+        TimelineId: null);
 
     public async Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct)
     {

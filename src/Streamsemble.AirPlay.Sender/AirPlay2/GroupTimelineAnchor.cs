@@ -57,4 +57,13 @@ public sealed class GroupTimelineAnchor
             _set = false;
         }
     }
+
+    /// <summary>Current epoch mapping for display: null when no epoch is established.</summary>
+    public (long CaptureSample, ulong Nanos)? Snapshot()
+    {
+        lock (_gate)
+        {
+            return _set ? (_captureSample, _nanos) : null;
+        }
+    }
 }

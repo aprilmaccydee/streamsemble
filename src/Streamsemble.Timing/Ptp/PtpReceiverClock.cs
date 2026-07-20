@@ -35,6 +35,7 @@ public sealed class PtpReceiverClock(byte[] clockId, ILogger logger) : IDisposab
 {
     private readonly object _gate = new();
     private readonly Dictionary<IPAddress, (int Count, byte Priority1)> _peers = [];
+    private readonly Dictionary<IPAddress, long> _lastDelayReqNanos = [];
     private PtpPortMux? _mux;
     private PtpPortMux.Consumer? _consumer;
     private CancellationTokenSource? _cts;
@@ -128,6 +129,20 @@ public sealed class PtpReceiverClock(byte[] clockId, ILogger logger) : IDisposab
     /// <summary>v4-mapped v6 → plain v4 so the peer set doesn't hold the same host twice.</summary>
     private static IPAddress Normalize(IPAddress address)
         => address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+
+    /// <summary>
+    /// Seconds since this peer last sent a Delay_Req — the "is it actually
+    /// slaving to our clock" signal. Null if it never has.
+    /// </summary>
+    public double? SecondsSinceDelayReq(IPAddress peer)
+    {
+        lock (_gate)
+        {
+            return _lastDelayReqNanos.TryGetValue(Normalize(peer), out var at)
+                ? Math.Max(0, (NowNanos - at) / 1e9)
+                : null;
+        }
+    }
 
     private (IPAddress Address, byte Priority1)[] PeersSnapshot()
     {
@@ -227,6 +242,11 @@ public sealed class PtpReceiverClock(byte[] clockId, ILogger logger) : IDisposab
                 if (_delayReqLog++ < 8)
                 {
                     logger.LogInformation("PTP clock: sender {From} is slaving to our clock (Delay_Req)", packet.From);
+                }
+
+                lock (_gate)
+                {
+                    _lastDelayReqNanos[Normalize(packet.From)] = packet.ReceivedNanos;
                 }
 
                 var resp = PtpWire.BuildGmDelayResp(packet.Data, ClockId,

@@ -14,6 +14,30 @@ using Streamsemble.Timing;
 
 namespace Streamsemble.AirPlay.Sender;
 
+/// <summary>Per-speaker view for the web UI: identity, volume and live sync/latency numbers.</summary>
+public sealed record SpeakerStatus(
+    string Name,
+    float? Volume,
+    double TargetLeadMs,
+    double? AheadMs,
+    double? PtpLockAgeSeconds,
+    SessionTelemetry Telemetry);
+
+/// <summary>The group epoch anchor for display: capture sample C renders at UNIX second T.</summary>
+public sealed record GroupEpochInfo(long CaptureSample, double AnchorUnixSeconds);
+
+/// <summary>Group-level pipeline snapshot for the web UI's technical panel.</summary>
+public sealed record GroupTelemetry(
+    bool Streaming,
+    bool Holding,
+    long RealtimePacketsSent,
+    double RealtimePacketRate,
+    int SendQueueDepth,
+    long RtpHead,
+    GroupEpochInfo? Epoch,
+    string PtpClockId,
+    double PresentationLatencyMs);
+
 /// <summary>
 /// The production sink: streams the live source to every selected AirPlay
 /// speaker. All sessions share one master clock, one RTP timeline (identical
@@ -130,6 +154,27 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 {
                     await ReconcileAsync(ct).ConfigureAwait(false);
                 }
+
+                // Keep per-speaker volumes fresh for the UI: immediately for
+                // sessions never read, every ~15 s for the rest (a device's
+                // volume can change under us via its own app/buttons).
+                // Read-only — this never SETS anything on a speaker.
+                var refreshAll = ++_volumeRefreshTick % 3 == 0;
+                await Task.WhenAll(SessionSnapshot()
+                    .Where(s => s.LastKnownVolume is null || refreshAll)
+                    .Select(async s =>
+                    {
+                        try
+                        {
+                            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                            timeout.CancelAfter(TimeSpan.FromSeconds(2));
+                            await s.GetVolumeAsync(timeout.Token).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            // Best-effort — a slow session just stays unknown.
+                        }
+                    })).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -155,6 +200,93 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         {
             return _sessions.Values.ToArray();
         }
+    }
+
+    /// <summary>Mean of the volumes we know across live sessions; null when none are known.</summary>
+    public float? AverageSpeakerVolume
+    {
+        get
+        {
+            var known = SessionSnapshot().Select(s => s.LastKnownVolume).OfType<float>().ToList();
+            return known.Count > 0 ? known.Average() : null;
+        }
+    }
+
+    /// <summary>
+    /// Sets ONE speaker's volume (explicit user request from the UI). False if
+    /// no live session matches the name.
+    /// </summary>
+    public async Task<bool> SetSpeakerVolumeAsync(string name, float volume, CancellationToken ct = default)
+    {
+        var session = SessionSnapshot().FirstOrDefault(s => s.DisplayName.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (session is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            await session.SetVolumeAsync(Math.Clamp(volume, 0f, 1f), ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "{Name}: volume update failed", session.DisplayName);
+            return false;
+        }
+    }
+
+    /// <summary>Per-speaker sync/latency view for the web UI.</summary>
+    public IReadOnlyList<SpeakerStatus> SpeakerStatuses()
+    {
+        var now = _clock.NowSeconds;
+        var streamingLive = Streaming && _timestampBase is not null && !_holdFrames;
+        var result = new List<SpeakerStatus>();
+        foreach (var session in SessionSnapshot())
+        {
+            var telemetry = session.GetTelemetry();
+            // Buffered sessions anchor to the group presentation latency; a
+            // realtime PTP session pins its receiver latency to the same value;
+            // classic RAOP renders at the NTP sync's RenderDelay. Trim shifts all.
+            var baseLeadMs = session.RequiresPtp
+                ? AirPlay2.AirPlay2Session.GroupPresentationLatencySeconds * 1000
+                : RenderDelaySeconds * 1000;
+            var targetLeadMs = baseLeadMs + session.LatencyTrimMs;
+
+            // Buffered receivers report their real render-head lead from the
+            // anchor mapping; realtime ones follow the send pacing, so their
+            // lead is the pacing offset plus the fixed receiver-side delay.
+            var aheadMs = telemetry.BufferAheadMs
+                ?? (streamingLive && session is not AirPlay2.AirPlay2Session { IsBuffered: true }
+                    ? (_lastDueSeconds - now) * 1000 + targetLeadMs
+                    : null);
+
+            result.Add(new SpeakerStatus(
+                Name: session.DisplayName,
+                Volume: session.LastKnownVolume,
+                TargetLeadMs: targetLeadMs,
+                AheadMs: aheadMs,
+                PtpLockAgeSeconds: session.RequiresPtp ? _gmClock.SecondsSinceDelayReq(session.DeviceAddress) : null,
+                Telemetry: telemetry));
+        }
+
+        return result;
+    }
+
+    /// <summary>Group pipeline snapshot for the web UI's technical panel.</summary>
+    public GroupTelemetry Telemetry()
+    {
+        var epoch = _groupAnchor.Snapshot();
+        return new GroupTelemetry(
+            Streaming: Streaming,
+            Holding: _holdFrames,
+            RealtimePacketsSent: _packetsSent,
+            RealtimePacketRate: _lastMeasuredRate,
+            SendQueueDepth: _sendQueue is { } queue ? queue.Reader.Count : 0,
+            RtpHead: _rtpHead,
+            Epoch: epoch is { } e ? new GroupEpochInfo(e.CaptureSample, e.Nanos / 1e9) : null,
+            PtpClockId: Convert.ToHexString(_gmClock.ClockId),
+            PresentationLatencyMs: AirPlay2.AirPlay2Session.GroupPresentationLatencySeconds * 1000);
     }
 
     private ControlChannel? _control;
@@ -185,6 +317,10 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     private long _packetsSent;
     private long _rateCount;
     private double _rateWindowStart;
+    // Telemetry-only mirrors of send-loop state, read racily by the web API.
+    private double _lastDueSeconds;
+    private double _lastMeasuredRate;
+    private int _volumeRefreshTick;
     private bool _sendMarker;
     private bool _sendFirstSync;
     private uint _lastSyncRtp;
@@ -573,6 +709,21 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 // the device at whatever it's already set to.
                 await session.SetVolumeAsync(requestedVolume, ct).ConfigureAwait(false);
             }
+            else
+            {
+                // Read-only: learn what the device is set to so the UI can show
+                // it. Time-boxed so a receiver that ignores GET_PARAMETER can't
+                // stall the connect batch (the health loop retries later).
+                try
+                {
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(2));
+                    await session.GetVolumeAsync(timeout.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                }
+            }
 
             return session;
         }
@@ -637,6 +788,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 // Pace against the master clock: packet with sample-offset N is
                 // due at anchor + (N - anchorOffset)/rate.
                 var due = _anchorSeconds + (offset - _anchorOffset) / (double)SampleRate;
+                _lastDueSeconds = due;
                 var wait = due - _clock.NowSeconds;
                 if (wait > 1.0 && ++_pacingLog % 50 == 1)
                 {
@@ -730,6 +882,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                         var elapsed = _clock.NowSeconds - _rateWindowStart;
                         if (elapsed >= 1.0)
                         {
+                            _lastMeasuredRate = _rateCount / elapsed;
                             _logger.LogInformation("Audio rate: {Rate:F0} pkt/s to {Name} ({Bytes} B/pkt) — realtime is ~125", _rateCount / elapsed, session.DisplayName, sent);
                             _rateCount = 0;
                             _rateWindowStart = _clock.NowSeconds;
@@ -957,6 +1110,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _audioSocket = null;
         _sendQueue = null;
         _plainRing.Clear();
+        _lastMeasuredRate = 0;
         cts.Dispose();
         _logger.LogInformation("AirPlay stream stopped");
     }
