@@ -25,7 +25,8 @@ public class ArbiterTests
         }
     }
 
-    private static LastWriterWinsArbiter CreateArbiter() => new(NullLogger<LastWriterWinsArbiter>.Instance);
+    private static LastWriterWinsArbiter CreateArbiter(TimeSpan? idleGrace = null)
+        => new(NullLogger<LastWriterWinsArbiter>.Instance, idleGrace);
 
     [Fact]
     public void LastActiveSourceWins()
@@ -59,16 +60,48 @@ public class ArbiterTests
     }
 
     [Fact]
-    public void IdleReleasesTheSlot()
+    public async Task IdleReleasesTheSlotAfterGrace()
     {
-        var arbiter = CreateArbiter();
+        var arbiter = CreateArbiter(TimeSpan.FromMilliseconds(50));
         var source = new FakeSource("Spotify");
         arbiter.Register(source);
 
         source.GoActive();
         source.GoIdle();
 
+        // Still live inside the grace window (a transient drop must not
+        // release the slot and tear the sink down).
+        Assert.Same(source, arbiter.ActiveSource);
+
+        var released = new TaskCompletionSource();
+        arbiter.ActiveSourceChanged += (_, s) =>
+        {
+            if (s is null)
+            {
+                released.TrySetResult();
+            }
+        };
+        await released.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Null(arbiter.ActiveSource);
+    }
+
+    [Fact]
+    public async Task BriefIdleDropRidesThroughTheGrace()
+    {
+        var arbiter = CreateArbiter(TimeSpan.FromMilliseconds(200));
+        var source = new FakeSource("Spotify");
+        arbiter.Register(source);
+
+        var sawRelease = false;
+        arbiter.ActiveSourceChanged += (_, s) => sawRelease |= s is null;
+
+        source.GoActive();
+        source.GoIdle();
+        source.GoActive(); // reconnected within the grace window
+
+        await Task.Delay(400);
+        Assert.Same(source, arbiter.ActiveSource);
+        Assert.False(sawRelease);
     }
 
     [Fact]

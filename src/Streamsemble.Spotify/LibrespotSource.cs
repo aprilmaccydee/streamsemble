@@ -36,6 +36,7 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
     {
         using var listener = StartEventListener(out var eventPort);
         _ = ListenForEventsAsync(listener, ct);
+        _ = WatchPcmStallAsync(ct);
         var scriptPath = WriteEventScript(eventPort);
 
         var backoff = TimeSpan.FromSeconds(1);
@@ -126,6 +127,36 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
         }
     }
 
+    private long _lastPcmAtMs = Environment.TickCount64;
+
+    /// <summary>
+    /// PCM flow is the authoritative playback signal (events are best-effort),
+    /// so a stall while Active is the authoritative "playback died": go Idle
+    /// so the sink silences and — after the arbiter's grace — releases the
+    /// speakers. Ten seconds distinguishes a real death from librespot's
+    /// track-load gaps; if PCM returns later, the read loop flips straight
+    /// back to Active.
+    /// </summary>
+    private async Task WatchPcmStallAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                if (State == Core.Abstractions.SourceState.Active
+                    && Environment.TickCount64 - Volatile.Read(ref _lastPcmAtMs) > 10_000)
+                {
+                    logger.LogWarning("no PCM for 10 s while Active — playback stalled, going idle");
+                    SetState(Core.Abstractions.SourceState.Idle);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
     private async Task ReadPcmAsync(Stream stdout, CancellationToken ct)
     {
         var frameBytes = PcmFrame.CanonicalFrameBytes;
@@ -161,6 +192,7 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
                 }
 
                 EmitPcm(buffer.AsMemory().ToArray());
+                Volatile.Write(ref _lastPcmAtMs, Environment.TickCount64);
                 filled = 0;
 
                 pacedSamples += PcmFrame.SamplesPerFrame;
@@ -235,6 +267,9 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
         switch (playerEvent)
         {
             case "playing":
+                // Fresh grace for the watchdog: a play command precedes PCM by
+                // however long the track takes to load.
+                Volatile.Write(ref _lastPcmAtMs, Environment.TickCount64);
                 SetState(Core.Abstractions.SourceState.Active);
                 break;
             case "paused":
@@ -251,6 +286,7 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
                 // tails survive; plain pause keeps the tail for resume.
                 if (State != Core.Abstractions.SourceState.Idle)
                 {
+                    Volatile.Write(ref _lastPcmAtMs, Environment.TickCount64);
                     RaiseDiscontinuity();
                     if (State == Core.Abstractions.SourceState.Active)
                     {
@@ -260,8 +296,17 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
 
                 break;
             case "stopped":
-            case "session_disconnected":
                 SetState(Core.Abstractions.SourceState.Idle);
+                break;
+            case "session_disconnected":
+                // The Spotify session/dealer dropping does NOT mean playback
+                // stopped: librespot keeps decoding the current track and
+                // reconnects within seconds (this WAN drops both Spotify TCP
+                // flows every few minutes). Marking Idle here flushed and
+                // re-anchored the speakers mid-song for nothing. If playback
+                // actually died with the session, the PCM-stall watchdog
+                // declares Idle shortly after.
+                logger.LogInformation("librespot session disconnected — keeping state {State}; PCM watchdog will idle a real stall", State);
                 break;
             case "track_changed":
                 _metadata = new TrackMetadata

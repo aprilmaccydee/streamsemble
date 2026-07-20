@@ -120,8 +120,13 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
             {
                 EnqueueControl(() => sink.FlushAsync(dropQueuedAudio: false, ct), "flush");
             }
-            else if (change is { NewState: SourceState.Active, OldState: SourceState.Paused })
+            else if (change.NewState is SourceState.Active)
             {
+                // Any transition INTO Active resumes, not just Paused→Active:
+                // the flush that held the pipeline may have come from an Idle
+                // drop (network blip killing the source), and Idle→Active then
+                // has to release that hold or the send loop stays wedged.
+                // Resume is idempotent when nothing is held.
                 EnqueueControl(() => sink.ResumeAsync(ct), "resume");
             }
         }
