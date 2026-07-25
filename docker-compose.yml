@@ -1,0 +1,85 @@
+# Example deployment: the full hub (AirPlay/Spotify in → AirPlay 2 speakers out).
+#
+#   docker compose up -d --build     # first build compiles librespot: ~10 min
+#   docker compose logs -f           # then open http://<host-ip>:8088
+#
+# Host networking is REQUIRED, not a convenience: mDNS discovery/advertising is
+# multicast on the LAN, and every AirPlay audio/control/timing channel is a
+# dynamically allocated UDP port that senders and speakers dial directly. Bridge
+# networking gives you a hub nothing can find and audio that never arrives.
+# That makes this a Linux-host deployment — on macOS and Windows, Docker's
+# "host" network is the internal VM, not your LAN, so run the hub natively there
+# (`dotnet run --project src/Streamsemble.Host`) and use this file on the box
+# that actually hosts the speakers' network. If the hub needs its own LAN
+# address, a macvlan network is the only other layout that works.
+#
+# Before starting, check nothing else on the host holds the ports the hub owns:
+#   sudo lsof -nP -iUDP:319 -iUDP:320 -iUDP:5353 -iTCP:7000 -iTCP:8088
+# nqptp/shairport-sync (319/320) will fight the PTP grandmaster; avahi-daemon on
+# 5353 normally coexists, but is worth stopping if discovery misbehaves.
+
+services:
+  streamsemble:
+    build:
+      context: .
+      args:
+        # LIBRESPOT_VARIANT: none   # skip the Rust build (then set Spotify__Enabled=false)
+        LIBRESPOT_REF: 9c7d756
+    image: streamsemble:latest
+    container_name: streamsemble
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_BIND_SERVICE      # PTP grandmaster binds privileged UDP 319/320
+    init: true                # reap librespot/ffmpeg children cleanly
+    stop_grace_period: 20s
+    volumes:
+      # HomeKit pairing identity, librespot credentials cache, WAV recordings.
+      # Losing this means re-pairing PIN-verified receivers (TVs) and Spotify.
+      - streamsemble-data:/data
+    environment:
+      # --- hub -----------------------------------------------------------
+      - Streamsemble__DeviceName=Streamsemble
+      - Streamsemble__Sink=AirPlay              # AirPlay | Wav | Null
+      - Streamsemble__WavDirectory=/data/recordings
+      # - Streamsemble__TestTone=true           # click track instead of a real source
+
+      # --- inbound: AirPlay 2 receiver (pick "Streamsemble Hub" on a phone) --
+      - AirPlayReceiver__Enabled=true
+      - AirPlayReceiver__Name=Streamsemble Hub
+      - AirPlayReceiver__Port=7000
+
+      # --- inbound: Spotify Connect --------------------------------------
+      - Spotify__Enabled=true
+      - Spotify__Bitrate=320
+      - Spotify__ExtraArgs=--volume-ctrl fixed
+      # - Spotify__DeviceName=Streamsemble      # defaults to Streamsemble__DeviceName
+
+      # --- outbound: speakers ---------------------------------------------
+      # Seeds the initial selection; the web UI overrides it live. Name is a
+      # substring match on the mDNS-advertised name (or use __Host for a
+      # fixed address). Buffered is the verified AirPlay 2 mode.
+      - AirPlaySender__Targets__0__Name=Kitchen
+      - AirPlaySender__Targets__0__Protocol=AirPlay2
+      - AirPlaySender__Targets__0__StreamMode=Buffered
+      - AirPlaySender__Targets__1__Name=Living room TV
+      - AirPlaySender__Targets__1__Protocol=AirPlay2
+      - AirPlaySender__Targets__1__StreamMode=Buffered
+      # - AirPlaySender__Targets__1__LatencyTrimMs=0   # +ve = this speaker plays later
+
+      # --- HomeKit PIN pairing (strict receivers, e.g. TVs) ----------------
+      # Set to 1, start, then write the PIN shown on the TV into the volume:
+      #   docker compose exec streamsemble sh -c 'echo 1234-5678 > /data/.streamsemble/pin.txt'
+      # The identity persists in the volume afterwards.
+      # - STREAMSEMBLE_PAIR=1
+
+      - Logging__LogLevel__Default=Information
+      - Logging__LogLevel__Streamsemble=Debug
+
+    # The image runs unprivileged (uid 10001) and still binds PTP 319/320 via
+    # the file capability + cap_add above. If you swap the named volume for a
+    # host bind mount, chown it to 10001 first — or fall back to root:
+    # user: "0:0"
+
+volumes:
+  streamsemble-data:

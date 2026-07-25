@@ -1,0 +1,29 @@
+# Build output and IDE state — the image builds from source inside the SDK stage.
+**/bin/
+**/obj/
+**/*.user
+.vs/
+.vscode/
+.idea/
+
+.git/
+.gitignore
+
+# Local debugging artifacts and captured audio (see .gitignore): never ship these.
+debug/
+**/recordings/
+**/*.pcap
+**/*.log
+**/*.wav
+**/*.aacdump
+
+# Local pairing/identity state — belongs in the /data volume, not the image.
+**/homekit-pairings.json
+**/pin.txt
+**/credentials.json
+**/.librespot/
+
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md

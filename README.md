@@ -177,6 +177,37 @@ For Spotify, open the app and pick **Streamsemble** as the playback device.
 > own outbound AirPlay sessions when anything holds those ports. Streaming
 > from *other* devices (phones, other Macs) to a hub on this machine is fine.
 
+### Docker
+
+`Dockerfile` + `docker-compose.yml` build the whole hub — .NET publish, plus
+librespot compiled from upstream `9c7d756` with `tools/librespot-resilience.patch`
+applied, plus the `ffmpeg` the buffered AirPlay 2 encoder shells out to.
+
+```bash
+docker compose up -d --build     # first build compiles librespot (~10 min)
+docker compose logs -f           # then http://<host-ip>:8088
+```
+
+Edit the `environment:` block to name your speakers; every setting in
+`appsettings.json` maps to `Section__Key` (e.g. `AirPlaySender__Targets__0__Name`).
+
+- **Host networking is required.** mDNS is multicast and every AirPlay
+  audio/control/timing channel is a dynamically allocated UDP port dialled
+  directly by senders and speakers; a bridge network gives you a hub nothing
+  discovers and audio that never arrives. That makes this a **Linux-host**
+  deployment — on macOS/Windows, Docker's "host" network is the internal VM, so
+  run the hub natively there instead.
+- The container runs unprivileged (uid 10001); `cap_add: NET_BIND_SERVICE` plus
+  a file capability on the executable is what lets the PTP grandmaster bind
+  319/320. Check nothing else holds those first (`lsof -nP -iUDP:319 -iUDP:320`)
+  — nqptp/shairport-sync will fight it.
+- `/data` is `$HOME` in the container: HomeKit pairing identity, librespot
+  credentials cache and WAV recordings live there, so keep the volume across
+  restarts or you re-pair every PIN-verified receiver. For a TV's PIN:
+  `docker compose exec streamsemble sh -c 'echo 1234-5678 > /data/.streamsemble/pin.txt'`.
+- Build with `--build-arg LIBRESPOT_VARIANT=none` to skip the Rust stage
+  entirely (then run with `Spotify__Enabled=false`).
+
 ### Configuration (`src/Streamsemble.Host/appsettings.json`)
 
 - `Streamsemble:DeviceName` — advertised name.
@@ -208,7 +239,8 @@ and FFT cross-correlation (~1.8 ms).
 ## Linux deployment notes
 
 Everything is cross-platform; the receiver has run on Ubuntu 24.04 arm64
-(`dotnet publish -r linux-arm64 --self-contained`). The PTP clock needs
+(`dotnet publish -r linux-arm64 --self-contained`), and the container image
+above is the packaged form of the same thing. The PTP clock needs
 ports 319/320 (`setcap CAP_NET_BIND_SERVICE` or root) and conflicts with any
 nqptp/shairport-sync on the same host. The librespot event helper uses
 `curl` (present on typical Linux hosts).
