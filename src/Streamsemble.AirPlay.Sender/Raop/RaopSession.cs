@@ -168,20 +168,26 @@ public sealed class RaopSession(string displayName, IPAddress address, int rtspP
         BufferedPacketsSent: 0,
         TimelineId: null);
 
+    private NowPlaying? _nowPlaying;
+
     public async Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct)
     {
-        var body = Dmap.TrackItem(metadata);
-        var response = await _rtsp.RequestAsync("SET_PARAMETER", ct, "application/x-dmap-tagged", body,
-            new Dictionary<string, string> { ["RTP-Info"] = $"rtptime={_lastKnownRtpTime}" }).ConfigureAwait(false);
-        if (!response.IsSuccess)
+        try
         {
-            // Metadata is cosmetic; some receivers reject DMAP — never fail the stream over it.
-            logger.LogDebug("{Name}: metadata rejected ({Status})", DisplayName, response.StatusCode);
+            _nowPlaying ??= new NowPlaying(_rtsp, DisplayName, logger);
+            await _nowPlaying.SendAsync(metadata, _lastKnownRtpTime, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogDebug(ex, "{Name}: metadata push failed", DisplayName);
         }
     }
 
     public async Task FlushAsync(ushort nextSeq, uint nextRtpTime, CancellationToken ct)
     {
+        // Receivers commonly clear their now-playing display on a flush, so
+        // forget that the cover was already sent and push it again next update.
+        _nowPlaying?.Reset();
         Ensure(await _rtsp.RequestAsync("FLUSH", ct, extraHeaders: new Dictionary<string, string>
         {
             ["RTP-Info"] = $"seq={nextSeq};rtptime={nextRtpTime}",

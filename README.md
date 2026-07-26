@@ -29,7 +29,7 @@ dependency injection throughout.
 | **Sender fan-out → N speakers, in sync** | ✅ Working | Real-device group (TV + Sonos) natively synced ≲25 ms with zero manual trims; earlier shairport-sync pair showed ~1.8 ms content skew by cross-correlation. Late joiners map onto the group's epoch anchor (`GroupTimelineAnchor`) instead of anchoring at "now", so a speaker joining mid-stream lands on the house timeline. |
 | **Retransmit / packet ring** | ✅ Working | Control channel answers RAOP resend requests from a shared plain-packet ring, re-framed per target. |
 | **ALAC decoder (Apple reference port)** | ✅ Working, unit-tested | SCE/CPE/verbatim/partial frames, all three magic-cookie forms; byte-identical against ffmpeg-generated golden vectors. |
-| **Volume & metadata forwarding** | ✅ Working | Spotify volume/track events → RAOP `SET_PARAMETER` (dB volume, DMAP metadata). Per-speaker volume is also read back from the device (`GET_PARAMETER`, on connect + periodic) and settable per speaker from the web UI. Inbound sender volume is observe-only by design. |
+| **Volume & metadata forwarding** | ✅ Working | Spotify volume/track events → `SET_PARAMETER` (dB volume; progress + DMAP listing item + cover art), on classic RAOP *and* AirPlay 2 over the encrypted control channel. Title, artist, album, album artist, track/disc number, duration, live position and album art all forward; a speaker joining mid-track is caught up rather than left blank. Per-speaker volume is also read back from the device (`GET_PARAMETER`, on connect + periodic) and settable per speaker from the web UI. Inbound sender volume is observe-only by design. |
 | **Source arbitration** | ✅ Working | Last source to play wins; the previous source is asked to yield. Unit-tested. |
 | **Web UI: discovery, selection, volume, sync telemetry** | ✅ Working | Browser at `http://<host>:8088` lists discovered AirPlay speakers; ticking one connects it live (mid-stream join), unticking drops it. Per-speaker + averaged global volume, live sync/latency graphic, and a technical panel (anchor state, buffer lead, PTP lock, epoch). |
 | **Google Cast source** | ⚠️ Stub (by design) | See limitation below. |
@@ -96,9 +96,9 @@ dependency injection throughout.
 | `Streamsemble.Timing` | `IMasterClock`, NTP timing responder, and the PTP stack: `PtpPortMux` (single owner of 319/320), `PtpReceiverClock` (the hub grandmaster), wire builders pinned by tests. |
 | `Streamsemble.Discovery` | mDNS browse and advertise (routable-IPv4-only records). |
 | `Streamsemble.AirPlay.Common` | Shared RTSP/plist/TLV8 + HAP pairing crypto, client and server side (`HapSrpServer`, transient pair-setup, FairPlay responder). |
-| `Streamsemble.AirPlay.Sender` | RAOP + AirPlay 2 sessions, RTP send, control/sync channel, `AirPlayTargetGroup` fan-out sink. |
+| `Streamsemble.AirPlay.Sender` | RAOP + AirPlay 2 sessions, RTP send, control/sync channel, `NowPlaying` metadata push, `AirPlayTargetGroup` fan-out sink. |
 | `Streamsemble.AirPlay.Receiver` | Full receiver: RTSP server, session handling, realtime (ALAC) + buffered (AAC) audio servers, receiver source. |
-| `Streamsemble.Spotify` | Supervised librespot child process → PCM + events. |
+| `Streamsemble.Spotify` | Supervised librespot child process → PCM + events, including now-playing metadata and cover-art fetch. |
 | `Streamsemble.Cast.Stub` | `ICastSource` stub. |
 | `Streamsemble.Host` | Console app: Generic Host, DI wiring, config. |
 
@@ -223,13 +223,45 @@ Edit the `environment:` block to name your speakers; every setting in
   `STREAMSEMBLE_PAIR=1`, then write the on-screen PIN to
   `~/.streamsemble/pin.txt` when prompted; the identity persists for future
   connects.
+- `STREAMSEMBLE_GROUP_LATENCY` (seconds, default `2.0`) — the group
+  presentation latency: every receiver, buffered or realtime, plays the sample
+  that is "now" at *shared PTP now + this*. It is what keeps multi-room in
+  sync, so it is deliberately one value for the whole house; `LatencyTrimMs`
+  is the per-speaker adjustment. Useful range is roughly **1–2 s** and the hub
+  logs a warning outside it: below ~1 s a receiver may never reach its start
+  threshold (silence, or an anchor landing behind "now" and force-resetting the
+  group epoch), and 2 s is the top of the buffered SETUP window this has been
+  verified against. Clamped to [0.5, 5.0]; unparseable values fall back to the
+  default and say so.
+
+### Now-playing metadata
+
+Track title/artist/album, album artist, track and disc number, duration,
+live position and **cover art** flow from the source to every speaker. On the
+wire that is three `SET_PARAMETER` requests per update — `text/parameters`
+progress, an `application/x-dmap-tagged` listing item, then the JPEG — sent
+identically for classic RAOP and for HAP-paired AirPlay 2 (over the encrypted
+control channel). Receivers that reject one part still get the others; nothing
+here can fail a stream.
+
+- Spotify metadata comes from librespot's `--onevent` variables; cover art is
+  fetched from the largest URL in `COVERS` and pushed once it lands, so the
+  title appears immediately and the art follows a beat later.
+- A speaker connecting mid-track (late join, reconnect, health-loop rebuild)
+  is caught up with the current track rather than showing a blank display
+  until the song ends. Buffered sessions send theirs once the timeline anchors.
+- The web UI shows the same artwork bytes that went to the speakers, so a
+  blank square there means the receivers got nothing either.
+  `STREAMSEMBLE_TV_NUDGE=0` suppresses the at-anchor push.
 
 ## Testing
 
 ```bash
-dotnet test    # 56 tests (AirPlay + core): SRP client↔server interop, ALAC
-               # decoder vs ffmpeg golden vectors, PTP grandmaster wire pins,
-               # ring buffer, arbiter, packers
+dotnet test    # 95 tests (AirPlay + core + Spotify): SRP client↔server interop,
+               # ALAC decoder vs ffmpeg golden vectors, PTP grandmaster wire
+               # pins, DMAP metadata encoding, the now-playing RTSP exchange
+               # against a stand-in receiver, librespot field parsing, group
+               # latency config, ring buffer, arbiter, packers
 ```
 
 Multi-room sync was verified end-to-end on real devices (TV + Sonos,

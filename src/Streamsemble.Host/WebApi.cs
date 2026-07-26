@@ -33,7 +33,21 @@ public static class WebApi
             return Results.Json(new
             {
                 activeSource = status.ActiveSource,
-                nowPlaying = new { title = meta.Title, artist = meta.Artist, album = meta.Album },
+                nowPlaying = new
+                {
+                    title = meta.Title,
+                    artist = meta.Artist,
+                    album = meta.Album,
+                    albumArtist = meta.AlbumArtist,
+                    trackNumber = meta.TrackNumber,
+                    discNumber = meta.DiscNumber,
+                    durationMs = meta.Duration?.TotalMilliseconds,
+                    positionMs = meta.Position?.TotalMilliseconds,
+                    // Versioned by track identity so the browser refetches on
+                    // track change but caches within one track.
+                    artworkUrl = meta.Artwork is { Length: > 0 } ? $"/api/artwork?v={meta.PersistentId():x}" : null,
+                    artworkSourceUrl = meta.ArtworkUrl,
+                },
                 volume = averageVolume ?? status.Volume,
                 volumeIsAverage = averageVolume.HasValue,
                 discovered = discovered.Current(DateTimeOffset.UtcNow)
@@ -75,6 +89,17 @@ public static class WebApi
                     presentationLatencyMs = telemetry.PresentationLatencyMs,
                 },
             });
+        });
+
+        // Cover art for the current track, straight from the source's metadata
+        // — the same bytes the speakers were sent, so what the browser shows is
+        // proof of what went out.
+        app.MapGet("/api/artwork", (PlaybackStatus status) =>
+        {
+            var meta = status.Metadata;
+            return meta.Artwork is { Length: > 0 } art
+                ? Results.File(art, meta.ArtworkMimeType ?? "image/jpeg")
+                : Results.NotFound();
         });
 
         app.MapPost("/api/speakers/volume", async (SpeakerVolumeRequest request, AirPlayTargetGroup group) =>

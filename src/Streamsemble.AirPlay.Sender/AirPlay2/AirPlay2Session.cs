@@ -105,10 +105,47 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         }
     }
 
-    public Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct) => Task.CompletedTask;
+    /// <summary>Last metadata handed to us, re-sent whenever the timeline changes under it (anchor, reconnect).</summary>
+    private volatile TrackMetadata _metadata = new();
+
+    private Raop.NowPlaying? _nowPlaying;
+
+    public async Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct)
+    {
+        _metadata = metadata;
+
+        // Nothing to hang an update on before RECORD, and a buffered session
+        // has no valid RTP time until its pump anchors. Either way the cached
+        // copy goes out from SendNowPlayingAsync the moment the timeline exists.
+        if (!_recordSent || (IsBuffered && !_anchored))
+        {
+            return;
+        }
+
+        try
+        {
+            _nowPlaying ??= new Raop.NowPlaying(_rtsp, DisplayName, logger);
+            await _nowPlaying.SendAsync(metadata, CurrentRtpTime, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogDebug(ex, "{Name}: metadata push failed", DisplayName);
+        }
+    }
+
+    /// <summary>
+    /// RTP time to tag metadata with: the buffered stream runs its own
+    /// counters, the realtime path follows the group's shared timeline.
+    /// </summary>
+    private uint CurrentRtpTime => IsBuffered ? _bufferedHeadRtpTime : _lastKnownRtpTime;
 
     public async Task FlushAsync(ushort nextSeq, uint nextRtpTime, CancellationToken ct)
     {
+        // A flush tears the receiver's timeline down, and receivers commonly
+        // clear their now-playing display with it — so forget that we already
+        // sent the cover and push it again with the re-anchor.
+        _nowPlaying?.Reset();
+
         if (IsBuffered)
         {
             if (!_recordSent)
@@ -665,8 +702,11 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             stream.Add("audioMode", new NSString("default"));
             stream.Add("isMedia", new NSNumber(true));          // iOS/OwnTone send this on the stream
             stream.Add("controlPort", new NSNumber(ourControlPort));
-            stream.Add("latencyMin", new NSNumber(11025));
-            stream.Add("latencyMax", new NSNumber(88200));
+            // Advertised buffering window: 0.25–2 s by default, widened if the
+            // configured group latency sits outside it (the anchor renders at
+            // that latency, so a window that excludes it is self-contradictory).
+            stream.Add("latencyMin", new NSNumber(Math.Min(11025, GroupPresentationLatencySamples)));
+            stream.Add("latencyMax", new NSNumber(Math.Max(88200, GroupPresentationLatencySamples)));
             stream.Add("spf", new NSNumber(AacEncoderPipe.SamplesPerFrame));
             stream.Add("sr", new NSNumber(44100));
             stream.Add("shk", new NSData(_audioKeyForWire));
@@ -814,8 +854,69 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     // stream pins its receiver latency to the SAME value (latencyMin==latencyMax)
     // so both land on the same PTP instant — no per-device trim needed. Must
     // exceed both receivers' minimum buffering (~1s AAC decode + jitter).
-    public const double GroupPresentationLatencySeconds = 2.0;
-    public const int GroupPresentationLatencySamples = (int)(GroupPresentationLatencySeconds * 44100);
+    //
+    // Overridable with STREAMSEMBLE_GROUP_LATENCY (seconds) for rigs whose
+    // receivers buffer differently. Two real limits bound the useful range:
+    // below ~1 s a receiver may never reach its start threshold (silence, or
+    // an anchor that lands behind "now" and force-resets the group epoch), and
+    // above ~2 s only receivers that accept a wider advertised latency window
+    // will play at all — 2.0 s is the top of what the buffered SETUP has been
+    // verified against. Clamped to [0.5, 5.0]; anything outside [1.0, 2.0] is
+    // unexplored territory and says so in the log.
+    public static readonly double GroupPresentationLatencySeconds = ReadGroupLatencySeconds();
+    public static readonly int GroupPresentationLatencySamples = (int)(GroupPresentationLatencySeconds * 44100);
+
+    /// <summary>Non-null when the configured latency is outside the verified 1–2 s band; logged once at group start.</summary>
+    public static string? GroupLatencyWarning { get; private set; }
+
+    /// <summary>Set when STREAMSEMBLE_GROUP_LATENCY overrode the 2.0 s default, for the startup log.</summary>
+    public static bool GroupLatencyOverridden { get; private set; }
+
+    internal const double DefaultGroupPresentationLatencySeconds = 2.0;
+
+    private static double ReadGroupLatencySeconds()
+    {
+        var (seconds, overridden, warning) = ParseGroupLatency(Environment.GetEnvironmentVariable("STREAMSEMBLE_GROUP_LATENCY"));
+        GroupLatencyOverridden = overridden;
+        GroupLatencyWarning = warning;
+        return seconds;
+    }
+
+    /// <summary>
+    /// Interpret STREAMSEMBLE_GROUP_LATENCY. Kept pure and separate from the
+    /// environment read so the clamping and the "you are off the verified map"
+    /// warnings can be exercised directly.
+    /// </summary>
+    internal static (double Seconds, bool Overridden, string? Warning) ParseGroupLatency(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return (DefaultGroupPresentationLatencySeconds, false, null);
+        }
+
+        if (!double.TryParse(raw, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+        {
+            return (DefaultGroupPresentationLatencySeconds, false,
+                $"STREAMSEMBLE_GROUP_LATENCY=\"{raw}\" is not a number — using {DefaultGroupPresentationLatencySeconds:F2}s");
+        }
+
+        var clamped = Math.Clamp(seconds, 0.5, 5.0);
+        if (Math.Abs(clamped - seconds) > 1e-9)
+        {
+            return (clamped, true, $"STREAMSEMBLE_GROUP_LATENCY={seconds:F2}s is out of range — clamped to {clamped:F2}s");
+        }
+
+        if (clamped is < 1.0 or > 2.0)
+        {
+            return (clamped, true, $"STREAMSEMBLE_GROUP_LATENCY={clamped:F2}s is outside the verified 1–2 s band — "
+                + (clamped < 1.0
+                    ? "receivers may never reach their start threshold (silence or repeated re-anchors)"
+                    : "receivers may reject the wider latency window and stay silent"));
+        }
+
+        return (clamped, true, null);
+    }
 
     private AacEncoderPipe? _aac;
     private System.Net.Sockets.TcpClient? _audioTcp;
@@ -889,7 +990,6 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             var reader = _bufferedAlac ? _alacFrames.Reader : _aac!.Frames;
             var samplesPerFrame = _bufferedAlac ? 352u : AacEncoderPipe.SamplesPerFrame;
             var ssrc = _bufferedAlac ? 0u : AacSsrc;
-            var firstRtpTime = rtpTime;
 
             await foreach (var frame in reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
@@ -940,7 +1040,11 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                     _anchored = await SendAnchorAsync(rtpTime, ageSamples, captureSample, ct).ConfigureAwait(false);
                     if (_anchored && Environment.GetEnvironmentVariable("STREAMSEMBLE_TV_NUDGE") != "0")
                     {
-                        await SendNowPlayingAsync(firstRtpTime, rtpTime, ct).ConfigureAwait(false);
+                        // Deliberately not awaited: this is the audio pump, and
+                        // metadata (a cover art upload especially) must never
+                        // hold up the next packet. The RTSP client serializes
+                        // it against the anchor that just went out.
+                        _ = SendNowPlayingAsync(rtpTime, ct);
                     }
                 }
 
@@ -967,46 +1071,26 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     }
 
     /// <summary>
-    /// Experiment: a TV with an on-screen "now playing" UI may not start its
-    /// audio pipeline until the session carries progress + track metadata (a
-    /// headless receiver like shairport never needs this). Sent once, just after
-    /// the anchor. Gate off with STREAMSEMBLE_TV_NUDGE=0.
+    /// Push the current track the moment the buffered timeline becomes real
+    /// (just after the anchor). Two jobs in one: it is where a session that
+    /// connected mid-track finally gets its metadata, and a TV with an
+    /// on-screen now-playing UI may not start its audio pipeline until the
+    /// session carries progress at all (a headless receiver like shairport
+    /// never needs this). Gate off with STREAMSEMBLE_TV_NUDGE=0.
     /// </summary>
-    private async Task SendNowPlayingAsync(uint startRtp, uint currentRtp, CancellationToken ct)
+    private async Task SendNowPlayingAsync(uint currentRtp, CancellationToken ct)
     {
         try
         {
-            var end = startRtp + 44100u * 3600; // ~1h window for a live stream
-            var progress = System.Text.Encoding.ASCII.GetBytes($"progress: {startRtp}/{currentRtp}/{end}\r\n");
-            await _rtsp.RequestAsync("SET_PARAMETER", ct, "text/parameters", progress).ConfigureAwait(false);
-
-            var meta = BuildDmapMetadata(album: "Diagnostics", title: "Streamsemble Test Tone", artist: "Streamsemble");
-            await _rtsp.RequestAsync("SET_PARAMETER", ct, "application/x-dmap-tagged", meta).ConfigureAwait(false);
-            logger.LogInformation("{Name}: sent now-playing progress + metadata (TV render nudge)", DisplayName);
+            _nowPlaying ??= new Raop.NowPlaying(_rtsp, DisplayName, logger);
+            await _nowPlaying.SendAsync(_metadata, currentRtp, ct).ConfigureAwait(false);
+            logger.LogInformation("{Name}: sent now-playing at anchor ({Title})",
+                DisplayName, _metadata.Title ?? "progress only — no track metadata yet");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex, "{Name}: now-playing SET_PARAMETER failed", DisplayName);
         }
-    }
-
-    /// <summary>Encode a DMAP (DAAP) now-playing listing item: mlit{ minm, asar, asal }.</summary>
-    private static byte[] BuildDmapMetadata(string album, string title, string artist)
-    {
-        static byte[] Tag(string code, byte[] value)
-        {
-            var b = new byte[8 + value.Length];
-            System.Text.Encoding.ASCII.GetBytes(code).CopyTo(b, 0);
-            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(4), value.Length);
-            value.CopyTo(b, 8);
-            return b;
-        }
-
-        static byte[] Str(string code, string s) => Tag(code, System.Text.Encoding.UTF8.GetBytes(s));
-
-        var inner = new[] { Str("minm", title), Str("asar", artist), Str("asal", album) }
-            .SelectMany(x => x).ToArray();
-        return Tag("mlit", inner);
     }
 
     private async Task SendBufferedPacketAsync(Stream tcp, uint seq, uint rtpTime, uint ssrc, byte[] payload, CancellationToken ct)

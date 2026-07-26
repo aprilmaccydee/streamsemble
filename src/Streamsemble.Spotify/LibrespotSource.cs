@@ -17,7 +17,15 @@ namespace Streamsemble.Spotify;
 public sealed class LibrespotSource(SpotifyOptions options, string defaultDeviceName, ILogger<LibrespotSource> logger)
     : AudioSourceBase("Spotify")
 {
-    private TrackMetadata _metadata = new();
+    private volatile TrackMetadata _metadata = new();
+
+    /// <summary>Bumped on every track change; an in-flight cover fetch whose epoch is stale is discarded.</summary>
+    private long _metadataEpoch;
+
+    /// <summary>Spotify covers are ~50 KB; the cap is a sanity bound, not a target.</summary>
+    private const int MaxArtworkBytes = 4 * 1024 * 1024;
+
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
 
     /// <summary>
     /// librespot exposes no external transport control, so preemption is
@@ -251,7 +259,7 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
                 var form = HttpUtility.ParseQueryString(await reader.ReadToEndAsync(ct).ConfigureAwait(false));
                 context.Response.StatusCode = 204;
                 context.Response.Close();
-                HandleEvent(form.AllKeys.OfType<string>().ToDictionary(k => k, k => form[k] ?? ""));
+                HandleEvent(form.AllKeys.OfType<string>().ToDictionary(k => k, k => form[k] ?? ""), ct);
             }
             catch (Exception ex)
             {
@@ -260,7 +268,7 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
         }
     }
 
-    private void HandleEvent(Dictionary<string, string> vars)
+    private void HandleEvent(Dictionary<string, string> vars, CancellationToken ct)
     {
         var playerEvent = vars.GetValueOrDefault("PLAYER_EVENT", "");
         logger.LogDebug("librespot event {Event}", playerEvent);
@@ -271,6 +279,7 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
                 // however long the track takes to load.
                 Volatile.Write(ref _lastPcmAtMs, Environment.TickCount64);
                 SetState(Core.Abstractions.SourceState.Active);
+                UpdatePosition(vars);
                 break;
             case "paused":
                 if (State == Core.Abstractions.SourceState.Active)
@@ -278,6 +287,14 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
                     SetState(Core.Abstractions.SourceState.Paused);
                 }
 
+                UpdatePosition(vars);
+                break;
+            case "seeked":
+            case "position_correction":
+                // The receiver's progress bar is only as good as the position
+                // we last told it; a seek moves the playhead without changing
+                // the track, so re-push the same listing item with fresh time.
+                UpdatePosition(vars);
                 break;
             case "loading":
                 // A user-initiated load (skip/new selection): the pipeline's
@@ -309,16 +326,7 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
                 logger.LogInformation("librespot session disconnected — keeping state {State}; PCM watchdog will idle a real stall", State);
                 break;
             case "track_changed":
-                _metadata = new TrackMetadata
-                {
-                    Title = vars.GetValueOrDefault("NAME"),
-                    Artist = vars.GetValueOrDefault("ARTISTS")?.Replace('\n', ','),
-                    Album = vars.GetValueOrDefault("ALBUM"),
-                    Duration = long.TryParse(vars.GetValueOrDefault("DURATION_MS"), out var ms)
-                        ? TimeSpan.FromMilliseconds(ms)
-                        : null,
-                };
-                RaiseMetadata(_metadata);
+                HandleTrackChanged(vars, ct);
                 break;
             case "volume_changed":
                 if (ushort.TryParse(vars.GetValueOrDefault("VOLUME"), out var volume))
@@ -330,6 +338,131 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
         }
     }
 
+    /// <summary>
+    /// New track: publish the text metadata immediately (receivers should show
+    /// the title the moment audio starts, not after an HTTP round-trip), then
+    /// fetch the cover in the background and republish once it lands.
+    /// </summary>
+    private void HandleTrackChanged(Dictionary<string, string> vars, CancellationToken ct)
+    {
+        var metadata = new TrackMetadata
+        {
+            Title = vars.GetValueOrDefault("NAME"),
+            // librespot joins multiple artists with newlines; receivers want one line.
+            Artist = LibrespotFields.JoinList(vars.GetValueOrDefault("ARTISTS")),
+            Album = vars.GetValueOrDefault("ALBUM"),
+            AlbumArtist = LibrespotFields.JoinList(vars.GetValueOrDefault("ALBUM_ARTISTS")),
+            Duration = long.TryParse(vars.GetValueOrDefault("DURATION_MS"), out var ms)
+                ? TimeSpan.FromMilliseconds(ms)
+                : null,
+            Position = TimeSpan.Zero,
+            TrackNumber = int.TryParse(vars.GetValueOrDefault("NUMBER"), out var number) && number > 0 ? number : null,
+            DiscNumber = int.TryParse(vars.GetValueOrDefault("DISC_NUMBER"), out var disc) && disc > 0 ? disc : null,
+            TrackId = vars.GetValueOrDefault("URI") is { Length: > 0 } uri ? uri : vars.GetValueOrDefault("TRACK_ID"),
+            ArtworkUrl = LibrespotFields.PickCover(vars.GetValueOrDefault("COVERS")),
+        };
+
+        var epoch = Interlocked.Increment(ref _metadataEpoch);
+        _metadata = metadata;
+        RaiseMetadata(metadata);
+        logger.LogInformation("now playing: {Title} — {Artist} ({Album}){Cover}",
+            metadata.Title, metadata.Artist, metadata.Album,
+            metadata.ArtworkUrl is null ? ", no cover offered" : "");
+
+        if (metadata.ArtworkUrl is { Length: > 0 } coverUrl)
+        {
+            _ = FetchArtworkAsync(coverUrl, epoch, ct);
+        }
+    }
+
+    /// <summary>
+    /// Download the cover and republish the track with it attached. Dropped
+    /// silently if another track started meanwhile (<paramref name="epoch"/>
+    /// went stale) — a late arrival must never overwrite the current track's art.
+    /// </summary>
+    private async Task FetchArtworkAsync(string url, long epoch, CancellationToken ct)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            using var response = await Http.GetAsync(url, timeout.Token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogDebug("cover fetch {Url} returned {Status}", url, (int)response.StatusCode);
+                return;
+            }
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(timeout.Token).ConfigureAwait(false);
+            if (bytes.Length == 0 || bytes.Length > MaxArtworkBytes)
+            {
+                logger.LogDebug("cover fetch {Url} ignored ({Bytes} bytes)", url, bytes.Length);
+                return;
+            }
+
+            if (Interlocked.Read(ref _metadataEpoch) != epoch)
+            {
+                return;
+            }
+
+            var withArt = _metadata with
+            {
+                Artwork = bytes,
+                ArtworkMimeType = response.Content.Headers.ContentType?.MediaType ?? LibrespotFields.SniffImageMime(bytes),
+                ArtworkUrl = url,
+            };
+
+            // Re-check under the epoch: the track may have changed between the
+            // read above and here, in which case _metadata is a different track.
+            if (Interlocked.Read(ref _metadataEpoch) != epoch)
+            {
+                return;
+            }
+
+            _metadata = withArt;
+            RaiseMetadata(withArt);
+            logger.LogInformation("cover art loaded ({Bytes:N0} bytes, {Mime})", bytes.Length, withArt.ArtworkMimeType);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "cover fetch failed for {Url}", url);
+        }
+    }
+
+    /// <summary>
+    /// Refresh the playhead on the current track and republish, so receivers
+    /// show real progress. Each republish costs an RTSP round-trip per speaker,
+    /// and librespot's position_correction can fire far more often than a
+    /// progress bar needs, so a move smaller than a second is not worth telling
+    /// anyone about.
+    /// </summary>
+    private void UpdatePosition(Dictionary<string, string> vars)
+    {
+        if (!long.TryParse(vars.GetValueOrDefault("POSITION_MS"), out var positionMs) || positionMs < 0)
+        {
+            return;
+        }
+
+        var current = _metadata;
+        if (!current.HasContent)
+        {
+            return;
+        }
+
+        var position = TimeSpan.FromMilliseconds(positionMs);
+        if (current.Position is { } previous && Math.Abs((position - previous).TotalMilliseconds) < 1000)
+        {
+            return;
+        }
+
+        var updated = current with { Position = position };
+        _metadata = updated;
+        RaiseMetadata(updated);
+    }
+
     private string WriteEventScript(int port)
     {
         var dir = Path.Combine(Path.GetTempPath(), "streamsemble");
@@ -337,11 +470,21 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
         var path = Path.Combine(dir, "librespot-event.sh");
         File.WriteAllText(path, $"""
             #!/bin/sh
+            # librespot 0.8 exports these on track_changed; COVERS/ARTISTS/
+            # ALBUM_ARTISTS are newline-separated lists, which survive
+            # --data-urlencode intact.
             curl -s -m 2 -X POST "http://127.0.0.1:{port}/event" \
               --data-urlencode "PLAYER_EVENT=$PLAYER_EVENT" \
               --data-urlencode "NAME=$NAME" \
               --data-urlencode "ARTISTS=$ARTISTS" \
+              --data-urlencode "ALBUM_ARTISTS=$ALBUM_ARTISTS" \
               --data-urlencode "ALBUM=$ALBUM" \
+              --data-urlencode "COVERS=$COVERS" \
+              --data-urlencode "NUMBER=$NUMBER" \
+              --data-urlencode "DISC_NUMBER=$DISC_NUMBER" \
+              --data-urlencode "ITEM_TYPE=$ITEM_TYPE" \
+              --data-urlencode "TRACK_ID=$TRACK_ID" \
+              --data-urlencode "URI=$URI" \
               --data-urlencode "DURATION_MS=$DURATION_MS" \
               --data-urlencode "POSITION_MS=$POSITION_MS" \
               --data-urlencode "VOLUME=$VOLUME" >/dev/null 2>&1 || true

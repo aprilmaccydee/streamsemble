@@ -29,6 +29,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.AirPlay.Tests"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Core.Tests", "tests\Streamsemble.Core.Tests\Streamsemble.Core.Tests.csproj", "{F5D83816-6C0F-40FD-9D0C-66332483D863}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Streamsemble.Spotify.Tests", "tests\Streamsemble.Spotify.Tests\Streamsemble.Spotify.Tests.csproj", "{1CC8CDDB-B431-4128-9625-6997AFD66138}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -82,6 +84,10 @@ Global
 		{F5D83816-6C0F-40FD-9D0C-66332483D863}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{F5D83816-6C0F-40FD-9D0C-66332483D863}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{F5D83816-6C0F-40FD-9D0C-66332483D863}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1CC8CDDB-B431-4128-9625-6997AFD66138}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1CC8CDDB-B431-4128-9625-6997AFD66138}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1CC8CDDB-B431-4128-9625-6997AFD66138}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1CC8CDDB-B431-4128-9625-6997AFD66138}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{F518282F-4BD3-4FF4-9AAD-4DADF0794665} = {A8D12931-E547-4270-B22A-0F444E118428}
@@ -95,5 +101,6 @@ Global
 		{74D4BBEA-F687-4747-8FB5-6992EB695CD6} = {A8D12931-E547-4270-B22A-0F444E118428}
 		{A91BD999-B342-42A0-B87C-ACD163818B8A} = {8B9A5A21-8812-494B-9282-46E103C7E317}
 		{F5D83816-6C0F-40FD-9D0C-66332483D863} = {8B9A5A21-8812-494B-9282-46E103C7E317}
+		{1CC8CDDB-B431-4128-9625-6997AFD66138} = {8B9A5A21-8812-494B-9282-46E103C7E317}
 	EndGlobalSection
 EndGlobal

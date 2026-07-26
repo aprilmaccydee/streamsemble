@@ -94,6 +94,18 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _gmClock = gmClockArg;
         _logger = loggerArg;
         _selectedTargets.Changed += (_, _) => _ = ReconcileAsync(CancellationToken.None);
+
+        if (AirPlay2.AirPlay2Session.GroupLatencyOverridden)
+        {
+            _logger.LogInformation("group presentation latency {Seconds:F2}s (STREAMSEMBLE_GROUP_LATENCY; default 2.00s)",
+                AirPlay2.AirPlay2Session.GroupPresentationLatencySeconds);
+        }
+
+        if (AirPlay2.AirPlay2Session.GroupLatencyWarning is { } latencyWarning)
+        {
+            _logger.LogWarning("{Warning}", latencyWarning);
+        }
+
         _ = HealthLoopAsync(_lifetime.Token);
     }
 
@@ -725,6 +737,21 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 }
             }
 
+            if (_metadata.HasContent)
+            {
+                // Catch this session up on what is already playing. Buffered
+                // sessions cache it and send once their timeline anchors; a
+                // realtime one takes it straight away.
+                try
+                {
+                    await session.SetMetadataAsync(_metadata, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogDebug(ex, "{Name}: initial metadata push failed", session.DisplayName);
+                }
+            }
+
             return session;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -978,11 +1005,29 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
 
     public async Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct = default)
     {
+        // Cached so a speaker that connects mid-track (late join, reconnect,
+        // health-loop rebuild) gets the current track instead of a blank
+        // display until whatever is playing happens to end.
+        _metadata = metadata;
         foreach (var session in SessionSnapshot())
         {
-            await session.SetMetadataAsync(metadata, ct).ConfigureAwait(false);
+            try
+            {
+                await session.SetMetadataAsync(metadata, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "{Name}: metadata update failed", session.DisplayName);
+            }
         }
     }
+
+    /// <summary>
+    /// Last track pushed to the group; replayed to each newly connected
+    /// session. The web API reads now-playing from <c>PlaybackStatus</c>
+    /// instead — this copy exists purely to catch late joiners up.
+    /// </summary>
+    private volatile TrackMetadata _metadata = new();
 
     public Task FlushAsync(CancellationToken ct = default) => FlushAsync(dropQueuedAudio: false, ct);
 

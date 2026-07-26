@@ -67,6 +67,12 @@ services:
       - AirPlaySender__Targets__1__StreamMode=Buffered
       # - AirPlaySender__Targets__1__LatencyTrimMs=0   # +ve = this speaker plays later
 
+      # Group presentation latency in seconds (default 2.0): how far ahead of
+      # "now" every receiver renders. One value for the whole house — this is
+      # what keeps them in sync; LatencyTrimMs is the per-speaker nudge. Useful
+      # range ~1–2 s; outside that the hub warns and receivers may not start.
+      # - STREAMSEMBLE_GROUP_LATENCY=2.0
+
       # --- HomeKit PIN pairing (strict receivers, e.g. TVs) ----------------
       # Set to 1, start, then write the PIN shown on the TV into the volume:
       #   docker compose exec streamsemble sh -c 'echo 1234-5678 > /data/.streamsemble/pin.txt'
