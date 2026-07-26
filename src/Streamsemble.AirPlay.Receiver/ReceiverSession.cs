@@ -788,14 +788,62 @@ public sealed class ReceiverSession(
         }
 
         var rate = plist.TryGetValue("rate", out var r) ? ((NSNumber)r).ToLong() : 0;
-        logger.LogInformation("SETRATEANCHORTIME rate={Rate}", rate);
         if (rate >= 1)
         {
-            _emitter?.Go();
+            // "rtpTime renders at networkTimeSecs+Frac" — on OUR timeline,
+            // since the hub clock is the grandmaster inbound senders sync to.
+            // The sender holds its local video back to exactly this instant
+            // (plus the latency we declare), so emission must hold for it too:
+            // opening the gate on request-arrival played the anchor lead
+            // early, which is why lip sync stayed out even once we reported
+            // real latency.
+            if (AnchorNanos(plist) is { } gateNanos)
+            {
+                var leadMs = (gateNanos - PtpReceiverClock.NowNanos) / 1e6;
+                if (Math.Abs(leadMs) > 5000)
+                {
+                    logger.LogWarning(
+                        "SETRATEANCHORTIME anchor {Lead:F0} ms from now — honoring, but a lead this size means clock trouble",
+                        leadMs);
+                }
+
+                logger.LogInformation("SETRATEANCHORTIME rate={Rate} — render gate at anchor ({Lead:F0} ms ahead)",
+                    rate, leadMs);
+                _emitter?.GoAt(gateNanos);
+            }
+            else
+            {
+                logger.LogInformation("SETRATEANCHORTIME rate={Rate} — no network time in body; gate opens now", rate);
+                _emitter?.Go();
+            }
+
             source.MarkActive();
+        }
+        else
+        {
+            logger.LogInformation("SETRATEANCHORTIME rate={Rate}", rate);
         }
 
         return RtspReply.Ok();
+    }
+
+    /// <summary>
+    /// The anchor's network time as grandmaster nanoseconds: whole seconds
+    /// plus a 2^64 fraction (the sender-side frac64 math in reverse). Null
+    /// when the body carries no network time (a bare rate change).
+    /// </summary>
+    internal static long? AnchorNanos(NSDictionary plist)
+    {
+        if (!plist.TryGetValue("networkTimeSecs", out var secsObj) || secsObj is not NSNumber secs)
+        {
+            return null;
+        }
+
+        var frac64 = plist.TryGetValue("networkTimeFrac", out var fracObj) && fracObj is NSNumber frac
+            ? unchecked((ulong)frac.ToLong())
+            : 0UL;
+        var fracNanos = (long)(((UInt128)frac64 * 1_000_000_000) >> 64);
+        return secs.ToLong() * 1_000_000_000L + fracNanos;
     }
 
     private RtspReply SetParameterReply(RtspRequest request)
