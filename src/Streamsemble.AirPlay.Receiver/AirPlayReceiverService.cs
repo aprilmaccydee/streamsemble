@@ -37,7 +37,8 @@ public sealed class AirPlayReceiverService(
         // The process-wide hub clock (DI singleton, shared with the speaker
         // fan-out so every role runs on ONE grandmaster). Lazily binds
         // 319/320 on the first PTP session SETUP.
-        _server = new RtspServer(conn => new ReceiverSession(conn, source, identity, ptp, logger), logger);
+        _server = new RtspServer(conn => new ReceiverSession(
+            conn, source, identity, ptp, options.Value.PresentationLatencySamples, logger), logger);
         _server.Start(options.Value.Port);
 
         // _airplay._tcp ONLY — deliberately no _raop._tcp. The _raop service

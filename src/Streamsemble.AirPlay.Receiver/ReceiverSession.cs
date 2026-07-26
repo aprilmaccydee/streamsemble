@@ -32,6 +32,7 @@ public sealed class ReceiverSession(
     AirPlayReceiverSource source,
     ReceiverIdentity identity,
     PtpReceiverClock ptp,
+    int presentationLatencySamples,
     ILogger logger) : IRtspConnectionHandler
 {
     private readonly TransientPairSetupServer _pairSetup = new();
@@ -101,6 +102,14 @@ public sealed class ReceiverSession(
             { "name", new NSString(identity.Name) },
             { "nameIsFactoryDefault", new NSNumber(false) },
             { "manufacturer", new NSString("Streamsemble") },
+            // The one field where we deliberately diverge from the TV's
+            // numbers (shape and placement still mirror tv-groupfields.log):
+            // the TV reports all-zero latencies because it renders at the
+            // sender's anchor; we forward into the speaker group, which
+            // renders one group presentation latency later. Reporting that
+            // here (and in RECORD) is what makes a sender hold back its local
+            // video for lip sync.
+            { "audioLatencies", BuildAudioLatencies() },
             { "model", new NSString(ReceiverConstants.Model) },
             { "pi", new NSString(identity.Pi) },
             { "protocolVersion", new NSString("1.1") },
@@ -131,6 +140,36 @@ public sealed class ReceiverSession(
             { "txtAirPlay", new NSData(BuildTxtAirPlay()) },
         };
         return PlistReply(info);
+    }
+
+    /// <summary>
+    /// The TV's exact entry set (types 100/101/102, same audioType variants,
+    /// same key order) with our real output latency in every slot — the hub
+    /// pipes every inbound audio class through the same group timeline, so
+    /// no class renders sooner than another.
+    /// </summary>
+    private NSArray BuildAudioLatencies() => new(
+        AudioLatency(100, null),
+        AudioLatency(100, "default"),
+        AudioLatency(100, "media"),
+        AudioLatency(100, "telephony"),
+        AudioLatency(100, "speechRecognition"),
+        AudioLatency(100, "alert"),
+        AudioLatency(101, null),
+        AudioLatency(101, "default"),
+        AudioLatency(102, "media"));
+
+    private NSDictionary AudioLatency(int type, string? audioType)
+    {
+        var dict = new NSDictionary { { "inputLatencyMicros", new NSNumber(0) } };
+        if (audioType is not null)
+        {
+            dict.Add("audioType", new NSString(audioType));
+        }
+
+        dict.Add("type", new NSNumber(type));
+        dict.Add("outputLatencyMicros", new NSNumber(presentationLatencySamples * 1_000_000L / 44100));
+        return dict;
     }
 
     private byte[] BuildTxtAirPlay()
@@ -732,8 +771,13 @@ public sealed class ReceiverSession(
 
     private RtspReply RecordReply()
     {
-        logger.LogInformation("RECORD — sender is starting the stream");
-        return new RtspReply { Headers = { ["Audio-Latency"] = "0" } };
+        // Audio-Latency (samples at 44.1k) is the classic lever behind
+        // "AirPlay delays the video": a sender holds its local render back by
+        // this much. Ours is real — audio pushed to the source is audible one
+        // group presentation latency later, on the speakers.
+        logger.LogInformation("RECORD — sender is starting the stream (Audio-Latency {Samples})",
+            presentationLatencySamples);
+        return new RtspReply { Headers = { ["Audio-Latency"] = presentationLatencySamples.ToString() } };
     }
 
     private RtspReply RateAnchorReply(RtspRequest request)

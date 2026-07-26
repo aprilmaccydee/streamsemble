@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Streamsemble.AirPlay.Receiver;
 using Streamsemble.AirPlay.Sender;
+using Streamsemble.AirPlay.Sender.AirPlay2;
 using Streamsemble.Cast.Stub;
 using Streamsemble.Core;
 using Streamsemble.Core.Abstractions;
@@ -20,6 +21,12 @@ builder.Services.Configure<StreamsembleOptions>(builder.Configuration.GetSection
 builder.Services.Configure<SpotifyOptions>(builder.Configuration.GetSection("Spotify"));
 builder.Services.Configure<AirPlaySenderOptions>(builder.Configuration.GetSection("AirPlaySender"));
 builder.Services.Configure<AirPlayReceiverOptions>(builder.Configuration.GetSection("AirPlayReceiver"));
+// The receiver's true presentation latency is the speaker group's: inbound
+// audio re-anchors onto the group timeline instead of rendering locally.
+// Reporting it lets Apple senders delay their local video/audio to match
+// (respects STREAMSEMBLE_GROUP_LATENCY via the sender-side constant).
+builder.Services.PostConfigure<AirPlayReceiverOptions>(
+    o => o.PresentationLatencySamples = AirPlay2Session.GroupPresentationLatencySamples);
 
 // Timing: exactly one master clock and timing responder for the whole process —
 // every outbound speaker session must discipline to the same timeline.
