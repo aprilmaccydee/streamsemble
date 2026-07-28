@@ -23,6 +23,14 @@ public sealed class AirPlayReceiverSource() : AudioSourceBase("AirPlay")
 
     internal void MarkActive() => SetState(Core.Abstractions.SourceState.Active);
 
+    /// <summary>
+    /// Sender pause/seek (FLUSH/FLUSHBUFFERED). Routes through the pump's
+    /// Paused handling so the speaker fan-out flushes too — without this the
+    /// group latency's worth of in-flight audio plays out after the sender
+    /// stopped. The next SETRATEANCHORTIME rate=1 marks Active again.
+    /// </summary>
+    internal void MarkPaused() => SetState(Core.Abstractions.SourceState.Paused);
+
     internal void MarkIdle() => SetState(Core.Abstractions.SourceState.Idle);
 
     internal void PushMetadata(Core.Metadata.TrackMetadata metadata) => RaiseMetadata(metadata);

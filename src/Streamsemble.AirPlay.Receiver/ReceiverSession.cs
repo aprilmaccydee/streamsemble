@@ -771,13 +771,17 @@ public sealed class ReceiverSession(
 
     private RtspReply RecordReply()
     {
-        // Audio-Latency (samples at 44.1k) is the classic lever behind
-        // "AirPlay delays the video": a sender holds its local render back by
-        // this much. Ours is real — audio pushed to the source is audible one
-        // group presentation latency later, on the speakers.
-        logger.LogInformation("RECORD — sender is starting the stream (Audio-Latency {Samples})",
-            presentationLatencySamples);
-        return new RtspReply { Headers = { ["Audio-Latency"] = presentationLatencySamples.ToString() } };
+        // Deliberately 0 while /info audioLatencies carries the real figure:
+        // declare on ONE surface only. Live test 2026-07-26 with both nonzero
+        // had the sender over-delaying video (audio seconds AHEAD) — it
+        // counts them cumulatively, and no real receiver reports both (Sonos:
+        // RECORD only, no audioLatencies key at all; TV: audioLatencies
+        // all-zero). audioLatencies won the slot because it is the modern
+        // pre-connect surface for our AirPlay-3.x-sdk /info shape. If lip
+        // sync comes back AUDIO-LATE by the group latency, the sender only
+        // honors this header — swap which surface carries the figure.
+        logger.LogInformation("RECORD — sender is starting the stream");
+        return new RtspReply { Headers = { ["Audio-Latency"] = "0" } };
     }
 
     private RtspReply RateAnchorReply(RtspRequest request)
@@ -899,7 +903,12 @@ public sealed class ReceiverSession(
         {
         }
 
-        logger.LogInformation("FLUSHBUFFERED — queued audio dropped");
+        // Pause must reach the speakers too: Paused makes the pump flush the
+        // fan-out, silencing the group-latency's worth of audio already in
+        // flight (audibly: pause used to keep playing for the whole group
+        // latency). The re-anchor that follows marks Active again.
+        source.MarkPaused();
+        logger.LogInformation("FLUSH — queued audio dropped, source paused until re-anchor");
         return RtspReply.Ok();
     }
 
