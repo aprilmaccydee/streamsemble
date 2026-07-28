@@ -15,10 +15,13 @@ public readonly record struct RealtimeAudioPacket(ushort Sequence, uint RtpTime,
 /// reply: data carries RTP packets (12-byte header ‖ ChaCha20-Poly1305
 /// ciphertext+tag ‖ 8-byte LE-counter nonce; AAD = header[4..12); key = shk —
 /// the same envelope as buffered, per-packet), control carries 0xD7 anchor
-/// and 0xD6 retransmit packets (both ignored: we render on arrival and never
-/// request resends). Packets are re-ordered on a small window keyed by the
-/// RTP sequence; anything that hasn't arrived by the time the window slides
-/// past it is a dropped-frame glitch, exactly like a lossy speaker.
+/// packets — parsed and surfaced via <see cref="OnAnchor"/>, they are the
+/// stream's only statement of when frames should RENDER (the sender
+/// transmits well ahead of real time) — and 0xD6 retransmit payloads
+/// (ignored: we never request resends). Packets are re-ordered on a small
+/// window keyed by the RTP sequence; anything that hasn't arrived by the
+/// time the window slides past it is a dropped-frame glitch, exactly like a
+/// lossy speaker.
 /// </summary>
 public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisposable
 {
@@ -37,6 +40,13 @@ public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisp
 
     /// <summary>Called with decrypted packets in sequence order, from the socket read loop.</summary>
     public required Func<RealtimeAudioPacket, CancellationToken, ValueTask> OnPacket { get; init; }
+
+    /// <summary>
+    /// Called per 0xD7 anchor: RTP frame <c>frame</c> is audible at
+    /// grandmaster reading <c>nanos</c>. Sent ~1/s; the first one arrives
+    /// with (or just before) the first audio packets.
+    /// </summary>
+    public Action<uint, long>? OnAnchor { get; init; }
 
     public void Start()
     {
@@ -145,13 +155,36 @@ public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisp
     {
         try
         {
+            var anchorsSeen = 0;
             while (!ct.IsCancellationRequested)
             {
                 var result = await udp.ReceiveAsync(ct).ConfigureAwait(false);
-                var type = result.Buffer.Length >= 2 ? result.Buffer[1] & 0x7F : 0;
-                // 0x57 (0xD7) = PTP anchor, 0x56 (0xD6) = retransmit payload —
-                // both informational for an on-arrival renderer.
-                logger.LogTrace("realtime control packet type 0x{Type:X2} ({Len} B)", type, result.Buffer.Length);
+                var packet = result.Buffer;
+                var type = packet.Length >= 2 ? packet[1] & 0x7F : 0;
+                // 0x57 (0xD7) = anchor "frame F is audible at grandmaster ns T":
+                // [4..8) frame F (u32 BE), [8..16) T (u64 BE), [16..20) the frame
+                // being TRANSMITTED at T (u32 BE; F + ~77175 = the sender's
+                // transmission lead), [20..28) clock id (layout per
+                // shairport-sync's rtp_ap2_control_receiver). 0x56 (0xD6) =
+                // retransmit payload, ignored.
+                if (type == 0x57 && packet.Length >= 28)
+                {
+                    var frame = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(4));
+                    var nanos = (long)BinaryPrimitives.ReadUInt64BigEndian(packet.AsSpan(8));
+                    if (anchorsSeen++ == 0)
+                    {
+                        var txFrame = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(16));
+                        logger.LogInformation(
+                            "realtime 0xD7 anchor: frame {Frame} audible at {Nanos} (sender transmission lead {LeadMs:F0} ms)",
+                            frame, nanos, (uint)(txFrame - frame) * 1000.0 / 44100);
+                    }
+
+                    OnAnchor?.Invoke(frame, nanos);
+                }
+                else
+                {
+                    logger.LogTrace("realtime control packet type 0x{Type:X2} ({Len} B)", type, packet.Length);
+                }
             }
         }
         catch (OperationCanceledException)

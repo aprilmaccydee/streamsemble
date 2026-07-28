@@ -44,6 +44,7 @@ public sealed class ReceiverSession(
     private RealtimeAudioServer? _realtimeServer;
     private AacDecoderPipe? _decoder;
     private PacedPcmEmitter? _emitter;
+    private AnchoredPcmScheduler? _scheduler;
     private UdpClient? _controlSocket;
     private CancellationTokenSource? _streamCts;
     private TrackMetadata _metadata = new();
@@ -496,9 +497,10 @@ public sealed class ReceiverSession(
     /// Realtime (type 96) — what macOS system output sends (ALAC 44.1/16/2,
     /// 352-sample packets, same ChaCha20 envelope as buffered keyed by shk).
     /// There is no ANNOUNCE in AirPlay 2, so the ALAC config is synthesized
-    /// from the protocol's fixed parameters. Rendered on arrival: the sender
-    /// paces transmission, so no SETRATEANCHORTIME gate exists in this mode —
-    /// the source goes active on the first decoded packet.
+    /// from the protocol's fixed parameters. No SETRATEANCHORTIME exists in
+    /// this mode; render timing comes from the control channel's 0xD7
+    /// anchors instead, via <see cref="AnchoredPcmScheduler"/> — the sender
+    /// transmits well ahead of presentation, so arrival time is meaningless.
     /// </summary>
     private RtspReply SetupRealtimeStream(NSDictionary stream)
     {
@@ -517,11 +519,28 @@ public sealed class ReceiverSession(
         var alac = new AlacDecoder(AlacSpecificConfig(spf));
         _streamCts = new CancellationTokenSource();
 
+        // Decoded frames render at their 0xD7-anchored time, not on arrival:
+        // the modern sender transmits ~1.75 s ahead of presentation, so
+        // arrival is the wrong clock for lip sync — and the lead varies per
+        // session, which is why the offset never measured the same twice.
+        // MarkActive rides each emit (no-op while Active): the slot is
+        // claimed when audio actually renders, and re-claimed after a FLUSH
+        // left the source Paused.
+        var scheduler = new AnchoredPcmScheduler(pcm =>
+        {
+            source.MarkActive();
+            source.PushDecodedPcm(pcm);
+        }, logger);
+        _scheduler = scheduler;
+        _ = RunSchedulerAsync(scheduler, _streamCts.Token);
+
         var pcmBuffer = new byte[alac.MaxBytesPerPacket];
         var pending = new List<byte>(PcmFrame.CanonicalFrameBytes * 2);
         var active = false;
+        var nextRtp = 0u;
         _realtimeServer = new RealtimeAudioServer(shk.Bytes, logger)
         {
+            OnAnchor = scheduler.SetAnchor,
             OnPacket = (packet, _) =>
             {
                 int written;
@@ -538,16 +557,22 @@ public sealed class ReceiverSession(
                 if (!active)
                 {
                     active = true;
-                    source.MarkActive();
                     logger.LogInformation("realtime audio flowing (seq {Seq}, {Bytes} B PCM/packet)",
                         packet.Sequence, written);
+                }
+
+                // An empty carry list means the next sample out is this
+                // packet's first sample — re-sync the running RTP cursor.
+                if (pending.Count == 0)
+                {
+                    nextRtp = packet.RtpTime;
                 }
 
                 // Full ALAC frames are exactly one canonical frame; the carry
                 // list only ever holds a trailing partial.
                 if (pending.Count == 0 && written == PcmFrame.CanonicalFrameBytes)
                 {
-                    source.PushDecodedPcm(pcmBuffer.AsSpan(0, written).ToArray());
+                    scheduler.Enqueue(packet.RtpTime, pcmBuffer.AsSpan(0, written).ToArray());
                     return ValueTask.CompletedTask;
                 }
 
@@ -558,7 +583,8 @@ public sealed class ReceiverSession(
                     var frame = new byte[PcmFrame.CanonicalFrameBytes];
                     pending.CopyTo(offset, frame, 0, frame.Length);
                     offset += frame.Length;
-                    source.PushDecodedPcm(frame);
+                    scheduler.Enqueue(nextRtp, frame);
+                    nextRtp += (uint)PcmFrame.SamplesPerFrame;
                 }
 
                 pending.RemoveRange(0, offset);
@@ -658,6 +684,21 @@ public sealed class ReceiverSession(
         catch (Exception ex)
         {
             logger.LogWarning(ex, "PCM emitter failed");
+        }
+    }
+
+    private async Task RunSchedulerAsync(AnchoredPcmScheduler scheduler, CancellationToken ct)
+    {
+        try
+        {
+            await scheduler.RunAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "anchored PCM scheduler failed");
         }
     }
 
@@ -903,6 +944,8 @@ public sealed class ReceiverSession(
         {
         }
 
+        _scheduler?.Flush();
+
         // Pause must reach the speakers too: Paused makes the pump flush the
         // fan-out, silencing the group-latency's worth of audio already in
         // flight (audibly: pause used to keep playing for the whole group
@@ -933,6 +976,7 @@ public sealed class ReceiverSession(
         _realtimeServer = null;
         _decoder = null;
         _emitter = null;
+        _scheduler = null;
         _controlSocket = null;
         source.MarkIdle();
     }
