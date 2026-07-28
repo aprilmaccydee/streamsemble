@@ -11,16 +11,14 @@ public sealed class AirPlayReceiverOptions
     public int Port { get; set; } = 7000;
 
     /// <summary>
-    /// The hub's render lead, in samples at 44.1 kHz: how long audio emitted
-    /// into the pipeline takes to turn audible on the speaker group (the
-    /// group presentation latency; Host wires it from the sender side).
-    /// Inbound anchored render times are honored by emitting this much
-    /// EARLY, so audio is audible AT the sender's stated time and the
-    /// receiver truthfully declares zero latency — the TV contract. NOT
-    /// reported to senders: the 2026-07-26 experiments proved declared
-    /// latency isn't honored consistently (ignored for realtime video,
-    /// double-counted across surfaces). Must stay below the realtime
-    /// sender's ~1.75 s transmission lead or audio trails by the difference.
+    /// Emit-scheduling lead, in samples at 44.1 kHz: inbound frames are
+    /// released to the pipeline this far before their stamped render
+    /// deadline (Host wires it as group latency + slack). Sync does NOT
+    /// depend on this value — every frame carries its absolute deadline and
+    /// the sink derives the send timeline from the stamps — it only needs
+    /// to be large enough that the data is downstream before it is due, and
+    /// small enough to fit inside the realtime sender's ~1.75 s
+    /// transmission lead.
     /// </summary>
     public int PresentationLatencySamples { get; set; }
 }

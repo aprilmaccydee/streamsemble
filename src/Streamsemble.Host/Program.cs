@@ -21,10 +21,12 @@ builder.Services.Configure<StreamsembleOptions>(builder.Configuration.GetSection
 builder.Services.Configure<SpotifyOptions>(builder.Configuration.GetSection("Spotify"));
 builder.Services.Configure<AirPlaySenderOptions>(builder.Configuration.GetSection("AirPlaySender"));
 builder.Services.Configure<AirPlayReceiverOptions>(builder.Configuration.GetSection("AirPlayReceiver"));
-// The receiver's render lead is the speaker group's presentation latency:
-// inbound anchored audio is emitted that much early so it turns audible at
-// the sender's stated render time (respects STREAMSEMBLE_GROUP_LATENCY via
-// the sender-side constant).
+// Inbound frames are released exactly one group latency before their
+// stamped render deadline. The release time is sync-neutral — frames
+// render at their stamp regardless — it only has to be early enough that
+// the data is downstream when due (a frame released at stamp − latency is
+// sent the moment it lands, still a full group latency before it renders).
+// Respects STREAMSEMBLE_GROUP_LATENCY via the sender-side constant.
 builder.Services.PostConfigure<AirPlayReceiverOptions>(
     o => o.PresentationLatencySamples = AirPlay2Session.GroupPresentationLatencySamples);
 

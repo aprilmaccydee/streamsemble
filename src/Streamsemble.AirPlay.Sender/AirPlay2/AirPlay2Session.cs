@@ -950,6 +950,15 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     /// </summary>
     public Func<long, long>? TrueContentAgeSamples { get; set; }
 
+    /// <summary>
+    /// Set by the group: the SOURCE's render stamp (grandmaster ns) for a
+    /// capture index, when the live source states its render deadlines
+    /// (inbound AirPlay). Anchoring the receiver at the stamp makes
+    /// presentation exact by construction; negative = unstamped source
+    /// (music), fall back to the now-based anchor.
+    /// </summary>
+    public Func<long, long>? TargetNanosForCapture { get; set; }
+
     /// <summary>Capture-counter position just past the last PCM handed to this session.</summary>
     private long _pcmCaptureEnd;
 
@@ -1199,12 +1208,26 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             return false;
         }
 
-        // The anchored frame holds PCM captured contentAgeSamples ago (encoder
-        // pipeline delay, measured live); schedule it that much earlier so PCM
-        // captured at T plays at exactly T + group latency on every receiver.
-        var ageNanos = (ulong)(contentAgeSamples * 1_000_000_000L / 44100);
-        var proposed = anchor.Nanos + (ulong)(GroupPresentationLatencySeconds * 1_000_000_000) - ageNanos;
-        logger.LogInformation("{Name}: anchor content age {Ms:F0} ms (encoder pipeline), compensating", DisplayName, contentAgeSamples * 1000.0 / 44100);
+        ulong proposed;
+        if (TargetNanosForCapture?.Invoke(captureSample) is > 0 and var targetNanos)
+        {
+            // The source stated when this capture index must turn audible —
+            // anchor the receiver exactly there. No "now", no age estimate:
+            // presentation equals the source's deadline by construction.
+            proposed = (ulong)targetNanos;
+            logger.LogInformation("{Name}: anchoring at the source's render stamp ({LeadMs:F0} ms out)",
+                DisplayName, ((long)proposed - (long)anchor.Nanos) / 1e6);
+        }
+        else
+        {
+            // The anchored frame holds PCM captured contentAgeSamples ago
+            // (encoder pipeline delay, measured live); schedule it that much
+            // earlier so PCM captured at T plays at exactly T + group latency
+            // on every receiver.
+            var ageNanos = (ulong)(contentAgeSamples * 1_000_000_000L / 44100);
+            proposed = anchor.Nanos + (ulong)(GroupPresentationLatencySeconds * 1_000_000_000) - ageNanos;
+            logger.LogInformation("{Name}: anchor content age {Ms:F0} ms (encoder pipeline), compensating", DisplayName, contentAgeSamples * 1000.0 / 44100);
+        }
 
         var baseNanos = proposed;
         if (GroupAnchor is { } groupAnchor)

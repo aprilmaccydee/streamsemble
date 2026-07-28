@@ -51,8 +51,8 @@ public class AnchorGateTests
         var emitted = 0;
         var emitter = new PacedPcmEmitter(
             channel.Reader,
-            _ => Interlocked.Increment(ref emitted),
-            () => Volatile.Read(ref clock));
+            (_, _) => Interlocked.Increment(ref emitted),
+            clockNanos: () => Volatile.Read(ref clock));
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var run = emitter.RunAsync(cts.Token);
 
@@ -80,8 +80,8 @@ public class AnchorGateTests
         var emitted = 0;
         var emitter = new PacedPcmEmitter(
             channel.Reader,
-            _ => Interlocked.Increment(ref emitted),
-            () => 1_000_000_000_000L);
+            (_, _) => Interlocked.Increment(ref emitted),
+            clockNanos: () => 1_000_000_000_000L);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var run = emitter.RunAsync(cts.Token);
 

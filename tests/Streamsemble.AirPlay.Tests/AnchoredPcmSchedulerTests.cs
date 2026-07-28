@@ -12,7 +12,7 @@ public class AnchoredPcmSchedulerTests
         var clock = 5_000_000_000_000L;
         var emitted = new List<uint>();
         var scheduler = new AnchoredPcmScheduler(
-            pcm => { lock (emitted) { emitted.Add((uint)pcm.Length); } },
+            (pcm, _) => { lock (emitted) { emitted.Add((uint)pcm.Length); } },
             NullLogger.Instance,
             clockNanos: () => Volatile.Read(ref clock));
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -54,7 +54,7 @@ public class AnchoredPcmSchedulerTests
         var clock = clockStart;
         var emitted = 0;
         var scheduler = new AnchoredPcmScheduler(
-            _ => Interlocked.Increment(ref emitted),
+            (_, _) => Interlocked.Increment(ref emitted),
             NullLogger.Instance,
             clockNanos: () => Volatile.Read(ref clock));
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -83,7 +83,7 @@ public class AnchoredPcmSchedulerTests
         var clock = 5_000_000_000_000L;
         var emitted = 0;
         var scheduler = new AnchoredPcmScheduler(
-            _ => Interlocked.Increment(ref emitted),
+            (_, _) => Interlocked.Increment(ref emitted),
             NullLogger.Instance,
             leadNanos: 1_500_000_000,
             clockNanos: () => Volatile.Read(ref clock));

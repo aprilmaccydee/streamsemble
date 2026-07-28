@@ -35,9 +35,16 @@ public abstract class AudioSourceBase(string name) : IAudioSource
     public abstract Task StopAsync(CancellationToken cancellationToken = default);
 
     /// <summary>Stamps <paramref name="pcm"/> with the running sample clock and queues it.</summary>
-    protected void EmitPcm(ReadOnlyMemory<byte> pcm)
+    protected void EmitPcm(ReadOnlyMemory<byte> pcm) => EmitPcm(pcm, 0);
+
+    /// <summary>
+    /// As <see cref="EmitPcm(ReadOnlyMemory{byte})"/>, additionally carrying
+    /// the absolute grandmaster time the first sample should turn audible
+    /// (see <see cref="PcmFrame.TargetNanos"/>); 0 = no target.
+    /// </summary>
+    protected void EmitPcm(ReadOnlyMemory<byte> pcm, long targetNanos)
     {
-        var frame = new PcmFrame(pcm, _sampleClock);
+        var frame = new PcmFrame(pcm, _sampleClock, targetNanos);
         _sampleClock += frame.SampleCount;
         _channel.Writer.TryWrite(frame);
     }

@@ -18,8 +18,14 @@ public sealed class AirPlayReceiverSource() : AudioSourceBase("AirPlay")
         return Task.CompletedTask;
     }
 
-    /// <summary>Entry point for the decoded-audio path to feed the pipeline.</summary>
-    internal void PushDecodedPcm(ReadOnlyMemory<byte> pcm) => EmitPcm(pcm);
+    /// <summary>
+    /// Entry point for the decoded-audio path to feed the pipeline.
+    /// <paramref name="targetNanos"/> is the grandmaster time the first
+    /// sample should turn audible (0 = unknown); the sink derives its send
+    /// timeline from it so inbound audio presents exactly when the sender
+    /// asked.
+    /// </summary>
+    internal void PushDecodedPcm(ReadOnlyMemory<byte> pcm, long targetNanos = 0) => EmitPcm(pcm, targetNanos);
 
     internal void MarkActive() => SetState(Core.Abstractions.SourceState.Active);
 

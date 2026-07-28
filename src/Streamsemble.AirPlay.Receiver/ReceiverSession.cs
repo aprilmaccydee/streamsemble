@@ -461,7 +461,10 @@ public sealed class ReceiverSession(
 
         _streamCts = new CancellationTokenSource();
         _decoder = new AacDecoderPipe(logger);
-        _emitter = new PacedPcmEmitter(_decoder.Pcm, pcm => source.PushDecodedPcm(pcm));
+        _emitter = new PacedPcmEmitter(
+            _decoder.Pcm,
+            (pcm, target) => source.PushDecodedPcm(pcm, target),
+            presentationLatencySamples * 1_000_000_000L / 44100);
         _ = RunEmitterAsync(_emitter, _streamCts.Token);
 
         _audioServer = new BufferedAudioServer(shk.Bytes, logger)
@@ -519,17 +522,17 @@ public sealed class ReceiverSession(
         var alac = new AlacDecoder(AlacSpecificConfig(spf));
         _streamCts = new CancellationTokenSource();
 
-        // Decoded frames render at their 0xD7-anchored time, not on arrival:
-        // the modern sender transmits ~1.75 s ahead of presentation, so
-        // arrival is the wrong clock for lip sync — and the lead varies per
-        // session, which is why the offset never measured the same twice.
-        // MarkActive rides each emit (no-op while Active): the slot is
-        // claimed when audio actually renders, and re-claimed after a FLUSH
-        // left the source Paused.
-        var scheduler = new AnchoredPcmScheduler(pcm =>
+        // Decoded frames carry their 0xD7-anchored render deadline, not
+        // arrival time: the modern sender transmits ~1.75 s ahead of
+        // presentation with a per-session-variable lead, so arrival is the
+        // wrong clock for lip sync. The sink derives its send timeline from
+        // the stamps. MarkActive rides each emit (no-op while Active): the
+        // slot is claimed when audio actually flows, and re-claimed after a
+        // FLUSH left the source Paused.
+        var scheduler = new AnchoredPcmScheduler((pcm, target) =>
         {
             source.MarkActive();
-            source.PushDecodedPcm(pcm);
+            source.PushDecodedPcm(pcm, target);
         }, logger, presentationLatencySamples * 1_000_000_000L / 44100);
         _scheduler = scheduler;
         _ = RunSchedulerAsync(scheduler, _streamCts.Token);
@@ -832,19 +835,13 @@ public sealed class ReceiverSession(
         {
             // "rtpTime renders at networkTimeSecs+Frac" — on OUR timeline,
             // since the hub clock is the grandmaster inbound senders sync to.
-            // The sender holds its local video back to exactly this instant
-            // (plus the latency we declare), so emission must hold for it too:
-            // opening the gate on request-arrival played the anchor lead
-            // early, which is why lip sync stayed out even once we reported
-            // real latency.
+            // The sender holds its local video back to exactly this instant,
+            // so the anchor becomes every frame's render stamp: the emitter
+            // stamps frames anchor+offset, and the sink derives its send
+            // timeline from the stamps — presentation lands on the anchor
+            // with no estimated pipeline constants in between.
             if (AnchorNanos(plist) is { } anchorNanos)
             {
-                // Emit one group latency EARLY so the anchored frame turns
-                // AUDIBLE at the anchor — the TV contract our /info mirrors
-                // (zero declared latency, present at the anchor). Buffered
-                // senders burst well past the anchor point, so the data is
-                // there to emit ahead.
-                var gateNanos = anchorNanos - presentationLatencySamples * 1_000_000_000L / 44100;
                 var leadMs = (anchorNanos - PtpReceiverClock.NowNanos) / 1e6;
                 if (Math.Abs(leadMs) > 5000)
                 {
@@ -854,9 +851,9 @@ public sealed class ReceiverSession(
                 }
 
                 logger.LogInformation(
-                    "SETRATEANCHORTIME rate={Rate} — audible at anchor ({Lead:F0} ms ahead; emitting {Emit:F0} ms early)",
-                    rate, leadMs, presentationLatencySamples * 1000.0 / 44100);
-                _emitter?.GoAt(gateNanos);
+                    "SETRATEANCHORTIME rate={Rate} — frames stamped audible at anchor ({Lead:F0} ms ahead)",
+                    rate, leadMs);
+                _emitter?.GoAt(anchorNanos);
             }
             else
             {

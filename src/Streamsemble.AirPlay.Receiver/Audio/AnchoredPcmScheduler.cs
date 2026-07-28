@@ -5,23 +5,22 @@ using Streamsemble.Timing.Ptp;
 namespace Streamsemble.AirPlay.Receiver.Audio;
 
 /// <summary>
-/// Emits realtime PCM so it turns AUDIBLE at its anchored render time.
-/// Modern macOS realtime ("buffered realtime") transmits ~1.75 s ahead of
-/// presentation, so arrival order is the wrong clock — rendering on
-/// arrival runs early by whatever lead the engine uses, differently every
-/// session. The 0xD7 anchors state "frame F is audible at local time T"
-/// (already clock-translated, refreshed ~1/s); frame N must be audible at
-/// T + (N − F)/44100, and since everything emitted here takes the hub's
-/// group presentation latency to reach the speakers, it is emitted
-/// <paramref name="leadNanos"/> (that group latency) EARLY — the TV
-/// contract: declare zero, present at the anchor. That only works while
-/// the hub latency fits inside the sender's transmission lead; if it
-/// doesn't, frames emit on arrival and trail by the difference, loudly.
-/// Frames arriving before any anchor wait up to a second for one; a sender
-/// that never sends 0xD7 falls back to on-arrival, loudly.
+/// Emits realtime PCM stamped with its anchored render deadline. Modern
+/// macOS realtime ("buffered realtime") transmits ~1.75 s ahead of
+/// presentation, so arrival order is the wrong clock. The 0xD7 anchors
+/// state "frame F is audible at local time T" (already clock-translated,
+/// refreshed ~1/s); frame N is audible at T + (N − F)/44100. Each frame is
+/// handed to <paramref name="emit"/> with that absolute target time —
+/// downstream, the sink derives its whole send timeline from the stamp,
+/// so presentation is exact with no estimated pipeline constants — and
+/// emission is paced <paramref name="leadNanos"/> (the group latency plus
+/// scheduling slack) ahead of the target so the data is always downstream
+/// in time. Frames arriving before any anchor wait up to a second for
+/// one; a sender that never sends 0xD7 falls back to on-arrival with
+/// unstamped frames (target 0), loudly.
 /// </summary>
 public sealed class AnchoredPcmScheduler(
-    Action<ReadOnlyMemory<byte>> emit,
+    Action<ReadOnlyMemory<byte>, long> emit,
     ILogger logger,
     long leadNanos = 0,
     Func<long>? clockNanos = null)
@@ -70,10 +69,11 @@ public sealed class AnchoredPcmScheduler(
                 }
             }
 
+            long audibleAt = 0;
             while (anchor is not null)
             {
-                var target = anchor.Nanos + unchecked((int)(rtp - anchor.Frame)) * 1_000_000_000L / 44100 - leadNanos;
-                var aheadNs = target - _now();
+                audibleAt = anchor.Nanos + unchecked((int)(rtp - anchor.Frame)) * 1_000_000_000L / 44100;
+                var aheadNs = audibleAt - leadNanos - _now();
                 if (aheadNs <= 1_000_000)
                 {
                     if (aheadNs < -250_000_000 && !_budgetWarned)
@@ -94,7 +94,7 @@ public sealed class AnchoredPcmScheduler(
                 anchor = Volatile.Read(ref _anchor);
             }
 
-            emit(pcm);
+            emit(pcm, audibleAt);
         }
     }
 }
