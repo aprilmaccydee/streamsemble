@@ -869,10 +869,16 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     /// <summary>Non-null when the configured latency is outside the verified 1–2 s band; logged once at group start.</summary>
     public static string? GroupLatencyWarning { get; private set; }
 
-    /// <summary>Set when STREAMSEMBLE_GROUP_LATENCY overrode the 2.0 s default, for the startup log.</summary>
+    /// <summary>Set when STREAMSEMBLE_GROUP_LATENCY overrode the default, for the startup log.</summary>
     public static bool GroupLatencyOverridden { get; private set; }
 
-    internal const double DefaultGroupPresentationLatencySeconds = 2.0;
+    // 1.5 s, not 2.0: still inside the verified 1–2 s band for every
+    // speaker, and — the reason for the change — UNDER the ~1.75 s
+    // transmission lead of a realtime inbound sender. The receiver honors
+    // anchored render times by emitting one group latency early; at 2.0 s
+    // the frames simply haven't arrived yet when they need to go out, and
+    // inbound audio structurally trails video by the difference.
+    internal const double DefaultGroupPresentationLatencySeconds = 1.5;
 
     private static double ReadGroupLatencySeconds()
     {

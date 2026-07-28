@@ -9,11 +9,13 @@ public class GroupLatencyConfigTests
     [InlineData(null)]
     [InlineData("")]
     [InlineData("   ")]
-    public void UnsetKeepsTheVerifiedTwoSecondDefault(string? raw)
+    public void UnsetKeepsTheDefault(string? raw)
     {
         var (seconds, overridden, warning) = AirPlay2Session.ParseGroupLatency(raw);
 
-        Assert.Equal(2.0, seconds);
+        // 1.5 s: verified band for the speakers AND under the ~1.75 s
+        // realtime inbound transmission lead the receiver renders against.
+        Assert.Equal(1.5, seconds);
         Assert.False(overridden);
         Assert.Null(warning);
     }
@@ -61,7 +63,7 @@ public class GroupLatencyConfigTests
     {
         var (seconds, overridden, warning) = AirPlay2Session.ParseGroupLatency("two seconds");
 
-        Assert.Equal(2.0, seconds);
+        Assert.Equal(1.5, seconds);
         Assert.False(overridden);
         Assert.Contains("not a number", warning);
     }

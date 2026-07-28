@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using Streamsemble.AirPlay.Common.Hap;
+using Streamsemble.Timing.Ptp;
 
 namespace Streamsemble.AirPlay.Receiver.Audio;
 
@@ -42,11 +43,15 @@ public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisp
     public required Func<RealtimeAudioPacket, CancellationToken, ValueTask> OnPacket { get; init; }
 
     /// <summary>
-    /// Called per 0xD7 anchor: RTP frame <c>frame</c> is audible at
-    /// grandmaster reading <c>nanos</c>. Sent ~1/s; the first one arrives
-    /// with (or just before) the first audio packets.
+    /// Called per 0xD7 anchor: RTP frame <c>frame</c> is audible at LOCAL
+    /// grandmaster reading <c>nanos</c> — the packet's sender-clock time
+    /// already translated through <see cref="ClockOffsetFilter"/>. Sent
+    /// ~1/s; the first one arrives with (or just before) the first audio
+    /// packets.
     /// </summary>
     public Action<uint, long>? OnAnchor { get; init; }
+
+    private readonly ClockOffsetFilter _senderClockOffset = new();
 
     public void Start()
     {
@@ -161,25 +166,31 @@ public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisp
                 var result = await udp.ReceiveAsync(ct).ConfigureAwait(false);
                 var packet = result.Buffer;
                 var type = packet.Length >= 2 ? packet[1] & 0x7F : 0;
-                // 0x57 (0xD7) = anchor "frame F is audible at grandmaster ns T":
-                // [4..8) frame F (u32 BE), [8..16) T (u64 BE), [16..20) the frame
-                // being TRANSMITTED at T (u32 BE; F + ~77175 = the sender's
-                // transmission lead), [20..28) clock id (layout per
-                // shairport-sync's rtp_ap2_control_receiver). 0x56 (0xD6) =
-                // retransmit payload, ignored.
+                // 0x57 (0xD7) = anchor: [4..8) frame F (u32 BE) audible at
+                // [8..16) T (u64 BE), [16..20) the frame being TRANSMITTED at
+                // T (u32 BE; F + ~77175 = the sender's transmission lead),
+                // [20..28) clock id (layout per shairport-sync's
+                // rtp_ap2_control_receiver). T is on the SENDER's timeline
+                // (its monotonic clock — hours-since-boot scale), and T is
+                // also this packet's send instant (one instant, two cursor
+                // readings), which is what makes arrival-based offset
+                // filtering sound. 0x56 (0xD6) = retransmit payload, ignored.
                 if (type == 0x57 && packet.Length >= 28)
                 {
                     var frame = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(4));
-                    var nanos = (long)BinaryPrimitives.ReadUInt64BigEndian(packet.AsSpan(8));
+                    var senderNanos = (long)BinaryPrimitives.ReadUInt64BigEndian(packet.AsSpan(8));
+                    var offset = _senderClockOffset.Update(PtpReceiverClock.NowNanos - senderNanos);
+                    var localNanos = senderNanos + offset;
                     if (anchorsSeen++ == 0)
                     {
                         var txFrame = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(16));
                         logger.LogInformation(
-                            "realtime 0xD7 anchor: frame {Frame} audible at {Nanos} (sender transmission lead {LeadMs:F0} ms)",
-                            frame, nanos, (uint)(txFrame - frame) * 1000.0 / 44100);
+                            "realtime 0xD7 anchor: frame {Frame} audible at sender ns {Sender} = local ns {Local} "
+                            + "(clock offset {OffsetS:F3} s, sender transmission lead {LeadMs:F0} ms)",
+                            frame, senderNanos, localNanos, offset / 1e9, (uint)(txFrame - frame) * 1000.0 / 44100);
                     }
 
-                    OnAnchor?.Invoke(frame, nanos);
+                    OnAnchor?.Invoke(frame, localNanos);
                 }
                 else
                 {

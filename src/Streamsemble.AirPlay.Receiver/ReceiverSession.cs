@@ -103,13 +103,15 @@ public sealed class ReceiverSession(
             { "name", new NSString(identity.Name) },
             { "nameIsFactoryDefault", new NSNumber(false) },
             { "manufacturer", new NSString("Streamsemble") },
-            // The one field where we deliberately diverge from the TV's
-            // numbers (shape and placement still mirror tv-groupfields.log):
-            // the TV reports all-zero latencies because it renders at the
-            // sender's anchor; we forward into the speaker group, which
-            // renders one group presentation latency later. Reporting that
-            // here (and in RECORD) is what makes a sender hold back its local
-            // video for lip sync.
+            // TV-exact, ZEROS INCLUDED (tv-groupfields.log). Zero declared
+            // latency is the truth now: anchored render times (0xD7 /
+            // SETRATEANCHORTIME) are honored by emitting one group latency
+            // early, so audio is AUDIBLE at the sender's stated time — the
+            // same contract the TV fulfils. The 2026-07-26 experiments with
+            // nonzero figures here and/or in RECORD proved senders don't
+            // honor those fields consistently (realtime video ignored this
+            // array; two nonzero surfaces were counted cumulatively) — sync
+            // must come from anchor-exact rendering, not declarations.
             { "audioLatencies", BuildAudioLatencies() },
             { "model", new NSString(ReceiverConstants.Model) },
             { "pi", new NSString(identity.Pi) },
@@ -145,11 +147,9 @@ public sealed class ReceiverSession(
 
     /// <summary>
     /// The TV's exact entry set (types 100/101/102, same audioType variants,
-    /// same key order) with our real output latency in every slot — the hub
-    /// pipes every inbound audio class through the same group timeline, so
-    /// no class renders sooner than another.
+    /// same key order, all-zero latencies).
     /// </summary>
-    private NSArray BuildAudioLatencies() => new(
+    private static NSArray BuildAudioLatencies() => new(
         AudioLatency(100, null),
         AudioLatency(100, "default"),
         AudioLatency(100, "media"),
@@ -160,7 +160,7 @@ public sealed class ReceiverSession(
         AudioLatency(101, "default"),
         AudioLatency(102, "media"));
 
-    private NSDictionary AudioLatency(int type, string? audioType)
+    private static NSDictionary AudioLatency(int type, string? audioType)
     {
         var dict = new NSDictionary { { "inputLatencyMicros", new NSNumber(0) } };
         if (audioType is not null)
@@ -169,7 +169,7 @@ public sealed class ReceiverSession(
         }
 
         dict.Add("type", new NSNumber(type));
-        dict.Add("outputLatencyMicros", new NSNumber(presentationLatencySamples * 1_000_000L / 44100));
+        dict.Add("outputLatencyMicros", new NSNumber(0));
         return dict;
     }
 
@@ -530,7 +530,7 @@ public sealed class ReceiverSession(
         {
             source.MarkActive();
             source.PushDecodedPcm(pcm);
-        }, logger);
+        }, logger, presentationLatencySamples * 1_000_000_000L / 44100);
         _scheduler = scheduler;
         _ = RunSchedulerAsync(scheduler, _streamCts.Token);
 
@@ -812,15 +812,10 @@ public sealed class ReceiverSession(
 
     private RtspReply RecordReply()
     {
-        // Deliberately 0 while /info audioLatencies carries the real figure:
-        // declare on ONE surface only. Live test 2026-07-26 with both nonzero
-        // had the sender over-delaying video (audio seconds AHEAD) — it
-        // counts them cumulatively, and no real receiver reports both (Sonos:
-        // RECORD only, no audioLatencies key at all; TV: audioLatencies
-        // all-zero). audioLatencies won the slot because it is the modern
-        // pre-connect surface for our AirPlay-3.x-sdk /info shape. If lip
-        // sync comes back AUDIO-LATE by the group latency, the sender only
-        // honors this header — swap which surface carries the figure.
+        // 0 is the truth (see the audioLatencies note in InfoReply): anchored
+        // render times are honored by emitting one group latency early, so
+        // audio is audible AT the sender's stated time with nothing left to
+        // declare.
         logger.LogInformation("RECORD — sender is starting the stream");
         return new RtspReply { Headers = { ["Audio-Latency"] = "0" } };
     }
@@ -842,9 +837,15 @@ public sealed class ReceiverSession(
             // opening the gate on request-arrival played the anchor lead
             // early, which is why lip sync stayed out even once we reported
             // real latency.
-            if (AnchorNanos(plist) is { } gateNanos)
+            if (AnchorNanos(plist) is { } anchorNanos)
             {
-                var leadMs = (gateNanos - PtpReceiverClock.NowNanos) / 1e6;
+                // Emit one group latency EARLY so the anchored frame turns
+                // AUDIBLE at the anchor — the TV contract our /info mirrors
+                // (zero declared latency, present at the anchor). Buffered
+                // senders burst well past the anchor point, so the data is
+                // there to emit ahead.
+                var gateNanos = anchorNanos - presentationLatencySamples * 1_000_000_000L / 44100;
+                var leadMs = (anchorNanos - PtpReceiverClock.NowNanos) / 1e6;
                 if (Math.Abs(leadMs) > 5000)
                 {
                     logger.LogWarning(
@@ -852,8 +853,9 @@ public sealed class ReceiverSession(
                         leadMs);
                 }
 
-                logger.LogInformation("SETRATEANCHORTIME rate={Rate} — render gate at anchor ({Lead:F0} ms ahead)",
-                    rate, leadMs);
+                logger.LogInformation(
+                    "SETRATEANCHORTIME rate={Rate} — audible at anchor ({Lead:F0} ms ahead; emitting {Emit:F0} ms early)",
+                    rate, leadMs, presentationLatencySamples * 1000.0 / 44100);
                 _emitter?.GoAt(gateNanos);
             }
             else

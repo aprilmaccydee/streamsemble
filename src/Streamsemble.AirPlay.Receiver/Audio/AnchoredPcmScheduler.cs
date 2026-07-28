@@ -5,21 +5,25 @@ using Streamsemble.Timing.Ptp;
 namespace Streamsemble.AirPlay.Receiver.Audio;
 
 /// <summary>
-/// Emits realtime PCM at its anchored render time instead of on arrival.
-/// Modern macOS realtime ("buffered realtime") transmits with a variable
-/// lead — roughly 1.75 s of frames arrive before they are due — so
-/// on-arrival rendering runs early by whatever lead the engine happens to
-/// use that session, and lip sync lands differently every connect. The
-/// control channel's 0xD7 packets state "frame F is audible at grandmaster
-/// time T" (refreshed ~1/s); each frame N is held until
-/// T + (N − F)/44100, and the hub's group latency — the same figure we
-/// declare in /info audioLatencies — carries it from there to the speakers
-/// on schedule. Frames arriving before any anchor wait up to a second for
-/// one; a sender that never sends 0xD7 falls back to on-arrival, loudly.
+/// Emits realtime PCM so it turns AUDIBLE at its anchored render time.
+/// Modern macOS realtime ("buffered realtime") transmits ~1.75 s ahead of
+/// presentation, so arrival order is the wrong clock — rendering on
+/// arrival runs early by whatever lead the engine uses, differently every
+/// session. The 0xD7 anchors state "frame F is audible at local time T"
+/// (already clock-translated, refreshed ~1/s); frame N must be audible at
+/// T + (N − F)/44100, and since everything emitted here takes the hub's
+/// group presentation latency to reach the speakers, it is emitted
+/// <paramref name="leadNanos"/> (that group latency) EARLY — the TV
+/// contract: declare zero, present at the anchor. That only works while
+/// the hub latency fits inside the sender's transmission lead; if it
+/// doesn't, frames emit on arrival and trail by the difference, loudly.
+/// Frames arriving before any anchor wait up to a second for one; a sender
+/// that never sends 0xD7 falls back to on-arrival, loudly.
 /// </summary>
 public sealed class AnchoredPcmScheduler(
     Action<ReadOnlyMemory<byte>> emit,
     ILogger logger,
+    long leadNanos = 0,
     Func<long>? clockNanos = null)
 {
     private sealed record Anchor(uint Frame, long Nanos);
@@ -28,6 +32,7 @@ public sealed class AnchoredPcmScheduler(
     private readonly Func<long> _now = clockNanos ?? (() => PtpReceiverClock.NowNanos);
     private Anchor? _anchor;
     private bool _fallback;
+    private bool _budgetWarned;
 
     /// <summary>Latest 0xD7 mapping: frame is audible at the grandmaster reading.</summary>
     public void SetAnchor(uint frame, long nanos) => Volatile.Write(ref _anchor, new Anchor(frame, nanos));
@@ -67,10 +72,20 @@ public sealed class AnchoredPcmScheduler(
 
             while (anchor is not null)
             {
-                var target = anchor.Nanos + unchecked((int)(rtp - anchor.Frame)) * 1_000_000_000L / 44100;
+                var target = anchor.Nanos + unchecked((int)(rtp - anchor.Frame)) * 1_000_000_000L / 44100 - leadNanos;
                 var aheadNs = target - _now();
                 if (aheadNs <= 1_000_000)
                 {
+                    if (aheadNs < -250_000_000 && !_budgetWarned)
+                    {
+                        _budgetWarned = true;
+                        logger.LogWarning(
+                            "anchored frame is {LateMs:F0} ms past its emit time — the hub group latency exceeds "
+                            + "the sender's transmission lead; audio will trail by about this much "
+                            + "(lower STREAMSEMBLE_GROUP_LATENCY)",
+                            -aheadNs / 1e6);
+                    }
+
                     break;
                 }
 

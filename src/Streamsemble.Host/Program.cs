@@ -21,10 +21,10 @@ builder.Services.Configure<StreamsembleOptions>(builder.Configuration.GetSection
 builder.Services.Configure<SpotifyOptions>(builder.Configuration.GetSection("Spotify"));
 builder.Services.Configure<AirPlaySenderOptions>(builder.Configuration.GetSection("AirPlaySender"));
 builder.Services.Configure<AirPlayReceiverOptions>(builder.Configuration.GetSection("AirPlayReceiver"));
-// The receiver's true presentation latency is the speaker group's: inbound
-// audio re-anchors onto the group timeline instead of rendering locally.
-// Reporting it lets Apple senders delay their local video/audio to match
-// (respects STREAMSEMBLE_GROUP_LATENCY via the sender-side constant).
+// The receiver's render lead is the speaker group's presentation latency:
+// inbound anchored audio is emitted that much early so it turns audible at
+// the sender's stated render time (respects STREAMSEMBLE_GROUP_LATENCY via
+// the sender-side constant).
 builder.Services.PostConfigure<AirPlayReceiverOptions>(
     o => o.PresentationLatencySamples = AirPlay2Session.GroupPresentationLatencySamples);
 
