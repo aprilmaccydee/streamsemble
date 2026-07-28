@@ -940,6 +940,14 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     /// </summary>
     public GroupTimelineAnchor? GroupAnchor { get; set; }
 
+    /// <summary>
+    /// Set by the group: wall-true age (samples) of a capture index, measured
+    /// from the source's sample-clock epoch. Spans every queue between the
+    /// source's emit and this session — dwell the encoder-local age cannot
+    /// see. Negative = epoch not learned yet.
+    /// </summary>
+    public Func<long, long>? TrueContentAgeSamples { get; set; }
+
     /// <summary>Capture-counter position just past the last PCM handed to this session.</summary>
     private long _pcmCaptureEnd;
 
@@ -1043,6 +1051,21 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                     // has no encoder pipeline; its packed-queue skew was never
                     // tracked and stays untracked).
                     var captureSample = Volatile.Read(ref _pcmCaptureEnd) - ageSamples;
+
+                    // The encoder-local age misses dwell upstream of the
+                    // encoder (send queue, source channel); the group measures
+                    // the frame's TRUE wall age from the source's sample-clock
+                    // epoch. Compensating only the encoder age rendered the
+                    // whole timeline late by the invisible dwell.
+                    var trueAgeSamples = TrueContentAgeSamples?.Invoke(captureSample) ?? -1;
+                    if (trueAgeSamples > ageSamples)
+                    {
+                        logger.LogInformation(
+                            "{Name}: anchor frame carries {DwellMs:F0} ms of pre-encoder dwell (encoder age {EncoderMs:F0} ms)",
+                            DisplayName, (trueAgeSamples - ageSamples) * 1000.0 / 44100, ageSamples * 1000.0 / 44100);
+                        ageSamples = trueAgeSamples;
+                    }
+
                     _anchored = await SendAnchorAsync(rtpTime, ageSamples, captureSample, ct).ConfigureAwait(false);
                     if (_anchored && Environment.GetEnvironmentVariable("STREAMSEMBLE_TV_NUDGE") != "0")
                     {

@@ -60,6 +60,17 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     /// <summary>Wall-clock lead before the first packet goes out, letting the queue prime.</summary>
     private const double StartLeadSeconds = 0.25;
 
+    /// <summary>
+    /// Oldest backlog a (re)starting timeline will play rather than skip.
+    /// Frames older than this at re-base were emitted while the stream was
+    /// still spinning up; playing them sets the entire session's timeline
+    /// that much behind the source (inaudible for music, ruinous for
+    /// inbound video lip sync), and an anchor honest about their age lands
+    /// too close to "now" for the receivers' buffering. Skipping keeps the
+    /// anchor wall-true AND comfortably inside the presentation window.
+    /// </summary>
+    private const double MaxStartBacklogSeconds = 0.25;
+
     private readonly IOptions<AirPlaySenderOptions> _options;
     private readonly AirPlayBrowser _browser;
     private readonly IMasterClock _clock;
@@ -315,6 +326,19 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     private ushort _seq;
     private uint _rtpBase;
     private long? _timestampBase;
+
+    // Wall-clock birth of the source's sample counter: grandmaster ns at
+    // which sample 0 was emitted, min-filtered at sink ingest (WriteAsync
+    // observes now − ts/44100; the smallest observation carries the least
+    // queue dwell). The encoder-age measurement starts at the session's
+    // encoder and cannot see dwell in the send queue or source channel, so
+    // anchors compensated only by it rendered the whole timeline late by
+    // whatever backlog stood at anchor time — audible as inbound video lip
+    // sync trailing by up to seconds. MaxValue = unlearned; reset wherever
+    // _timestampBase resets (the source may idle between streams, which
+    // shifts its counter's epoch).
+    private long _sourceEpochNanos = long.MaxValue;
+    private long _staleDroppedSamples;
     private double _anchorSeconds;
     private long _anchorOffset;
 
@@ -369,6 +393,8 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _seq = (ushort)Random.Shared.Next(ushort.MaxValue);
         _rtpBase = (uint)Random.Shared.Next();
         _timestampBase = null;
+        _sourceEpochNanos = long.MaxValue;
+        _staleDroppedSamples = 0;
         _rtpHead = _rtpBase;
         _sendMarker = true;
         _sendFirstSync = true;
@@ -477,6 +503,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 if (!anyLive && missing.Any(m => !m.Target.Protocol.Equals("Raop", StringComparison.OrdinalIgnoreCase)))
                 {
                     _timestampBase = null;
+                    _sourceEpochNanos = long.MaxValue;
                     _sendMarker = true;
                     _lastSyncRtp = 0;
                     _groupAnchor.Reset();
@@ -694,6 +721,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 // the incumbents' timeline.
                 ap2.AnchorClock = () => ((ulong)Timing.Ptp.PtpReceiverClock.NowNanos, _gmClock.ClockId);
                 ap2.GroupAnchor = _groupAnchor;
+                ap2.TrueContentAgeSamples = TrueCaptureAgeSamples;
                 await ap2.ConnectAsync(_timingResponder.Port, _control!.Port, _seq, startRtp, ct).ConfigureAwait(false);
                 session = ap2;
             }
@@ -763,10 +791,33 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
 
     public async ValueTask WriteAsync(PcmFrame frame, CancellationToken ct = default)
     {
+        var epoch = Timing.Ptp.PtpReceiverClock.NowNanos - frame.Timestamp * 1_000_000_000L / 44100;
+        if (epoch < Volatile.Read(ref _sourceEpochNanos))
+        {
+            Volatile.Write(ref _sourceEpochNanos, epoch);
+        }
+
         if (_sendQueue is { } queue)
         {
             await queue.Writer.WriteAsync(frame, ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Wall-true age (samples) of a capture index, measured against the
+    /// source's sample-clock epoch — spans every queue between source emit
+    /// and the caller, unlike the encoder-local age. Negative when the epoch
+    /// is not yet learned.
+    /// </summary>
+    private long TrueCaptureAgeSamples(long captureSample)
+    {
+        var epoch = Volatile.Read(ref _sourceEpochNanos);
+        if (epoch == long.MaxValue)
+        {
+            return -1;
+        }
+
+        return (Timing.Ptp.PtpReceiverClock.NowNanos - epoch) * 441 / 10_000_000 - captureSample;
     }
 
     private async Task SendLoopAsync(ChannelReader<PcmFrame> queue, CancellationToken ct)
@@ -803,6 +854,30 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
 
                 if (_timestampBase is null)
                 {
+                    // Skip backlog that predates the (re)start: playing it
+                    // would set the whole timeline late by its age (see
+                    // MaxStartBacklogSeconds). Order is monotonic, so once a
+                    // fresh frame arrives nothing older follows.
+                    var epochNs = Volatile.Read(ref _sourceEpochNanos);
+                    if (epochNs != long.MaxValue)
+                    {
+                        var ageNs = Timing.Ptp.PtpReceiverClock.NowNanos
+                            - (epochNs + frame.Timestamp * 1_000_000_000L / 44100);
+                        if (ageNs > (long)(MaxStartBacklogSeconds * 1_000_000_000))
+                        {
+                            _staleDroppedSamples += frame.SampleCount;
+                            continue;
+                        }
+                    }
+
+                    if (_staleDroppedSamples > 0)
+                    {
+                        _logger.LogInformation(
+                            "skipped {Ms:F0} ms of pre-start backlog — the timeline joins the source live instead of late",
+                            _staleDroppedSamples * 1000.0 / 44100);
+                        _staleDroppedSamples = 0;
+                    }
+
                     _timestampBase = frame.Timestamp;
                     _anchorOffset = 0;
                     _anchorSeconds = _clock.NowSeconds + StartLeadSeconds;
@@ -1082,7 +1157,11 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         // the stream regardless of how the per-speaker flushes fare. Holding
         // this hostage to every speaker's RTSP responsiveness meant one slow
         // receiver silently kept the whole group on the stale timeline.
+        // (The source epoch resets with it: an idling source's sample counter
+        // freezes while wall time doesn't, so the old epoch would overstate
+        // the age of everything after resume.)
         _timestampBase = null;
+        _sourceEpochNanos = long.MaxValue;
         _sendMarker = true;
         _sendFirstSync = true;
         _syncPending = true;
