@@ -57,19 +57,26 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     /// </summary>
     private const double RenderDelaySeconds = 1.0;
 
-    /// <summary>Wall-clock lead before the first packet goes out, letting the queue prime.</summary>
-    private const double StartLeadSeconds = 0.25;
+    /// <summary>
+    /// Wall-clock lead before the first packet goes out, letting the queue
+    /// prime. This plus the first frame's age at re-base becomes the send
+    /// queue's STANDING depth — pure pipeline dwell that the whole group
+    /// (every mode, uniformly) trails the source by. 0.1 s still dwarfs the
+    /// sources' pacing jitter (≤12 ms); it was 0.25 s until the dwell was
+    /// measured live at 487 ms of standing queue (2026-07-28).
+    /// </summary>
+    private const double StartLeadSeconds = 0.10;
 
     /// <summary>
     /// Oldest backlog a (re)starting timeline will play rather than skip.
     /// Frames older than this at re-base were emitted while the stream was
-    /// still spinning up; playing them sets the entire session's timeline
-    /// that much behind the source (inaudible for music, ruinous for
-    /// inbound video lip sync), and an anchor honest about their age lands
-    /// too close to "now" for the receivers' buffering. Skipping keeps the
-    /// anchor wall-true AND comfortably inside the presentation window.
+    /// still spinning up; playing them adds their age to the group's
+    /// standing dwell for the whole session (inaudible for music, ruinous
+    /// for inbound video lip sync). Tight (0.1 s) because in the normal
+    /// pre-connected flow frames reach the send loop within milliseconds —
+    /// only genuine spin-up backlog is older.
     /// </summary>
-    private const double MaxStartBacklogSeconds = 0.25;
+    private const double MaxStartBacklogSeconds = 0.10;
 
     private readonly IOptions<AirPlaySenderOptions> _options;
     private readonly AirPlayBrowser _browser;

@@ -878,6 +878,8 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     // anchored render times by emitting one group latency early; at 2.0 s
     // the frames simply haven't arrived yet when they need to go out, and
     // inbound audio structurally trails video by the difference.
+    // (Deployments override via STREAMSEMBLE_GROUP_LATENCY; April runs
+    // 0.75 s — budget changes must be sanity-checked at that setting too.)
     internal const double DefaultGroupPresentationLatencySeconds = 1.5;
 
     private static double ReadGroupLatencySeconds()
@@ -1052,18 +1054,22 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                     // tracked and stays untracked).
                     var captureSample = Volatile.Read(ref _pcmCaptureEnd) - ageSamples;
 
-                    // The encoder-local age misses dwell upstream of the
-                    // encoder (send queue, source channel); the group measures
-                    // the frame's TRUE wall age from the source's sample-clock
-                    // epoch. Compensating only the encoder age rendered the
-                    // whole timeline late by the invisible dwell.
+                    // Measured but deliberately NOT compensated: the anchor
+                    // must stay SEND-relative like everything else. Realtime-
+                    // mode speakers render at send time + pinned latency —
+                    // pre-encoder dwell included — so a buffered anchor made
+                    // capture-true splits the group by exactly that dwell
+                    // (measured live 2026-07-28: TV Δ−544 ms vs Sonos +7 ms,
+                    // and the TV's cushion went critical). The whole group
+                    // trails the source by the dwell uniformly; the fix for
+                    // that lateness is shrinking the dwell (StartLead, stale
+                    // backlog threshold), never re-timing one mode alone.
                     var trueAgeSamples = TrueContentAgeSamples?.Invoke(captureSample) ?? -1;
-                    if (trueAgeSamples > ageSamples)
+                    if (trueAgeSamples > ageSamples + 441)
                     {
                         logger.LogInformation(
-                            "{Name}: anchor frame carries {DwellMs:F0} ms of pre-encoder dwell (encoder age {EncoderMs:F0} ms)",
-                            DisplayName, (trueAgeSamples - ageSamples) * 1000.0 / 44100, ageSamples * 1000.0 / 44100);
-                        ageSamples = trueAgeSamples;
+                            "{Name}: anchor frame carries {DwellMs:F0} ms of pre-encoder dwell (uniform group lateness vs source; not compensated)",
+                            DisplayName, (trueAgeSamples - ageSamples) * 1000.0 / 44100);
                     }
 
                     _anchored = await SendAnchorAsync(rtpTime, ageSamples, captureSample, ct).ConfigureAwait(false);
