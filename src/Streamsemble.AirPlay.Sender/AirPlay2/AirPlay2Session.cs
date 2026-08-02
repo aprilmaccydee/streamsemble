@@ -38,10 +38,23 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
     /// <summary>
     /// Buffered (type 103, AAC over TCP) vs realtime (type 96, ALAC over UDP).
-    /// Decided during connect: config override, else /info audioLatencies —
-    /// receivers that don't list type 96 (TVs) only render buffered streams.
+    /// Decided during connect: config override, else the receiver's feature
+    /// bitmask (bit 38 = buffered audio) from /info or mDNS. audioLatencies is
+    /// only a last-resort hint — Sonos omits it entirely, and treating that
+    /// omission as "realtime-only" used to drop Auto joiners off the group
+    /// timeline.
     /// </summary>
     public bool IsBuffered { get; private set; }
+
+    /// <summary>
+    /// mDNS feature bitmask from discovery (0 = unknown), set by the group
+    /// before connect. Fallback capability signal for Auto stream-mode when
+    /// the receiver's /info reply doesn't carry features.
+    /// </summary>
+    public ulong AdvertisedFeatures { get; set; }
+
+    /// <summary>Feature bit 38: receiver renders buffered audio (the canonical AirPlay 2 capability).</summary>
+    private const ulong SupportsBufferedAudio = 1UL << 38;
 
     /// <summary>
     /// All timing-group member addresses (this receiver + the sender + any other
@@ -207,15 +220,23 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             .ConfigureAwait(false);
         logger.LogInformation("{Name}: HAP pairing complete ({Mode}); control channel encrypted", DisplayName, _pairingMode);
 
-        var latencyTypes = await LogReceiverInfoAsync(ct).ConfigureAwait(false);
+        var (latencyTypes, infoFeatures) = await LogReceiverInfoAsync(ct).ConfigureAwait(false);
         _bufferedAlac = streamMode.Equals("BufferedAlac", StringComparison.OrdinalIgnoreCase);
+        // Auto trusts the receiver's own capability declaration: feature bit 38
+        // (buffered audio) from /info, else from mDNS discovery. audioLatencies
+        // is the last resort — Sonos never advertises it, so an empty list must
+        // not read as "realtime-only".
+        var features = infoFeatures ?? (AdvertisedFeatures != 0 ? AdvertisedFeatures : (ulong?)null);
         IsBuffered = _bufferedAlac
             || streamMode.Equals("Buffered", StringComparison.OrdinalIgnoreCase)
             || (streamMode.Equals("Auto", StringComparison.OrdinalIgnoreCase)
-                && latencyTypes.Count > 0 && !latencyTypes.Contains(96));
+                && (features is { } f
+                    ? (f & SupportsBufferedAudio) != 0
+                    : latencyTypes.Count > 0 && !latencyTypes.Contains(96)));
         logger.LogInformation(
-            "{Name}: stream mode {Mode} (configured {Configured}; receiver latency types: {Types})",
+            "{Name}: stream mode {Mode} (configured {Configured}; features {Features}; receiver latency types: {Types})",
             DisplayName, IsBuffered ? "Buffered/AAC" : "Realtime/ALAC", streamMode,
+            features is { } known ? $"0x{known:X}" : "unknown",
             latencyTypes.Count == 0 ? "none advertised" : string.Join(",", latencyTypes));
 
         await SetupAsync(ourTimingPort, ourControlPort, startSeq, startRtpTime, ct).ConfigureAwait(false);
@@ -550,13 +571,16 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     }
 
     /// <summary>
-    /// Queries /info post-pairing and returns the stream types the receiver
-    /// advertises latencies for (96 = realtime supported; TVs list only
-    /// 100/101/102 and need buffered).
+    /// Queries /info post-pairing and returns the receiver's feature bitmask
+    /// (null if absent) plus the stream types it advertises latencies for
+    /// (96 = realtime supported; TVs list only 100/101/102). Feeds the Auto
+    /// stream-mode decision, so failures matter beyond diagnostics — but the
+    /// mDNS feature fallback keeps Auto honest when this call comes up empty.
     /// </summary>
-    private async Task<HashSet<long>> LogReceiverInfoAsync(CancellationToken ct)
+    private async Task<(HashSet<long> LatencyTypes, ulong? Features)> LogReceiverInfoAsync(CancellationToken ct)
     {
         var types = new HashSet<long>();
+        ulong? features = null;
         try
         {
             var response = await _rtsp.RequestAsync("GET", ct, uriOverride: "/info").ConfigureAwait(false);
@@ -567,6 +591,11 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                     && double.TryParse(versionString.Content.Split('.')[0], out var version))
                 {
                     _sourceVersion = version;
+                }
+
+                if (info.TryGetValue("features", out var featuresObj) && featuresObj is NSNumber featuresNumber)
+                {
+                    features = unchecked((ulong)featuresNumber.ToLong());
                 }
 
                 if (info.TryGetValue("audioLatencies", out var latenciesObj) && latenciesObj is NSArray latencies)
@@ -587,10 +616,10 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            logger.LogDebug(ex, "{Name}: GET /info failed (diagnostic only)", DisplayName);
+            logger.LogInformation(ex, "{Name}: GET /info failed — Auto stream mode falls back to mDNS features", DisplayName);
         }
 
-        return types;
+        return (types, features);
     }
 
     private async Task<byte[]> PostPairAsync(string path, byte[] body, int hkp, CancellationToken ct)

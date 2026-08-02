@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Options;
 using Streamsemble.AirPlay.Sender;
 using Streamsemble.Core;
 using Streamsemble.Core.Abstractions;
@@ -110,16 +111,31 @@ public static class WebApi
                 : Results.NotFound(new { error = $"no live session named \"{request.Name}\"" });
         });
 
-        app.MapPost("/api/targets", (SelectRequest request, SelectedTargetStore selected) =>
+        app.MapPost("/api/targets", (SelectRequest request, SelectedTargetStore selected, IOptions<AirPlaySenderOptions> sender) =>
         {
-            var targets = request.Targets.Select(t => new AirPlayTargetOptions
-            {
-                Name = t.Name,
-                Host = t.Host,
-                Port = t.Port,
-                Protocol = t.Protocol,
-                LatencyTrimMs = t.LatencyTrimMs,
-            }).ToList();
+            // A UI selection carries only a discovered name + detected protocol;
+            // a configured target for the same speaker carries the operator's
+            // intent (stream mode, latency trim, host/port). Joining from the UI
+            // must not erase that, so a matching configured entry wins over a
+            // bare DTO. Same match semantics as the mDNS resolver: the config
+            // name is a substring of the discovered display name; most specific
+            // configured name wins.
+            var configured = sender.Value.Targets.Where(c => !string.IsNullOrEmpty(c.Name)).ToList();
+            var targets = request.Targets.Select(t =>
+                (t.Name is { } dtoName
+                    ? configured
+                        .Where(c => dtoName.Contains(c.Name!, StringComparison.OrdinalIgnoreCase))
+                        .OrderByDescending(c => c.Name!.Length)
+                        .FirstOrDefault()
+                    : null)
+                ?? new AirPlayTargetOptions
+                {
+                    Name = t.Name,
+                    Host = t.Host,
+                    Port = t.Port,
+                    Protocol = t.Protocol,
+                    LatencyTrimMs = t.LatencyTrimMs,
+                }).ToList();
             selected.Set(targets);
             return Results.Ok(new { count = targets.Count });
         });

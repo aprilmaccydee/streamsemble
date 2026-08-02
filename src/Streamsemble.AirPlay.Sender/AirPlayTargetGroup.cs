@@ -689,6 +689,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
             IReadOnlyDictionary<string, string>? txt = null;
             int? airPlayPort = null;
             var protocol = target.Protocol;
+            ulong advertisedFeatures = 0;
 
             if (target.Host is { } host)
             {
@@ -705,7 +706,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                     var seen = preScanned ?? await _browser.BrowseAsync(scanTime, ct).ConfigureAwait(false);
                     if (seen.FirstOrDefault(t => t.Address.Equals(address)) is { } match)
                     {
-                        (txt, airPlayPort) = (match.RaopTxt, match.AirPlayPort);
+                        (txt, airPlayPort, advertisedFeatures) = (match.RaopTxt, match.AirPlayPort, match.Features);
                         protocol = match.SupportsAirPlay2 ? "AirPlay2" : "Raop";
                         _logger.LogInformation("{Name}: protocol auto-detected as {Protocol} (features 0x{Features:X})", name, protocol, match.Features);
                     }
@@ -721,7 +722,8 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 var discovered = preScanned ?? await _browser.BrowseAsync(scanTime, ct).ConfigureAwait(false);
                 var resolved = discovered.FirstOrDefault(t => t.DisplayName.Contains(target.Name!, StringComparison.OrdinalIgnoreCase))
                     ?? throw new IOException($"\"{target.Name}\" not found via mDNS (saw: {string.Join(", ", discovered.Select(d => d.DisplayName).DefaultIfEmpty("nothing"))})");
-                (address, port, txt, name, airPlayPort) = (resolved.Address, resolved.RaopPort, resolved.RaopTxt, resolved.DisplayName, resolved.AirPlayPort);
+                (address, port, txt, name, airPlayPort, advertisedFeatures) =
+                    (resolved.Address, resolved.RaopPort, resolved.RaopTxt, resolved.DisplayName, resolved.AirPlayPort, resolved.Features);
                 if (protocol.Equals("Auto", StringComparison.OrdinalIgnoreCase))
                 {
                     protocol = resolved.SupportsAirPlay2 ? "AirPlay2" : "Raop";
@@ -744,6 +746,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                     // Timing-group peer list: all selected targets' addresses, so
                     // a multi-room group shares one PTP grandmaster (SETPEERS).
                     GroupPeerAddresses = await ResolveGroupAddressesAsync(ct).ConfigureAwait(false),
+                    AdvertisedFeatures = advertisedFeatures,
                 };
                 // Buffered playback anchors to OUR grandmaster clock via
                 // SETRATEANCHORTIME once the first frame is ready, mapped
