@@ -156,7 +156,7 @@ public sealed class WledLightingService : BackgroundService
                         continue;
                     }
 
-                    var rgb = WledLightRenderer.Render(device.Mode, item.Window, device.LedCount, device.Color);
+                    var rgb = device.Renderer.Render(device.Mode, item.Window, device.LedCount, device.RenderSettings);
                     WledLightRenderer.Scale(rgb, device.Brightness);
                     try
                     {

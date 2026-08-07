@@ -32,6 +32,10 @@ public sealed class WledDevice : IDisposable
         Mode = WledLightModes.Parse(options.Mode);
         Color = ParseColor(options.Color);
         Brightness = (float)Math.Clamp(options.Brightness, 0.0, 1.0);
+        Palette = WledPalettes.Parse(options.Palette);
+        Decay = (float)Math.Clamp(options.Decay, 0.0, 1.0);
+        Mirror = options.Mirror;
+        Reverse = options.Reverse;
     }
 
     public string Name => _options.Name ?? _options.Host;
@@ -45,6 +49,25 @@ public sealed class WledDevice : IDisposable
 
     /// <summary>Master brightness scale for rendered light frames, 0–1.</summary>
     public float Brightness { get; set; }
+
+    /// <summary>Color treatment for the light modes.</summary>
+    public WledPalette Palette { get; set; }
+
+    /// <summary>Fall half-life in seconds, 0–1.</summary>
+    public float Decay { get; set; }
+
+    /// <summary>Render from the strip's center outward.</summary>
+    public bool Mirror { get; set; }
+
+    /// <summary>Flip the strip end-for-end.</summary>
+    public bool Reverse { get; set; }
+
+    /// <summary>This strip's renderer — per-device visual state (fall
+    /// envelopes, rainbow phase), touched only by the lighting send loop.</summary>
+    public WledLightRenderer Renderer { get; } = new();
+
+    /// <summary>The render tunables, snapshotted for one light frame.</summary>
+    public WledRenderSettings RenderSettings => new(Color, Palette, Decay, Mirror, Reverse);
 
     /// <summary>Base color for the Pulse mode. Packed so cross-thread updates can't tear.</summary>
     public (byte R, byte G, byte B) Color

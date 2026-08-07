@@ -125,7 +125,8 @@ on the same LAN at `http://<host-ip>:8088`). The page:
   badges, and a hover tooltip (encoder pipeline age, inherited join debt,
   last PTP `Delay_Req`),
 - shows a **Lights card** when WLED strips are configured: per-strip on/off,
-  light mode (Pulse / Vu / Spectrum), Pulse color and master brightness, all
+  light mode (Pulse / Vu / Spectrum), palette (Classic / Solid / Rainbow),
+  color, master brightness, fall time, and mirror/reverse geometry, all
   applied to the running lighting engine within one light frame (~25 ms),
 - ends with a **technical details panel**: group epoch anchor, grandmaster
   clock id, and a per-session table (mode, pairing, anchor state, trims,
@@ -226,7 +227,8 @@ Edit the `environment:` block to name your speakers; every setting in
 - `Spotify:Enabled`, `Spotify:LibrespotPath`, `Spotify:Bitrate`,
   `Spotify:ExtraArgs` (passed through to librespot, e.g. `--volume-ctrl fixed`).
 - `Wled:Devices[]` — `{ Name, Host, Port, LedCount, Protocol, Mode, Color,
-  Brightness, TimeoutSeconds }`: WLED strips that light to the music. The
+  Brightness, Palette, Decay, Mirror, Reverse, TimeoutSeconds }`: WLED strips
+  that light to the music. The
   lighting engine taps the exact PCM the speakers get, renders ~43 light
   frames/s (loudness envelope + log-spaced FFT bands, slow-decay auto gain —
   no sensitivity knob), and schedules every frame on the group's
@@ -234,9 +236,17 @@ Edit the `environment:` block to name your speakers; every setting in
   anchor + group latency, the same mappings the speakers anchor with), so the
   flash lands when the *listener* hears the beat — not a group latency
   earlier when the hub decoded it. `Mode` is the light mode — `Spectrum`
-  (default) | `Vu` | `Pulse` (glows `Color`) | `Off` — and mode, color and
-  brightness are runtime-tunable from the web UI's Lights card or
-  `POST /api/wled/config` `{ "device": "desk", "mode": "Vu", "brightness": 0.6 }`
+  (default) | `Vu` | `Pulse` (glows `Color`) | `Off`. `Palette` recolors a
+  mode: `Classic` (default — Vu's green→amber→red meter, Spectrum's
+  bass-red→violet) | `Solid` (everything in `Color`) | `Rainbow` (a slowly
+  drifting full rainbow; on Pulse the whole strip hue-cycles). `Decay` is the
+  fall half-life in seconds (0–1): 0 snaps with the analyzer's envelope,
+  higher trails a silky tail behind transients. `Mirror` renders from the
+  strip's center outward; `Reverse` flips it end-for-end (combine them and
+  the show grows from the ends inward). All of mode, color, brightness,
+  palette, decay, mirror and reverse are runtime-tunable from the web UI's
+  Lights card or `POST /api/wled/config`
+  `{ "device": "desk", "mode": "Vu", "palette": "Rainbow", "decay": 0.35 }`
   (omit `device` for every strip). `Protocol` picks the wire format: `Dnrgb`
   (default, any strip length) | `Drgb` | `Drgbw` (RGBW strips) | `Warls`.
   Manual control for `Off` strips or testing: `POST /api/wled/color`

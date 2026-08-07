@@ -104,6 +104,12 @@
     .light-row input[type=range] { flex:1; accent-color:var(--accent); }
     .light-row input[type=range]:disabled { opacity:.35; }
     .light-row .pct { width:48px; text-align:right; color:var(--sec); }
+    .light-tunables { display:flex; align-items:center; gap:16px; padding:0 0 12px 32px; font-size:12px; color:var(--muted); flex-wrap:wrap; }
+    .light-tunables select { background:#1e2635; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:4px 7px; font-size:12px; }
+    .light-tunables label { display:flex; align-items:center; gap:6px; cursor:pointer; }
+    .light-tunables input[type=checkbox] { width:16px; height:16px; }
+    .light-tunables input[type=range] { width:100px; accent-color:var(--accent); }
+    .light-tunables .fallval { width:44px; text-align:right; color:var(--sec); }
     .lightnote { color:var(--muted); font-size:12px; margin-top:8px; }
 
     /* Technical details */
@@ -469,6 +475,7 @@
     // ---- Lights (WLED) -----------------------------------------------------
 
     const LIGHT_MODES = ["Pulse", "Vu", "Spectrum"];
+    const LIGHT_PALETTES = ["Classic", "Solid", "Rainbow"];
     const lastLightMode = new Map();     // device → last non-Off mode, for the on/off toggle
     const lightDragging = new Set();     // devices with a brightness slider mid-drag
     let lastWledSig = "";                // skip re-render (and dropdown-closing churn) when nothing changed
@@ -496,6 +503,16 @@
         const on = d.mode !== "Off";
         const shownMode = on ? d.mode : (lastLightMode.get(d.name) || "Spectrum");
         const pct = Math.round(d.brightness * 100);
+        const colorVisible = on && (d.mode === "Pulse" || d.palette === "Solid");
+        const tunables = on ? `<div class="light-tunables">
+            <select class="lt-palette" data-name="${escapeAttr(d.name)}">
+              ${LIGHT_PALETTES.map(p => `<option ${p === d.palette ? "selected" : ""}>${p}</option>`).join("")}
+            </select>
+            <label>fall <input type="range" class="lt-decay" data-name="${escapeAttr(d.name)}" min="0" max="100"
+                   value="${Math.round(d.decay * 100)}" /><span class="fallval num">${d.decay.toFixed(2)}s</span></label>
+            <label><input type="checkbox" class="lt-mirror" data-name="${escapeAttr(d.name)}" ${d.mirror ? "checked" : ""} />mirror</label>
+            <label><input type="checkbox" class="lt-reverse" data-name="${escapeAttr(d.name)}" ${d.reverse ? "checked" : ""} />reverse</label>
+          </div>` : "";
         return `<div class="light-row">
           <input type="checkbox" class="lt-on" data-name="${escapeAttr(d.name)}" ${on ? "checked" : ""} />
           <span class="name">${escapeHtml(d.name)}<span class="sub">${d.ledCount} LEDs · ${escapeHtml(d.protocol)}</span></span>
@@ -503,10 +520,10 @@
             ${LIGHT_MODES.map(m => `<option ${m === shownMode ? "selected" : ""}>${m}</option>`).join("")}
           </select>
           <input type="color" class="lt-color" data-name="${escapeAttr(d.name)}" value="${escapeAttr(d.color)}"
-                 ${on && d.mode === "Pulse" ? "" : 'style="visibility:hidden"'} />
+                 ${colorVisible ? "" : 'style="visibility:hidden"'} />
           <input type="range" class="lt-bright" data-name="${escapeAttr(d.name)}" min="0" max="100" value="${pct}" ${on ? "" : "disabled"} />
           <span class="pct num">${pct}%</span>
-        </div>`;
+        </div>${tunables}`;
       }).join("");
 
       $("lights").querySelectorAll(".lt-on").forEach(cb => cb.addEventListener("change", () =>
@@ -525,6 +542,22 @@
           lightDragging.delete(slider.dataset.name);
         });
       });
+      $("lights").querySelectorAll(".lt-palette").forEach(sel => sel.addEventListener("change", () =>
+        postWledConfig({ device: sel.dataset.name, palette: sel.value })));
+      $("lights").querySelectorAll(".lt-decay").forEach(slider => {
+        slider.addEventListener("input", () => {
+          lightDragging.add(slider.dataset.name);
+          slider.parentElement.querySelector(".fallval").textContent = (slider.value / 100).toFixed(2) + "s";
+        });
+        slider.addEventListener("change", async () => {
+          await postWledConfig({ device: slider.dataset.name, decay: slider.value / 100 });
+          lightDragging.delete(slider.dataset.name);
+        });
+      });
+      $("lights").querySelectorAll(".lt-mirror").forEach(cb => cb.addEventListener("change", () =>
+        postWledConfig({ device: cb.dataset.name, mirror: cb.checked })));
+      $("lights").querySelectorAll(".lt-reverse").forEach(cb => cb.addEventListener("change", () =>
+        postWledConfig({ device: cb.dataset.name, reverse: cb.checked })));
     }
 
     // ---- Speaker selection (unchanged behavior) ----------------------------

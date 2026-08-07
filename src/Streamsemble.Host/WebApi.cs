@@ -22,7 +22,9 @@ public static class WebApi
 
     public sealed record WledPixelsRequest(byte[][] Pixels, int Start = 0, string? Device = null);
 
-    public sealed record WledConfigRequest(string? Device = null, string? Mode = null, string? Color = null, float? Brightness = null);
+    public sealed record WledConfigRequest(
+        string? Device = null, string? Mode = null, string? Color = null, float? Brightness = null,
+        string? Palette = null, float? Decay = null, bool? Mirror = null, bool? Reverse = null);
 
     public static void MapStreamsembleApi(this WebApplication app)
     {
@@ -90,6 +92,10 @@ public static class WebApi
                     mode = d.Mode.ToString(),
                     color = d.ColorHex,
                     brightness = d.Brightness,
+                    palette = d.Palette.ToString(),
+                    decay = d.Decay,
+                    mirror = d.Mirror,
+                    reverse = d.Reverse,
                     ledCount = d.LedCount,
                     protocol = d.Protocol.ToString(),
                 }),
@@ -211,10 +217,12 @@ public static class WebApi
 
             WledLightMode? mode;
             (byte, byte, byte)? color;
+            WledPalette? palette;
             try
             {
                 mode = request.Mode is { } m ? WledLightModes.Parse(m) : null;
                 color = request.Color is { } c ? WledDevice.ParseColor(c) : null;
+                palette = request.Palette is { } p ? WledPalettes.Parse(p) : null;
             }
             catch (InvalidOperationException ex)
             {
@@ -238,6 +246,26 @@ public static class WebApi
                     target.Brightness = Math.Clamp(brightness, 0f, 1f);
                 }
 
+                if (palette is { } newPalette)
+                {
+                    target.Palette = newPalette;
+                }
+
+                if (request.Decay is { } decay)
+                {
+                    target.Decay = Math.Clamp(decay, 0f, 1f);
+                }
+
+                if (request.Mirror is { } mirror)
+                {
+                    target.Mirror = mirror;
+                }
+
+                if (request.Reverse is { } reverse)
+                {
+                    target.Reverse = reverse;
+                }
+
                 if (mode is WledLightMode.Off)
                 {
                     // Blank instead of freezing the last light frame, and let
@@ -254,6 +282,10 @@ public static class WebApi
                     mode = t.Mode.ToString(),
                     color = t.ColorHex,
                     brightness = t.Brightness,
+                    palette = t.Palette.ToString(),
+                    decay = t.Decay,
+                    mirror = t.Mirror,
+                    reverse = t.Reverse,
                 }),
             });
         });

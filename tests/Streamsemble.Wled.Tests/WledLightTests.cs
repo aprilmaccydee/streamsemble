@@ -8,10 +8,19 @@ public class WledLightTests
     private static LightWindow Window(float level, float[]? bands = null)
         => new(0, level, bands ?? new float[AudioLightAnalyzer.BandCount]);
 
+    private static WledRenderSettings Settings(
+        (byte R, byte G, byte B) color = default,
+        WledPalette palette = WledPalette.Classic,
+        float decay = 0f, bool mirror = false, bool reverse = false)
+        => new(color, palette, decay, mirror, reverse);
+
+    private static byte[] Render(WledLightMode mode, in LightWindow window, int ledCount, in WledRenderSettings settings = default)
+        => new WledLightRenderer().Render(mode, window, ledCount, settings);
+
     [Fact]
     public void PulseAtFullLevelShowsTheBaseColor()
     {
-        var rgb = WledLightRenderer.Render(WledLightMode.Pulse, Window(1f), 4, (200, 100, 50));
+        var rgb = Render(WledLightMode.Pulse, Window(1f), 4, Settings((200, 100, 50)));
 
         for (var i = 0; i < 4; i++)
         {
@@ -23,19 +32,19 @@ public class WledLightTests
 
     [Fact]
     public void PulseInSilenceIsDark()
-        => Assert.All(WledLightRenderer.Render(WledLightMode.Pulse, Window(0f), 4, (200, 100, 50)), b => Assert.Equal(0, b));
+        => Assert.All(Render(WledLightMode.Pulse, Window(0f), 4, Settings((200, 100, 50))), b => Assert.Equal(0, b));
 
     [Fact]
     public void VuFillsFromGreenBottomToRedTop()
     {
-        var half = WledLightRenderer.Render(WledLightMode.Vu, Window(0.5f), 10, default);
+        var half = Render(WledLightMode.Vu, Window(0.5f), 10);
         Assert.Equal((byte)0, half[0]);        // first LED pure green
         Assert.Equal((byte)255, half[1]);
         Assert.NotEqual((byte)0, half[4 * 3 + 1]); // 5th LED lit
         Assert.Equal((byte)0, half[5 * 3 + 1]);    // 6th dark
         Assert.Equal((byte)0, half[9 * 3]);        // top dark at half level
 
-        var full = WledLightRenderer.Render(WledLightMode.Vu, Window(1f), 10, default);
+        var full = Render(WledLightMode.Vu, Window(1f), 10);
         Assert.Equal((byte)255, full[9 * 3]);      // top LED pure red
         Assert.Equal((byte)0, full[9 * 3 + 1]);
     }
@@ -46,7 +55,7 @@ public class WledLightTests
         var bands = new float[AudioLightAnalyzer.BandCount];
         bands[^1] = 1f; // treble only
 
-        var rgb = WledLightRenderer.Render(WledLightMode.Spectrum, Window(1f, bands), 10, default);
+        var rgb = Render(WledLightMode.Spectrum, Window(1f, bands), 10);
 
         Assert.Equal(0, rgb[0] + rgb[1] + rgb[2]);                       // bass end dark
         Assert.True(rgb[9 * 3] + rgb[9 * 3 + 1] + rgb[9 * 3 + 2] > 0);  // treble end lit
@@ -54,7 +63,90 @@ public class WledLightTests
 
     [Fact]
     public void OffRendersBlack()
-        => Assert.All(WledLightRenderer.Render(WledLightMode.Off, Window(1f), 4, (255, 255, 255)), b => Assert.Equal(0, b));
+        => Assert.All(Render(WledLightMode.Off, Window(1f), 4, Settings((255, 255, 255))), b => Assert.Equal(0, b));
+
+    [Fact]
+    public void SolidPaletteMetersInTheDeviceColor()
+    {
+        var rgb = Render(WledLightMode.Vu, Window(1f), 4, Settings((10, 200, 30), WledPalette.Solid));
+
+        for (var i = 0; i < 4; i++)
+        {
+            Assert.Equal(10, rgb[i * 3]);
+            Assert.Equal(200, rgb[i * 3 + 1]);
+            Assert.Equal(30, rgb[i * 3 + 2]);
+        }
+    }
+
+    [Fact]
+    public void RainbowSpectrumSpansDistinctHues()
+    {
+        var bands = new float[AudioLightAnalyzer.BandCount];
+        Array.Fill(bands, 1f); // broadband: everything lit
+
+        var rgb = Render(WledLightMode.Spectrum, Window(1f, bands), 10, Settings(palette: WledPalette.Rainbow));
+
+        // Every LED lit — and mid-strip differs from the start (the 360° span
+        // wraps, so the two ENDS deliberately meet at the same hue).
+        for (var i = 0; i < 10; i++)
+        {
+            Assert.True(rgb[i * 3] + rgb[i * 3 + 1] + rgb[i * 3 + 2] > 0, $"LED {i} dark");
+        }
+
+        Assert.NotEqual((rgb[0], rgb[1], rgb[2]), (rgb[12], rgb[13], rgb[14]));
+    }
+
+    [Fact]
+    public void MirrorGrowsTheMeterFromTheCenter()
+    {
+        var rgb = Render(WledLightMode.Vu, Window(0.5f), 10, Settings(palette: WledPalette.Solid, color: (255, 255, 255), mirror: true));
+
+        // Half level over a 5-LED virtual half: center pair lit, strip ends dark.
+        Assert.True(rgb[4 * 3] > 0);
+        Assert.True(rgb[5 * 3] > 0);
+        Assert.Equal(0, rgb[0]);
+        Assert.Equal(0, rgb[9 * 3]);
+
+        // Reflection is symmetric.
+        for (var i = 0; i < 5; i++)
+        {
+            Assert.Equal(rgb[(4 - i) * 3], rgb[(5 + i) * 3]);
+        }
+    }
+
+    [Fact]
+    public void ReverseFlipsTheStrip()
+    {
+        var bands = new float[AudioLightAnalyzer.BandCount];
+        bands[^1] = 1f; // treble only
+
+        var rgb = Render(WledLightMode.Spectrum, Window(1f, bands), 10, Settings(reverse: true));
+
+        Assert.True(rgb[0] + rgb[1] + rgb[2] > 0);   // treble now at the start
+        Assert.Equal(0, rgb[9 * 3] + rgb[9 * 3 + 1] + rgb[9 * 3 + 2]);
+    }
+
+    [Fact]
+    public void DecayHoldsTheGlowAfterTheHit()
+    {
+        var snappy = new WledLightRenderer();
+        snappy.Render(WledLightMode.Pulse, Window(1f), 1, Settings((255, 255, 255)));
+        var dark = snappy.Render(WledLightMode.Pulse, Window(0f), 1, Settings((255, 255, 255)));
+        Assert.Equal(0, dark[0]);
+
+        var silky = new WledLightRenderer();
+        silky.Render(WledLightMode.Pulse, Window(1f), 1, Settings((255, 255, 255), decay: 1f));
+        var glowing = silky.Render(WledLightMode.Pulse, Window(0f), 1, Settings((255, 255, 255), decay: 1f));
+        Assert.True(glowing[0] > 200, $"decay tail too dim: {glowing[0]}");
+    }
+
+    [Fact]
+    public void PaletteNamesParseCaseInsensitively()
+    {
+        Assert.Equal(WledPalette.Rainbow, WledPalettes.Parse("rainbow"));
+        Assert.Equal(WledPalette.Classic, WledPalettes.Parse("CLASSIC"));
+        Assert.Throws<InvalidOperationException>(() => WledPalettes.Parse("disco"));
+    }
 
     [Fact]
     public void ScaleAppliesMasterBrightness()

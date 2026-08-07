@@ -83,8 +83,12 @@ services:
       # - Wled__Devices__0__LedCount=144
       # - Wled__Devices__0__Protocol=Dnrgb        # Dnrgb (any RGB strip) | Drgb | Drgbw (RGBW) | Warls
       # - Wled__Devices__0__Mode=Spectrum         # Spectrum | Vu | Pulse | Off
-      # - Wled__Devices__0__Color=#FF4000         # Pulse glow color
+      # - Wled__Devices__0__Color=#FF4000         # Pulse glow, and every mode under Palette=Solid
       # - Wled__Devices__0__Brightness=0.8        # 0–1 master scale
+      # - Wled__Devices__0__Palette=Classic       # Classic | Solid | Rainbow — recolors Vu/Spectrum (Rainbow drifts)
+      # - Wled__Devices__0__Decay=0               # fall half-life seconds 0–1; 0 snaps, higher trails a silky tail
+      # - Wled__Devices__0__Mirror=false          # render from the strip's center outward
+      # - Wled__Devices__0__Reverse=false         # flip end-for-end (strip mounted backwards)
       # - Wled__Devices__0__Port=21324            # WLED UDP realtime port (default)
       # - Wled__Devices__0__TimeoutSeconds=2      # strip returns to its own effect this long after the last packet
 
