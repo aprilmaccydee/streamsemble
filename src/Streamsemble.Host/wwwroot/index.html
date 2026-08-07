@@ -93,6 +93,19 @@
     .speaker .proto { font-size:10px; padding:1px 6px; border-radius:99px; background:#1e2635; color:var(--muted); border:1px solid var(--line); vertical-align:2px; }
     input[type=checkbox] { width:20px; height:20px; accent-color:var(--accent); cursor:pointer; }
 
+    /* Lights */
+    .light-row { display:flex; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--line); }
+    .light-row:first-of-type { border-top:none; }
+    .light-row .name { flex:0 0 150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .light-row .name .sub { color:var(--muted); font-size:11px; display:block; }
+    .light-row select { background:#1e2635; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:5px 8px; font-size:13px; }
+    .light-row select:disabled { opacity:.35; }
+    .light-row input[type=color] { width:34px; height:26px; border:1px solid var(--line); border-radius:6px; background:#1e2635; padding:2px; cursor:pointer; flex:none; }
+    .light-row input[type=range] { flex:1; accent-color:var(--accent); }
+    .light-row input[type=range]:disabled { opacity:.35; }
+    .light-row .pct { width:48px; text-align:right; color:var(--sec); }
+    .lightnote { color:var(--muted); font-size:12px; margin-top:8px; }
+
     /* Technical details */
     details > summary { cursor:pointer; color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.6px; list-style:none; }
     details > summary::before { content:"▸ "; }
@@ -150,6 +163,12 @@
       <h2>Sync &amp; latency</h2>
       <div class="groupline" id="groupline"></div>
       <div id="syncrows"><div class="empty">No speakers connected.</div></div>
+    </section>
+
+    <section class="card" id="lightscard" style="display:none">
+      <h2>Lights</h2>
+      <div id="lights"></div>
+      <div class="lightnote">Strips follow the music on the speakers' own timeline — the flash lands when you hear the beat, not when the hub decodes it.</div>
     </section>
 
     <section class="card">
@@ -447,6 +466,67 @@
         <tbody>${rows}</tbody></table>`;
     }
 
+    // ---- Lights (WLED) -----------------------------------------------------
+
+    const LIGHT_MODES = ["Pulse", "Vu", "Spectrum"];
+    const lastLightMode = new Map();     // device → last non-Off mode, for the on/off toggle
+    const lightDragging = new Set();     // devices with a brightness slider mid-drag
+    let lastWledSig = "";                // skip re-render (and dropdown-closing churn) when nothing changed
+
+    async function postWledConfig(body) {
+      lastWledSig = "";
+      await fetch("/api/wled/config", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      refresh();
+    }
+
+    function renderLights(s) {
+      const devices = s.wled || [];
+      $("lightscard").style.display = devices.length ? "" : "none";
+      if (!devices.length) return;
+      devices.forEach(d => { if (d.mode !== "Off") lastLightMode.set(d.name, d.mode); });
+      if (lightDragging.size > 0) return;   // don't rebuild rows mid-drag
+      const sig = JSON.stringify(devices);
+      if (sig === lastWledSig) return;
+      lastWledSig = sig;
+
+      $("lights").innerHTML = devices.map(d => {
+        const on = d.mode !== "Off";
+        const shownMode = on ? d.mode : (lastLightMode.get(d.name) || "Spectrum");
+        const pct = Math.round(d.brightness * 100);
+        return `<div class="light-row">
+          <input type="checkbox" class="lt-on" data-name="${escapeAttr(d.name)}" ${on ? "checked" : ""} />
+          <span class="name">${escapeHtml(d.name)}<span class="sub">${d.ledCount} LEDs · ${escapeHtml(d.protocol)}</span></span>
+          <select class="lt-mode" data-name="${escapeAttr(d.name)}" ${on ? "" : "disabled"}>
+            ${LIGHT_MODES.map(m => `<option ${m === shownMode ? "selected" : ""}>${m}</option>`).join("")}
+          </select>
+          <input type="color" class="lt-color" data-name="${escapeAttr(d.name)}" value="${escapeAttr(d.color)}"
+                 ${on && d.mode === "Pulse" ? "" : 'style="visibility:hidden"'} />
+          <input type="range" class="lt-bright" data-name="${escapeAttr(d.name)}" min="0" max="100" value="${pct}" ${on ? "" : "disabled"} />
+          <span class="pct num">${pct}%</span>
+        </div>`;
+      }).join("");
+
+      $("lights").querySelectorAll(".lt-on").forEach(cb => cb.addEventListener("change", () =>
+        postWledConfig({ device: cb.dataset.name, mode: cb.checked ? (lastLightMode.get(cb.dataset.name) || "Spectrum") : "Off" })));
+      $("lights").querySelectorAll(".lt-mode").forEach(sel => sel.addEventListener("change", () =>
+        postWledConfig({ device: sel.dataset.name, mode: sel.value })));
+      $("lights").querySelectorAll(".lt-color").forEach(inp => inp.addEventListener("change", () =>
+        postWledConfig({ device: inp.dataset.name, color: inp.value })));
+      $("lights").querySelectorAll(".lt-bright:not(:disabled)").forEach(slider => {
+        slider.addEventListener("input", () => {
+          lightDragging.add(slider.dataset.name);
+          slider.parentElement.querySelector(".pct").textContent = slider.value + "%";
+        });
+        slider.addEventListener("change", async () => {
+          await postWledConfig({ device: slider.dataset.name, brightness: slider.value / 100 });
+          lightDragging.delete(slider.dataset.name);
+        });
+      });
+    }
+
     // ---- Speaker selection (unchanged behavior) ----------------------------
 
     function renderSpeakers(s) {
@@ -493,6 +573,7 @@
         renderSync(s);
         renderTech(s);
         renderSpeakers(s);
+        renderLights(s);
       } catch (e) { /* transient */ }
     }
 

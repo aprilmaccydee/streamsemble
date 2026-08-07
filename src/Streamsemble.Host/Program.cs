@@ -14,6 +14,7 @@ using Streamsemble.Host;
 using Streamsemble.Spotify;
 using Streamsemble.Timing;
 using Streamsemble.Timing.Ptp;
+using Streamsemble.Wled;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -21,6 +22,7 @@ builder.Services.Configure<StreamsembleOptions>(builder.Configuration.GetSection
 builder.Services.Configure<SpotifyOptions>(builder.Configuration.GetSection("Spotify"));
 builder.Services.Configure<AirPlaySenderOptions>(builder.Configuration.GetSection("AirPlaySender"));
 builder.Services.Configure<AirPlayReceiverOptions>(builder.Configuration.GetSection("AirPlayReceiver"));
+builder.Services.Configure<WledOptions>(builder.Configuration.GetSection("Wled"));
 // Inbound frames are released exactly one group latency before their
 // stamped render deadline. The release time is sync-neutral — frames
 // render at their stamp regardless — it only has to be early enough that
@@ -52,13 +54,19 @@ builder.Services.AddSingleton<AirPlayTargetGroup>();
 builder.Services.AddSingleton<IAudioSink>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<StreamsembleOptions>>().Value;
-    return opts.Sink.ToLowerInvariant() switch
+    IAudioSink sink = opts.Sink.ToLowerInvariant() switch
     {
         "airplay" => sp.GetRequiredService<AirPlayTargetGroup>(),
         "wav" => new WavFileSink(opts.WavDirectory, sp.GetRequiredService<ILogger<WavFileSink>>()),
         "null" => new NullSink(),
         var other => throw new InvalidOperationException($"Unknown sink \"{other}\" (expected AirPlay, Wav or Null)"),
     };
+
+    // With WLED strips configured, the lighting engine taps the exact frame
+    // stream (and flush/stop signals) the real sink receives.
+    return sp.GetRequiredService<IOptions<WledOptions>>().Value.Devices.Count > 0
+        ? new LightingTapSink(sink, sp.GetRequiredService<WledLightingService>())
+        : sink;
 });
 builder.Services.AddSingleton<AudioPump>();
 builder.Services.AddHostedService<PumpService>();
@@ -88,6 +96,28 @@ builder.Services.AddSingleton<AirPlayReceiverSource>();
 builder.Services.AddSingleton<IAudioSource>(sp => sp.GetRequiredService<AirPlayReceiverSource>());
 builder.Services.AddHostedService<AirPlayReceiverService>();
 
+// Lighting: WLED UDP realtime. The lighting service turns the tapped frame
+// stream into per-strip light shows, and schedules every light frame on the
+// group's capture→audible timeline so the strips land on the beat the
+// LISTENER hears — the same instant the speakers render, not the group
+// latency earlier when the pump saw the bytes. /api/wled/* gives manual
+// control and runtime tuning.
+builder.Services.AddSingleton(sp => new WledDeviceGroup(
+    sp.GetRequiredService<IOptions<WledOptions>>().Value,
+    sp.GetRequiredService<ILogger<WledDeviceGroup>>()));
+builder.Services.AddSingleton(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<StreamsembleOptions>>().Value;
+    var airplay = opts.Sink.Equals("airplay", StringComparison.OrdinalIgnoreCase);
+    var group = airplay ? sp.GetRequiredService<AirPlayTargetGroup>() : null;
+    return new WledLightingService(
+        sp.GetRequiredService<WledDeviceGroup>(),
+        group is null ? _ => 0.0 : group.SecondsUntilAudible,
+        airplay ? AirPlay2Session.GroupPresentationLatencySeconds : 0.0,
+        sp.GetRequiredService<ILogger<WledLightingService>>());
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<WledLightingService>());
+
 builder.Services.AddSingleton<CastStubSource>();
 builder.Services.AddSingleton<IAudioSource>(sp => sp.GetRequiredService<CastStubSource>());
 builder.Services.AddHostedService<CastStubService>();
@@ -102,6 +132,10 @@ if (configuredTargets.Count > 0)
 {
     selected.Set(configuredTargets);
 }
+
+// Fail fast on WLED config typos (bad Mode, missing Host) instead of
+// surfacing them as 500s on the first /api/wled call.
+_ = app.Services.GetRequiredService<WledDeviceGroup>();
 
 app.UseDefaultFiles();
 app.UseStaticFiles();

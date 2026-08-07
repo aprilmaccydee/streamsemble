@@ -367,6 +367,40 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         var b = Volatile.Read(ref _sourceTargetBase);
         return b is null ? -1 : b.TargetNanos + (captureSample - b.CaptureTs) * 1_000_000_000L / 44100;
     }
+
+    /// <summary>
+    /// Seconds from now until a capture sample turns AUDIBLE on the current
+    /// timeline, or null while nothing is anchored. This is what lets
+    /// non-audio consumers (the WLED lighting engine) land on the same instant
+    /// the listener hears: a stamped source answers from its own render
+    /// stamps, a buffered group from the shared epoch anchor, and a
+    /// realtime-only group from the send anchor plus the group latency —
+    /// the same three mappings the speakers themselves anchor with.
+    /// Telemetry-grade reads: worst case is one light frame scheduled off a
+    /// mid-rebase snapshot, corrected by the next window ~25 ms later.
+    /// </summary>
+    public double? SecondsUntilAudible(long captureSample)
+    {
+        if (Volatile.Read(ref _sourceTargetBase) is { } stamped)
+        {
+            var nanos = stamped.TargetNanos + (captureSample - stamped.CaptureTs) * 1_000_000_000L / 44100;
+            return (nanos - Timing.Ptp.PtpReceiverClock.NowNanos) / 1e9;
+        }
+
+        if (_groupAnchor.Snapshot() is { } epoch)
+        {
+            var nanos = (long)epoch.Nanos + (captureSample - epoch.CaptureSample) * 1_000_000_000L / 44100;
+            return (nanos - Timing.Ptp.PtpReceiverClock.NowNanos) / 1e9;
+        }
+
+        if (_timestampBase is { } tsBase)
+        {
+            var dueSeconds = _anchorSeconds + (captureSample - tsBase - _anchorOffset) / (double)SampleRate;
+            return dueSeconds - _clock.NowSeconds + AirPlay2.AirPlay2Session.GroupPresentationLatencySeconds;
+        }
+
+        return null;
+    }
     private double _anchorSeconds;
     private long _anchorOffset;
 

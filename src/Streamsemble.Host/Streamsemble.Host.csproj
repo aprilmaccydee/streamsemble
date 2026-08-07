@@ -9,6 +9,7 @@
     <ProjectReference Include="../Streamsemble.Cast.Stub/Streamsemble.Cast.Stub.csproj" />
     <ProjectReference Include="../Streamsemble.AirPlay.Sender/Streamsemble.AirPlay.Sender.csproj" />
     <ProjectReference Include="../Streamsemble.AirPlay.Receiver/Streamsemble.AirPlay.Receiver.csproj" />
+    <ProjectReference Include="../Streamsemble.Wled/Streamsemble.Wled.csproj" />
   </ItemGroup>
   <ItemGroup>
     <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />

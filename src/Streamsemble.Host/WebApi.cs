@@ -1,8 +1,10 @@
+using System.Net.Sockets;
 using Microsoft.Extensions.Options;
 using Streamsemble.AirPlay.Sender;
 using Streamsemble.Core;
 using Streamsemble.Core.Abstractions;
 using Streamsemble.Discovery;
+using Streamsemble.Wled;
 
 namespace Streamsemble.Host;
 
@@ -16,12 +18,19 @@ public static class WebApi
 
     public sealed record SpeakerVolumeRequest(string Name, float Volume);
 
+    public sealed record WledColorRequest(byte R, byte G, byte B, string? Device = null);
+
+    public sealed record WledPixelsRequest(byte[][] Pixels, int Start = 0, string? Device = null);
+
+    public sealed record WledConfigRequest(string? Device = null, string? Mode = null, string? Color = null, float? Brightness = null);
+
     public static void MapStreamsembleApi(this WebApplication app)
     {
         app.MapGet("/api/state", (
             DiscoveredTargetStore discovered,
             SelectedTargetStore selected,
             AirPlayTargetGroup group,
+            WledDeviceGroup wled,
             PlaybackStatus status) =>
         {
             var meta = status.Metadata;
@@ -74,6 +83,15 @@ public static class WebApi
                     inheritedDebtMs = sp.Telemetry.InheritedDebtMs,
                     bufferedPacketsSent = sp.Telemetry.BufferedPacketsSent,
                     timelineId = sp.Telemetry.TimelineId,
+                }),
+                wled = wled.Devices.Select(d => new
+                {
+                    name = d.Name,
+                    mode = d.Mode.ToString(),
+                    color = d.ColorHex,
+                    brightness = d.Brightness,
+                    ledCount = d.LedCount,
+                    protocol = d.Protocol.ToString(),
                 }),
                 telemetry = new
                 {
@@ -148,6 +166,98 @@ public static class WebApi
             return Results.Ok(new { volume });
         });
 
+        // WLED UDP realtime: push RGB straight to the configured LED strips.
+        // A strip shows exactly what it is sent and returns to its own effect
+        // once packets stop (after its TimeoutSeconds). "device" targets one
+        // strip by name; omitted, every strip gets the data.
+        app.MapPost("/api/wled/color", (WledColorRequest request, WledDeviceGroup wled) =>
+            SendWledAsync(wled, request.Device, (d, ct) => d.SendColorAsync(request.R, request.G, request.B, ct)));
+
+        app.MapPost("/api/wled/pixels", (WledPixelsRequest request, WledDeviceGroup wled) =>
+        {
+            if (request.Pixels.Any(p => p.Length != 3))
+            {
+                return Task.FromResult(Results.BadRequest(new { error = "each pixel must be an [r, g, b] triple" }));
+            }
+
+            var rgb = new byte[request.Pixels.Length * 3];
+            for (var i = 0; i < request.Pixels.Length; i++)
+            {
+                request.Pixels[i].CopyTo(rgb, i * 3);
+            }
+
+            return SendWledAsync(wled, request.Device, (d, ct) => d.SendPixelsAsync(rgb, request.Start, ct));
+        });
+
+        app.MapPost("/api/wled/release", (string? device, WledDeviceGroup wled) =>
+            SendWledAsync(wled, device, (d, ct) => d.ReleaseAsync(ct)));
+
+        // Runtime tuning (web UI): light mode (Off = disabled), Pulse color,
+        // master brightness — per device, or every device when none is named.
+        // Takes effect on the next light frame, ~25 ms.
+        app.MapPost("/api/wled/config", (WledConfigRequest request, WledDeviceGroup wled) =>
+        {
+            if (!wled.IsConfigured)
+            {
+                return Results.Json(new { error = "no WLED devices configured (Wled:Devices)" },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+
+            var targets = wled.Match(request.Device);
+            if (targets.Count == 0)
+            {
+                return Results.NotFound(new { error = $"no WLED device named \"{request.Device}\"" });
+            }
+
+            WledLightMode? mode;
+            (byte, byte, byte)? color;
+            try
+            {
+                mode = request.Mode is { } m ? WledLightModes.Parse(m) : null;
+                color = request.Color is { } c ? WledDevice.ParseColor(c) : null;
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+
+            foreach (var target in targets)
+            {
+                if (mode is { } newMode)
+                {
+                    target.Mode = newMode;
+                }
+
+                if (color is { } newColor)
+                {
+                    target.Color = newColor;
+                }
+
+                if (request.Brightness is { } brightness)
+                {
+                    target.Brightness = Math.Clamp(brightness, 0f, 1f);
+                }
+
+                if (mode is WledLightMode.Off)
+                {
+                    // Blank instead of freezing the last light frame, and let
+                    // the device's own idle effect take over a second later.
+                    _ = ReleaseQuietlyAsync(target);
+                }
+            }
+
+            return Results.Ok(new
+            {
+                devices = targets.Select(t => new
+                {
+                    name = t.Name,
+                    mode = t.Mode.ToString(),
+                    color = t.ColorHex,
+                    brightness = t.Brightness,
+                }),
+            });
+        });
+
         // Debug endpoints driving the TONE SOURCE's state exactly like
         // librespot's player events drive the Spotify source — the pump then
         // runs its real pause/resume/cutover paths, scriptable via curl
@@ -169,5 +279,54 @@ public static class WebApi
             tone.DebugCutover();
             return Results.Ok(new { op = "cutover" });
         });
+    }
+
+    private static async Task ReleaseQuietlyAsync(WledDevice device)
+    {
+        try
+        {
+            await device.SendPixelsAsync(new byte[device.LedCount * 3]);
+            await device.ReleaseAsync();
+        }
+        catch (SocketException)
+        {
+            // The device logged it; the realtime timeout covers us anyway.
+        }
+    }
+
+    private static async Task<IResult> SendWledAsync(WledDeviceGroup wled, string? device, Func<WledDevice, CancellationToken, Task> send)
+    {
+        if (!wled.IsConfigured)
+        {
+            return Results.Json(new { error = "no WLED devices configured (Wled:Devices)" },
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        var targets = wled.Match(device);
+        if (targets.Count == 0)
+        {
+            return Results.NotFound(new { error = $"no WLED device named \"{device}\"" });
+        }
+
+        try
+        {
+            foreach (var target in targets)
+            {
+                await send(target, CancellationToken.None);
+            }
+
+            return Results.Ok(new { devices = targets.Select(t => t.Name) });
+        }
+        catch (SocketException ex)
+        {
+            return Results.Json(new { error = $"UDP send to WLED failed: {ex.Message}" },
+                statusCode: StatusCodes.Status502BadGateway);
+        }
+        catch (ArgumentException ex)
+        {
+            // Data the device's mode cannot frame: too many LEDs for
+            // DRGB/DRGBW/WARLS, an offset DRGB cannot express, partial pixels.
+            return Results.BadRequest(new { error = ex.Message });
+        }
     }
 }

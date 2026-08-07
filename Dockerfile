@@ -32,6 +32,7 @@ COPY src/Streamsemble.AirPlay.Sender/Streamsemble.AirPlay.Sender.csproj   src/St
 COPY src/Streamsemble.AirPlay.Receiver/Streamsemble.AirPlay.Receiver.csproj src/Streamsemble.AirPlay.Receiver/
 COPY src/Streamsemble.Spotify/Streamsemble.Spotify.csproj                 src/Streamsemble.Spotify/
 COPY src/Streamsemble.Cast.Stub/Streamsemble.Cast.Stub.csproj             src/Streamsemble.Cast.Stub/
+COPY src/Streamsemble.Wled/Streamsemble.Wled.csproj                       src/Streamsemble.Wled/
 COPY src/Streamsemble.Host/Streamsemble.Host.csproj                       src/Streamsemble.Host/
 RUN dotnet restore src/Streamsemble.Host/Streamsemble.Host.csproj
 

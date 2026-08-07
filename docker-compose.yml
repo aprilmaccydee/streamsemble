@@ -73,6 +73,21 @@ services:
       # range ~1–2 s; outside that the hub warns and receivers may not start.
       # - STREAMSEMBLE_GROUP_LATENCY=2.0
 
+      # --- lights: music-reactive WLED strips ------------------------------
+      # One block per strip; index (__0__, __1__, …) adds devices. Mode/Color/
+      # Brightness are just the boot state — the web UI's Lights card and
+      # POST /api/wled/config retune them live. Light frames are scheduled on
+      # the group's audible timeline, so the flash lands with the speakers.
+      # - Wled__Devices__0__Name=desk
+      # - Wled__Devices__0__Host=192.168.1.60     # or wled-desk.local if the container resolves mDNS
+      # - Wled__Devices__0__LedCount=144
+      # - Wled__Devices__0__Protocol=Dnrgb        # Dnrgb (any RGB strip) | Drgb | Drgbw (RGBW) | Warls
+      # - Wled__Devices__0__Mode=Spectrum         # Spectrum | Vu | Pulse | Off
+      # - Wled__Devices__0__Color=#FF4000         # Pulse glow color
+      # - Wled__Devices__0__Brightness=0.8        # 0–1 master scale
+      # - Wled__Devices__0__Port=21324            # WLED UDP realtime port (default)
+      # - Wled__Devices__0__TimeoutSeconds=2      # strip returns to its own effect this long after the last packet
+
       # --- HomeKit PIN pairing (strict receivers, e.g. TVs) ----------------
       # Set to 1, start, then write the PIN shown on the TV into the volume:
       #   docker compose exec streamsemble sh -c 'echo 1234-5678 > /data/.streamsemble/pin.txt'

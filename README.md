@@ -100,6 +100,7 @@ dependency injection throughout.
 | `Streamsemble.AirPlay.Receiver` | Full receiver: RTSP server, session handling, realtime (ALAC) + buffered (AAC) audio servers, receiver source. |
 | `Streamsemble.Spotify` | Supervised librespot child process → PCM + events, including now-playing metadata and cover-art fetch. |
 | `Streamsemble.Cast.Stub` | `ICastSource` stub. |
+| `Streamsemble.Wled` | Music-reactive WLED lighting: PCM tap → envelope/FFT analysis → per-strip render, scheduled on the group's capture→audible timeline; DNRGB/DRGB/DRGBW/WARLS UDP realtime framing. |
 | `Streamsemble.Host` | Console app: Generic Host, DI wiring, config. |
 
 ## Web UI
@@ -123,16 +124,21 @@ on the same LAN at `http://<host-ip>:8088`). The page:
   group presentation-latency target with sparkline history, lock/cushion
   badges, and a hover tooltip (encoder pipeline age, inherited join debt,
   last PTP `Delay_Req`),
+- shows a **Lights card** when WLED strips are configured: per-strip on/off,
+  light mode (Pulse / Vu / Spectrum), Pulse color and master brightness, all
+  applied to the running lighting engine within one light frame (~25 ms),
 - ends with a **technical details panel**: group epoch anchor, grandmaster
   clock id, and a per-session table (mode, pairing, anchor state, trims,
   reported latency, timeline id).
 
 The REST API behind it (usable directly): `GET /api/state` (now includes
-`speakers[]` per-session telemetry and a group `telemetry` object),
-`POST /api/targets` (`{ "targets": [ { "name": "Living Room" } ] }`),
-`POST /api/volume` (`{ "volume": 0.7 }`, all speakers), and
+`speakers[]` per-session telemetry, a group `telemetry` object and `wled[]`
+device state), `POST /api/targets`
+(`{ "targets": [ { "name": "Living Room" } ] }`),
+`POST /api/volume` (`{ "volume": 0.7 }`, all speakers),
 `POST /api/speakers/volume` (`{ "name": "Kitchen", "volume": 0.4 }`, one
-speaker). Configured `AirPlaySender:Targets` seed the initial selection, so
+speaker) and the `/api/wled/*` endpoints listed under configuration.
+Configured `AirPlaySender:Targets` seed the initial selection, so
 headless/config-only operation still works.
 
 ## Running
@@ -219,6 +225,25 @@ Edit the `environment:` block to name your speakers; every setting in
 - `AirPlayReceiver:Enabled`, `AirPlayReceiver:Name` — the inbound AirPlay hub.
 - `Spotify:Enabled`, `Spotify:LibrespotPath`, `Spotify:Bitrate`,
   `Spotify:ExtraArgs` (passed through to librespot, e.g. `--volume-ctrl fixed`).
+- `Wled:Devices[]` — `{ Name, Host, Port, LedCount, Protocol, Mode, Color,
+  Brightness, TimeoutSeconds }`: WLED strips that light to the music. The
+  lighting engine taps the exact PCM the speakers get, renders ~43 light
+  frames/s (loudness envelope + log-spaced FFT bands, slow-decay auto gain —
+  no sensitivity knob), and schedules every frame on the group's
+  capture→audible timeline (source render stamps → group epoch anchor → send
+  anchor + group latency, the same mappings the speakers anchor with), so the
+  flash lands when the *listener* hears the beat — not a group latency
+  earlier when the hub decoded it. `Mode` is the light mode — `Spectrum`
+  (default) | `Vu` | `Pulse` (glows `Color`) | `Off` — and mode, color and
+  brightness are runtime-tunable from the web UI's Lights card or
+  `POST /api/wled/config` `{ "device": "desk", "mode": "Vu", "brightness": 0.6 }`
+  (omit `device` for every strip). `Protocol` picks the wire format: `Dnrgb`
+  (default, any strip length) | `Drgb` | `Drgbw` (RGBW strips) | `Warls`.
+  Manual control for `Off` strips or testing: `POST /api/wled/color`
+  `{ "r": 255, "g": 40, "b": 0 }`, `POST /api/wled/pixels`
+  (`{ "pixels": [[r,g,b], …], "start": 0 }`) and `POST /api/wled/release`;
+  a strip returns to its own WLED effect `TimeoutSeconds` after the last
+  packet, and pause/stop blanks it and releases it immediately.
 - Verified HomeKit pairing for strict receivers (TVs): set
   `STREAMSEMBLE_PAIR=1`, then write the on-screen PIN to
   `~/.streamsemble/pin.txt` when prompted; the identity persists for future
@@ -257,11 +282,12 @@ here can fail a stream.
 ## Testing
 
 ```bash
-dotnet test    # 95 tests (AirPlay + core + Spotify): SRP client↔server interop,
+dotnet test    # AirPlay + core + Spotify + WLED: SRP client↔server interop,
                # ALAC decoder vs ffmpeg golden vectors, PTP grandmaster wire
                # pins, DMAP metadata encoding, the now-playing RTSP exchange
                # against a stand-in receiver, librespot field parsing, group
-               # latency config, ring buffer, arbiter, packers
+               # latency config, ring buffer, arbiter, packers, WLED realtime
+               # framing
 ```
 
 Multi-room sync was verified end-to-end on real devices (TV + Sonos,
