@@ -5,16 +5,17 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
 ---
 <Base
   title="Streamsemble — every speaker in the house, on the same beat"
-  description="A small self-hosted hub that takes Spotify and AirPlay in, and plays out to all your AirPlay 2 speakers in sync. Runs in Docker. Free, source on GitHub."
+  description="A small self-hosted hub that takes Spotify, AirPlay, and screen mirroring in, and plays out to all your AirPlay 2 speakers in sync — picture on the TV, sound everywhere. Runs in Docker. Free, source on GitHub."
 >
   <header class="hero wrap">
-    <p class="hero__path reveal" style="--i: 0">Spotify in. AirPlay in. Every room out.</p>
+    <p class="hero__path reveal" style="--i: 0">Spotify in. AirPlay in. Screen in. Every room out.</p>
     <h1 class="reveal" style="--i: 0">Every speaker in the house, on the same beat.</h1>
     <p class="hero__lede reveal" style="--i: 1">
       Streamsemble is a small server you run at home. Your phone sees it as just
       another speaker — and whatever you play to it comes out of every speaker
-      you choose, all in time with each other. It can run your LED strips to the
-      music, too.
+      you choose, all in time with each other. Mirror a Mac's screen to it and
+      the picture lands on your TV while the sound plays through the house,
+      lips still in time. It can run your LED strips to the music, too.
     </p>
   </header>
 
@@ -25,7 +26,7 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
         class="map__svg"
         viewBox="0 0 880 440"
         role="img"
-        aria-label="System map: the Spotify app and AirPlay devices play into the Streamsemble hub, which plays out in sync to the Kitchen, the living room TV, the Bedroom, and optional LED strips."
+        aria-label="System map: the Spotify app and AirPlay devices — including a mirrored Mac screen — play into the Streamsemble hub, which plays out in sync to the Kitchen, the living room TV, the Bedroom, and optional LED strips."
       >
         <g class="reveal" style="--i: 2">
           <rect class="map__box" x="24" y="90" width="180" height="84" rx="8" />
@@ -33,7 +34,7 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
           <text class="map__sub" x="114" y="149" text-anchor="middle">your phone or laptop</text>
           <rect class="map__box" x="24" y="250" width="180" height="84" rx="8" />
           <text class="map__name" x="114" y="287" text-anchor="middle">iPhone · Mac</text>
-          <text class="map__sub" x="114" y="309" text-anchor="middle">the AirPlay menu</text>
+          <text class="map__sub" x="114" y="309" text-anchor="middle">AirPlay · screen mirroring</text>
         </g>
 
         <g class="reveal" style="--i: 3">
@@ -77,8 +78,9 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
     </div>
     <p class="map__legend">
       Anything you play into the hub comes out of every speaker you've ticked, on
-      one shared clock. The LED strips are optional — they follow whatever is
-      playing.
+      one shared clock. Mirror a screen and the picture goes to the TV on that
+      same clock — so the lips on screen match the voice in the kitchen. The LED
+      strips are optional — they follow whatever is playing.
     </p>
   </section>
 
@@ -105,12 +107,12 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
     </a>
     <a class="door" href={`${base}web-ui/`}>
       <span class="door__title">The web UI</span>
-      <span class="door__desc">Tick speakers to bring them in mid-song, set volumes, watch the sync, run the lights.</span>
+      <span class="door__desc">Tick speakers to bring them in mid-song, set volumes, watch the sync and the screen, run the lights.</span>
       <span class="door__arrow" aria-hidden="true">→</span>
     </a>
     <a class="door" href={`${base}advanced/`}>
       <span class="door__title">Advanced setup</span>
-      <span class="door__desc">Speakers that connect themselves at boot, WLED light strips, house-wide latency, TVs that want a PIN.</span>
+      <span class="door__desc">Speakers that connect themselves at boot, screen mirroring to the TV, WLED light strips, house-wide latency, TVs that want a PIN.</span>
       <span class="door__arrow" aria-hidden="true">→</span>
     </a>
   </section>

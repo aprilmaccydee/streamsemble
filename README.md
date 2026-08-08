@@ -2,8 +2,10 @@
 
 A cross-platform (.NET 8) audio hub that receives from **Spotify Connect**,
 **AirPlay 2**, and **Google Cast** sources and plays out to **one or more
-AirPlay 2 speakers**, kept in sync. Built with the .NET Generic Host and
-dependency injection throughout.
+AirPlay 2 speakers**, kept in sync. It also receives **AirPlay screen
+mirroring** and forwards the picture to a TV — video on the TV, audio on
+every speaker, lip-synced on the same house clock. Built with the .NET
+Generic Host and dependency injection throughout.
 
 **Website & guides:** <https://aprilmaccydee.github.io/streamsemble/> —
 quick start (Docker + native), the web UI, and advanced setup in plain
@@ -17,6 +19,10 @@ English. This README is the deeper technical reference.
       │                 │                         ▲
  iPhone / Mac           └── ONE grandmaster ──────┘  PTP (319/320) + NTP timing
  streams into the hub       clock (PtpPortMux)       + sync packets = multi-room
+
+ Mac screen mirror ─► MirrorVideoSource ─► VideoPump ─► VideoTargetGroup ─► TV
+ (H.264 passed through untouched; every frame stamped on the same grandmaster
+  clock the speakers anchor to, so the picture lands when the sound does)
 ```
 
 ## What works today (verified)
@@ -35,7 +41,8 @@ English. This README is the deeper technical reference.
 | **ALAC decoder (Apple reference port)** | ✅ Working, unit-tested | SCE/CPE/verbatim/partial frames, all three magic-cookie forms; byte-identical against ffmpeg-generated golden vectors. |
 | **Volume & metadata forwarding** | ✅ Working | Spotify volume/track events → `SET_PARAMETER` (dB volume; progress + DMAP listing item + cover art), on classic RAOP *and* AirPlay 2 over the encrypted control channel. Title, artist, album, album artist, track/disc number, duration, live position and album art all forward; a speaker joining mid-track is caught up rather than left blank. Per-speaker volume is also read back from the device (`GET_PARAMETER`, on connect + periodic) and settable per speaker from the web UI. Inbound sender volume is observe-only by design. |
 | **Source arbitration** | ✅ Working | Last source to play wins; the previous source is asked to yield. Unit-tested. |
-| **Web UI: discovery, selection, volume, sync telemetry** | ✅ Working | Browser at `http://<host>:8088` lists discovered AirPlay speakers; ticking one connects it live (mid-stream join), unticking drops it. Per-speaker + averaged global volume, live sync/latency graphic, and a technical panel (anchor state, buffer lead, PTP lock, epoch). |
+| **Screen mirroring: Mac → hub → TV, with audio** | ✅ Working | A Mac mirrors to "Streamsemble Hub"; the hub decrypts the type-110 H.264 stream and forwards it to the TV named by `AirPlaySender:VideoTarget`, with a companion ALAC stream carrying the sound (a TV holds ONE AirPlay session, so all its media rides the mirror). Picture on the TV, audio on every speaker, lip-synced — each frame carries the render deadline the Mac stated, on the hub's grandmaster clock. H.264 is passed through, never re-encoded. |
+| **Web UI: discovery, selection, volume, sync telemetry** | ✅ Working | Browser at `http://<host>:8088` lists discovered AirPlay speakers; ticking one connects it live (mid-stream join), unticking drops it. Per-speaker + averaged global volume (including the mirroring display), live sync/latency graphic, a Screen card while mirroring, and a technical panel (anchor state, buffer lead, PTP lock, epoch). |
 | **Google Cast source** | ⚠️ Stub (by design) | See limitation below. |
 
 ## Protocol notes (hard-won, save yourself the week)
@@ -69,6 +76,15 @@ English. This README is the deeper technical reference.
 - Debugging on macOS: `/usr/bin/log show --predicate 'process ==
   "AirPlayXPCHelper"'` shows the sender's engine/transport decisions
   (activation options, chosen `AudioEngineType`, per-connection dials).
+- **A mirror sender emits ONE keyframe, ever** — at stream open, and again
+  only on a config (resolution) change. Anything that drops it and "waits for
+  the next keyframe" waits forever; on connect the hub replays the queued
+  backlog from its newest IDR and fast-forwards to the live edge instead.
+- **Mirror video to a modern TV must be VCL-only, sealed with the ChaCha
+  DataStream envelope.** SPS/PPS reach the TV solely via the unencrypted avcC
+  config packet — inline parameter sets render as a black screen, and so does
+  sealing with the legacy shk-derived AES-CTR (the `shk` in the SETUP is
+  vestigial; both ends send it, neither uses it for video).
 
 ## Deliberately incomplete
 
@@ -96,12 +112,12 @@ English. This README is the deeper technical reference.
 
 | Project | Role |
 |---|---|
-| `Streamsemble.Core` | Format, `PcmFrame`, ring buffer, `IAudioSource`/`IAudioSink`/`ISourceArbiter`, arbiter, pump, WAV/null/tone sinks & sources. Zero protocol deps. |
+| `Streamsemble.Core` | Format, `PcmFrame`, ring buffer, `IAudioSource`/`IAudioSink`/`ISourceArbiter`, arbiter, pump, WAV/null/tone sinks & sources — plus the video spine: stamped `VideoFrame`, avcC/SPS parsing, `VideoPump`. Zero protocol deps. |
 | `Streamsemble.Timing` | `IMasterClock`, NTP timing responder, and the PTP stack: `PtpPortMux` (single owner of 319/320), `PtpReceiverClock` (the hub grandmaster), wire builders pinned by tests. |
 | `Streamsemble.Discovery` | mDNS browse and advertise (routable-IPv4-only records). |
-| `Streamsemble.AirPlay.Common` | Shared RTSP/plist/TLV8 + HAP pairing crypto, client and server side (`HapSrpServer`, transient pair-setup, FairPlay responder). |
-| `Streamsemble.AirPlay.Sender` | RAOP + AirPlay 2 sessions, RTP send, control/sync channel, `NowPlaying` metadata push, `AirPlayTargetGroup` fan-out sink. |
-| `Streamsemble.AirPlay.Receiver` | Full receiver: RTSP server, session handling, realtime (ALAC) + buffered (AAC) audio servers, receiver source. |
+| `Streamsemble.AirPlay.Common` | Shared RTSP/plist/TLV8 + HAP pairing crypto, client and server side (`HapSrpServer`, transient pair-setup, FairPlay responder + key unwrap), mirror stream framing and ciphers. |
+| `Streamsemble.AirPlay.Sender` | RAOP + AirPlay 2 sessions, RTP send, control/sync channel, `NowPlaying` metadata push, `AirPlayTargetGroup` fan-out sink; outbound screen mirroring (`MirrorSenderSession`, `VideoTargetGroup`, mirror NTP server, companion audio). |
+| `Streamsemble.AirPlay.Receiver` | Full receiver: RTSP server, session handling, realtime (ALAC) + buffered (AAC) audio servers, receiver source; inbound mirror video (type-110 data server, access-unit assembler, `MirrorVideoSource`). |
 | `Streamsemble.Spotify` | Supervised librespot child process → PCM + events, including now-playing metadata and cover-art fetch. |
 | `Streamsemble.Cast.Stub` | `ICastSource` stub. |
 | `Streamsemble.Wled` | Music-reactive WLED lighting: PCM tap → envelope/FFT analysis → per-strip render, scheduled on the group's capture→audible timeline; DNRGB/DRGB/DRGBW/WARLS UDP realtime framing. |
@@ -120,7 +136,10 @@ on the same LAN at `http://<host-ip>:8088`). The page:
 - shows **per-speaker volume sliders** fed by the device's own reported volume
   (read-only `GET_PARAMETER` on connect + periodic refresh, so changes made
   from the speaker's own app show up); the global slider reports the **mean of
-  the live speaker volumes** and sets all speakers when moved,
+  the live speaker volumes** and sets all speakers when moved. A display
+  showing the mirrored screen appears here too (tagged `· mirror`) — its
+  audio rides the mirror session rather than a speaker session, so the hub
+  routes its volume over the mirror's own channel,
 - shows the active source and now-playing metadata plus the live pipeline
   state (playing / paused-with-pipeline-held / stopped, send-queue depth,
   anchored count, packet rate),
@@ -128,6 +147,11 @@ on the same LAN at `http://<host-ip>:8088`). The page:
   group presentation-latency target with sparkline history, lock/cushion
   badges, and a hover tooltip (encoder pipeline age, inherited join debt,
   last PTP `Delay_Req`),
+- shows a **Screen card** while a Mac is mirroring: what's arriving (source
+  resolution, frames in), where it's going (target, pairing, packets/bytes
+  out, render lead, the display's volume), and whether the display granted
+  the companion audio stream — "receiving but not forwarding" is a real state
+  the card can tell apart from nothing happening at all,
 - shows a **Lights card** when WLED strips are configured: per-strip on/off,
   light mode (Pulse / Vu / Spectrum), palette (Classic / Solid / Rainbow),
   color, master brightness, fall time, and mirror/reverse geometry, all
@@ -137,8 +161,8 @@ on the same LAN at `http://<host-ip>:8088`). The page:
   reported latency, timeline id).
 
 The REST API behind it (usable directly): `GET /api/state` (now includes
-`speakers[]` per-session telemetry, a group `telemetry` object and `wled[]`
-device state), `POST /api/targets`
+`speakers[]` per-session telemetry, a group `telemetry` object, a `video`
+mirroring snapshot and `wled[]` device state), `POST /api/targets`
 (`{ "targets": [ { "name": "Living Room" } ] }`),
 `POST /api/volume` (`{ "volume": 0.7 }`, all speakers),
 `POST /api/speakers/volume` (`{ "name": "Kitchen", "volume": 0.4 }`, one
@@ -227,6 +251,13 @@ Edit the `environment:` block to name your speakers; every setting in
   `StreamMode: Buffered` is the verified mode for AirPlay 2 speakers.
   `LatencyTrimMs` manually trims one speaker's alignment if a vendor's reported
   latency is off.
+- `AirPlaySender:VideoTarget` — where the mirrored screen goes: a display's
+  name (as the AirPlay menu shows it, or a configured target's name) or host.
+  While a screen is mirroring, that display leaves the speaker group and gets
+  **all** its media — picture and sound — through the one mirror session a TV
+  can hold; the speakers keep playing in sync, and everything returns to
+  normal when mirroring stops. Unset, the hub still receives mirrors (audio
+  plays house-wide) and just has nowhere to send the picture.
 - `AirPlayReceiver:Enabled`, `AirPlayReceiver:Name` — the inbound AirPlay hub.
 - `Spotify:Enabled`, `Spotify:LibrespotPath`, `Spotify:Bitrate`,
   `Spotify:ExtraArgs` (passed through to librespot, e.g. `--volume-ctrl fixed`).
@@ -301,7 +332,9 @@ dotnet test    # AirPlay + core + Spotify + WLED: SRP client↔server interop,
                # pins, DMAP metadata encoding, the now-playing RTSP exchange
                # against a stand-in receiver, librespot field parsing, group
                # latency config, ring buffer, arbiter, packers, WLED realtime
-               # framing
+               # framing, mirror stream crypto (seal↔open round trips),
+               # sender header layouts, FairPlay key unwrap vectors, and the
+               # video pump's replay-from-keyframe connect
 ```
 
 Multi-room sync was verified end-to-end on real devices (TV + Sonos,

@@ -5,7 +5,7 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
 ---
 <Base
   title="The web UI — Streamsemble"
-  description="One page controls the whole hub: pick speakers live, set volumes, watch the sync, and run the lights — from any browser on your network."
+  description="One page controls the whole hub: pick speakers live, set volumes, watch the sync and the mirrored screen, and run the lights — from any browser on your network."
   current="webui"
 >
   <main class="doc wrap">
@@ -33,7 +33,9 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
         Each speaker gets its own slider, and the reading comes from the
         speaker itself — turn a Sonos up from its own app and the slider here
         moves too. The big slider at the top is the average of them all; move
-        it and every speaker follows.
+        it and every speaker follows. A TV showing a mirrored screen keeps its
+        slider too (tagged <em>mirror</em>) — its sound travels a different
+        road while mirroring, and the hub quietly routes the slider down it.
       </p>
     </section>
 
@@ -57,6 +59,18 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
       </p>
     </section>
 
+    <section aria-labelledby="screen">
+      <h2 id="screen">Screen</h2>
+      <p>
+        Mirror a Mac to the hub and a Screen card appears: what's arriving
+        (resolution, frames in), where it's going (the TV named as the video
+        target), and the numbers that prove it's healthy — packets out, render
+        lead, whether the TV granted sound. The TV itself gets a
+        <em>mirroring</em> badge in the speakers list. When the mirror ends,
+        the card folds away and the TV goes back to being an ordinary speaker.
+      </p>
+    </section>
+
     <section aria-labelledby="lights">
       <h2 id="lights">Lights</h2>
       <p>
@@ -75,10 +89,10 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
       <p>
         Every control on the page is a plain HTTP call you can use yourself:
       </p>
-      <pre is:raw><code>GET  /api/state              # everything: speakers, volumes, telemetry, lights
+      <pre is:raw><code>GET  /api/state              # everything: speakers, volumes, telemetry, screen, lights
 POST /api/targets            # which speakers play
-POST /api/volume             # all speakers
-POST /api/speakers/volume    # one speaker
+POST /api/volume             # all speakers (the mirroring TV included)
+POST /api/speakers/volume    # one speaker — or the mirroring TV, by name
 POST /api/wled/config        # light mode, palette, brightness…</code></pre>
       <p>
         If you want to script the house — a button by the bed that moves the

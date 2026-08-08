@@ -5,7 +5,7 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
 ---
 <Base
   title="Advanced setup — Streamsemble"
-  description="Speakers that connect themselves at boot, WLED light strips, house-wide latency, PIN pairing for TVs, and Spotify options — all environment variables."
+  description="Speakers that connect themselves at boot, screen mirroring to the TV, WLED light strips, house-wide latency, PIN pairing for TVs, and Spotify options — all environment variables."
   current="advanced"
 >
   <main class="doc wrap">
@@ -61,6 +61,39 @@ const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
           If one speaker sits audibly early or late no matter what — some
           vendors misreport their own latency — nudge just that one with
           <code>LatencyTrimMs</code>, in milliseconds, positive or negative.
+        </li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="mirroring">
+      <h2 id="mirroring">Mirror your screen to a TV</h2>
+      <p>
+        Name a display and the hub forwards any screen mirrored to it onward —
+        picture on that TV, sound through the whole house, lips in time:
+      </p>
+      <span class="codelabel">docker-compose.yml · environment:</span>
+      <pre is:raw><code>- AirPlaySender__VideoTarget=Living room TV</code></pre>
+      <ul>
+        <li>
+          Use the TV's name exactly as the AirPlay menu shows it (or its IP as
+          a <code>Host</code>-style value). Then mirror your Mac to
+          <strong>Streamsemble Hub</strong> the way you'd mirror to anything.
+        </li>
+        <li>
+          A TV holds one AirPlay session at a time, so while a screen is up the
+          hub sends that TV <em>everything</em> — video and audio — through the
+          mirror, and quietly steps it out of the speaker group. The rest of
+          the speakers carry on unchanged. When you stop mirroring, the TV
+          rejoins as an ordinary speaker on its own.
+        </li>
+        <li>
+          Lip sync is automatic: every frame carries the moment the Mac wanted
+          it seen, on the same clock the speakers play by. There is nothing to
+          calibrate.
+        </li>
+        <li>
+          Without a <code>VideoTarget</code> the hub still accepts mirrors —
+          the sound plays house-wide, there's just nowhere to send the picture.
         </li>
       </ul>
     </section>
