@@ -21,4 +21,30 @@ public sealed class AirPlayReceiverOptions
     /// transmission lead.
     /// </summary>
     public int PresentationLatencySamples { get; set; }
+
+    /// <summary>
+    /// Advertise screen mirroring, so a Mac offers the hub as a mirror target
+    /// and can open a type-110 video stream. Off by default because the
+    /// features mask it changes is the same one the working audio negotiation
+    /// depends on — see <see cref="ReceiverFeatures.ScreenMirroringAdvertised"/>.
+    /// </summary>
+    public bool ScreenMirroring { get; set; }
+
+    /// <summary>
+    /// The screen we tell senders we have. A Mac sizes and paces its encoder
+    /// from this and will not open a video stream without it, so these are not
+    /// cosmetic — set them to the display the picture ends up on.
+    /// </summary>
+    public int ScreenWidth { get; set; } = 1920;
+
+    public int ScreenHeight { get; set; } = 1080;
+
+    /// <summary>Frames per second offered to the sender's encoder.</summary>
+    public int ScreenFps { get; set; } = 60;
+}
+
+/// <summary>The advertised mirroring display geometry, resolved from options.</summary>
+public sealed record MirrorDisplay(int Width, int Height, int Fps)
+{
+    public static readonly MirrorDisplay Default = new(1920, 1080, 60);
 }

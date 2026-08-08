@@ -90,6 +90,7 @@
     .speaker label { flex:1; cursor:pointer; }
     .speaker .host { color:var(--muted); font-size:12px; }
     .speaker .cbadge { font-size:11px; padding:2px 8px; border-radius:99px; background:#0d3d22; color:var(--on); border:1px solid #17512f; }
+    .speaker .cbadge.mirror { background:#122c4a; color:#7db6f0; border-color:#1d497c; }
     .speaker .proto { font-size:10px; padding:1px 6px; border-radius:99px; background:#1e2635; color:var(--muted); border:1px solid var(--line); vertical-align:2px; }
     input[type=checkbox] { width:20px; height:20px; accent-color:var(--accent); cursor:pointer; }
 
@@ -169,6 +170,13 @@
       <h2>Sync &amp; latency</h2>
       <div class="groupline" id="groupline"></div>
       <div id="syncrows"><div class="empty">No speakers connected.</div></div>
+    </section>
+
+    <section class="card" id="screencard" style="display:none">
+      <h2>Screen</h2>
+      <div class="groupline" id="screenline"></div>
+      <dl class="techgrid tech" id="screengrid"></dl>
+      <div class="lightnote">The picture is scheduled on the same timeline as the sound: each frame carries the instant the Mac wanted it visible, and the TV renders it then — the moment the speakers play what goes with it.</div>
     </section>
 
     <section class="card" id="lightscard" style="display:none">
@@ -265,36 +273,58 @@
 
     function toDb(linear) { return linear <= 0.001 ? -144 : -30 + linear * 30; }
 
+    // Config names are substrings of advertised display names ("Living Room"
+    // finds "Living Room TV"), so speaker identity matches either way around.
+    function sameSpeaker(a, b) {
+      a = (a || "").toLowerCase(); b = (b || "").toLowerCase();
+      return !!a && !!b && (a.includes(b) || b.includes(a));
+    }
+
     function renderVolume(s) {
       if (!volDragging) {
         const pct = Math.round((s.volume ?? 0.5) * 100);
         $("vol").value = pct; $("volpct").textContent = pct + "%";
       }
-      const live = s.speakers || [];
+      const v = s.video || {};
+      const streaming = (s.telemetry || {}).streaming;
+
+      // A display showing the mirrored screen is live too — its audio rides
+      // the mirror session instead of a speaker session, and the server
+      // routes its volume there. Video-only mirrors have nothing to adjust.
+      const mirror = v.forwarding && v.target ? { name: v.target, volume: v.targetVolume, mode: "mirror" } : null;
+      const live = (s.speakers || []).concat(mirror && v.carriesAudio ? [mirror] : []);
+      const knownCount = live.filter(sp => sp.volume != null).length;
       $("volnote").textContent = s.volumeIsAverage
-        ? `average of ${live.filter(sp => sp.volume != null).length} connected speaker${live.filter(sp => sp.volume != null).length === 1 ? "" : "s"} — moving it sets all speakers`
+        ? `average of ${knownCount} connected speaker${knownCount === 1 ? "" : "s"} — moving it sets all speakers`
         : "no live speaker volumes yet — moving it sets all speakers on connect";
 
-      // Selected-but-not-connected speakers get a disabled placeholder row.
-      const liveNames = new Set(live.map(sp => sp.name.toLowerCase()));
+      // Selected-but-not-live speakers get a disabled placeholder row.
       const pending = (s.selected || []).map(t => t.name).filter(Boolean)
-        .filter(n => !liveNames.has(n.toLowerCase()));
+        .filter(n => !live.some(sp => sameSpeaker(sp.name, n))
+                  && !(mirror && sameSpeaker(mirror.name, n)));
 
       $("voldivider").style.display = live.length + pending.length > 0 ? "" : "none";
       if (speakerDragging.size > 0) return;   // don't rebuild rows mid-drag
 
+      // Speakers connect when playback starts, so an idle hub isn't
+      // "connecting" to anything — say what's actually happening.
+      const pendingSub = streaming ? "connecting…" : "waiting for playback";
       const rows = live.map(sp => {
         const known = sp.volume != null;
         const pct = known ? Math.round(sp.volume * 100) : 50;
         const db = known ? toDb(sp.volume) : null;
-        const sub = known ? `${db <= -100 ? "muted" : db.toFixed(1) + " dB"} · ${escapeHtml(sp.mode)}` : "volume unknown";
+        const sub = known ? `${db <= -100 ? "muted" : db.toFixed(1) + " dB"} · ${escapeHtml(sp.mode)}` : `volume unknown · ${escapeHtml(sp.mode)}`;
         return `<div class="spvol">
           <span class="name">${escapeHtml(sp.name)}<span class="sub">${sub}</span></span>
           <input type="range" min="0" max="100" value="${pct}" data-name="${escapeAttr(sp.name)}" />
           <span class="pct num">${known ? pct + "%" : "—"}</span>
         </div>`;
-      }).concat(pending.map(n => `<div class="spvol">
-          <span class="name">${escapeHtml(n)}<span class="sub">connecting…</span></span>
+      }).concat(mirror && !v.carriesAudio ? [`<div class="spvol">
+          <span class="name">${escapeHtml(mirror.name)}<span class="sub">mirroring · video only</span></span>
+          <input type="range" min="0" max="100" value="50" disabled />
+          <span class="pct num">—</span>
+        </div>`] : []).concat(pending.map(n => `<div class="spvol">
+          <span class="name">${escapeHtml(n)}<span class="sub">${pendingSub}</span></span>
           <input type="range" min="0" max="100" value="50" disabled />
           <span class="pct num">—</span>
         </div>`));
@@ -472,6 +502,47 @@
         <tbody>${rows}</tbody></table>`;
     }
 
+    // ---- Screen mirroring --------------------------------------------------
+
+    function renderScreen(s) {
+      const v = s.video || {};
+      // The card stays hidden until a screen actually arrives — nobody wants a
+      // permanently empty panel for a feature they aren't using.
+      const show = v.receiving || v.forwarding || (v.source && v.source.framesReceived > 0);
+      $("screencard").style.display = show ? "" : "none";
+      if (!show) return;
+
+      const line = !v.receiving
+        ? "No screen is mirroring to the hub."
+        : v.forwarding
+          ? `Mirroring ${escapeHtml(v.source.resolution || "a screen")} to ${escapeHtml(v.target || "the display")}.`
+          : `Receiving ${escapeHtml(v.source.resolution || "a screen")} — not forwarding (set AirPlaySender:VideoTarget to send it on).`;
+      $("screenline").textContent = line;
+
+      const dd = (k, val) => `<div><dt>${k}</dt><dd class="num">${val}</dd></div>`;
+      $("screengrid").innerHTML =
+        dd("receiving", v.receiving ? "yes" : "no") +
+        dd("source", escapeHtml(v.source.resolution || "—")) +
+        dd("frames in", (v.source.framesReceived ?? 0).toLocaleString()) +
+        dd("forwarding to", escapeHtml(v.target || "—")) +
+        dd("pairing", escapeHtml(v.pairing || "—")) +
+        dd("packets out", (v.packetsSent ?? 0).toLocaleString()) +
+        dd("data out", fmtBytes(v.bytesSent)) +
+        dd("frames dropped", (v.framesDropped ?? 0).toLocaleString()) +
+        dd("audio", v.forwarding ? (v.carriesAudio ? `${(v.audioPacketsSent ?? 0).toLocaleString()} pkts` : "not granted") : "—") +
+        dd("volume", v.targetVolume != null ? Math.round(v.targetVolume * 100) + "%" : "—") +
+        dd("render lead", fmtMs(v.leadMs)) +
+        dd("timing queries", (v.timingQueriesAnswered ?? 0).toLocaleString());
+    }
+
+    function fmtBytes(n) {
+      if (!n) return "—";
+      const units = ["B", "KB", "MB", "GB"];
+      let value = n, unit = 0;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+      return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+    }
+
     // ---- Lights (WLED) -----------------------------------------------------
 
     const LIGHT_MODES = ["Pulse", "Vu", "Spectrum"];
@@ -564,6 +635,8 @@
 
     function renderSpeakers(s) {
       const connected = new Set((s.connected || []).map(x => x.toLowerCase()));
+      const v = s.video || {};
+      const mirrorTarget = v.forwarding ? v.target : null;
       const el = $("speakers");
       const list = s.discovered || [];
       if (list.length === 0) {
@@ -573,7 +646,8 @@
       protocols = Object.fromEntries(list.map(sp => [sp.id, sp.protocol || "Auto"]));
       el.innerHTML = list.map(sp => {
         const checked = selectedIds.has(sp.id) ? "checked" : "";
-        const live = connected.has(sp.name.toLowerCase()) ? '<span class="cbadge">connected</span>' : "";
+        const live = sameSpeaker(sp.name, mirrorTarget) ? '<span class="cbadge mirror">mirroring</span>'
+          : connected.has(sp.name.toLowerCase()) ? '<span class="cbadge">connected</span>' : "";
         const proto = sp.protocol === "AirPlay2" ? "AirPlay 2" : "RAOP";
         return `<div class="speaker">
           <input type="checkbox" id="sp_${cssId(sp.id)}" data-id="${escapeAttr(sp.id)}" ${checked} />
@@ -606,6 +680,7 @@
         renderSync(s);
         renderTech(s);
         renderSpeakers(s);
+        renderScreen(s);
         renderLights(s);
       } catch (e) { /* transient */ }
     }

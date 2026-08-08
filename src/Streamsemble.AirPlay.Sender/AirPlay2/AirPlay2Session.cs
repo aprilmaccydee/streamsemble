@@ -390,185 +390,18 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         return client.SharedSecret ?? throw new InvalidOperationException("transient pairing produced no shared secret");
     }
 
-    private System.Net.Sockets.TcpClient? _eventChannel;
+    private AirPlay2EventChannel? _eventChannel;
 
     private async Task ConnectEventChannelAsync(int port, CancellationToken ct)
     {
-        for (var attempt = 0; attempt < 5; attempt++)
+        _eventChannel = new AirPlay2EventChannel(DisplayName, address, _keys!, logger)
         {
-            try
-            {
-                var client = new System.Net.Sockets.TcpClient(address.AddressFamily);
-                await client.ConnectAsync(address, port, ct).ConfigureAwait(false);
-                _eventChannel = client;
-                logger.LogInformation("{Name}: event channel connected on :{Port}", DisplayName, port);
-                _ = ReadEventChannelAsync(client);
-                return;
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                logger.LogDebug("{Name}: event channel connect attempt {Attempt} failed ({Message})", DisplayName, attempt + 1, ex.Message);
-                await Task.Delay(500, ct).ConfigureAwait(false);
-            }
-        }
-
-        logger.LogWarning("{Name}: could not connect event channel on :{Port}; continuing anyway", DisplayName, port);
+            OnClosed = () => IsAlive = false,
+        };
+        await _eventChannel.ConnectAsync(port, ct).ConfigureAwait(false);
     }
 
     private HapSessionKeys? _keys;
-
-    /// <summary>
-    /// The events channel is a reverse RTSP connection: the receiver sends
-    /// HAP-encrypted requests to the sender and expects 200 responses. Leaving
-    /// them unanswered makes receivers drop the channel (and can gate
-    /// rendering), so decrypt, log and acknowledge everything.
-    /// </summary>
-    private async Task ReadEventChannelAsync(System.Net.Sockets.TcpClient client)
-    {
-        try
-        {
-            var stream = client.GetStream();
-            var readKey = _keys!.EventsReadKey;
-            var writeKey = _keys.EventsWriteKey;
-            var keyResolved = false;
-            ulong readCounter = 0, writeCounter = 0;
-            var plaintext = new List<byte>();
-            var lengthHeader = new byte[2];
-
-            while (true)
-            {
-                if (!await ReadExactAsync(stream, lengthHeader).ConfigureAwait(false))
-                {
-                    logger.LogInformation("{Name}: event channel closed by receiver", DisplayName);
-                    IsAlive = false;
-                    return;
-                }
-
-                var length = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(lengthHeader);
-                var body = new byte[length + 16];
-                if (!await ReadExactAsync(stream, body).ConfigureAwait(false))
-                {
-                    logger.LogInformation("{Name}: event channel closed mid-frame", DisplayName);
-                    IsAlive = false;
-                    return;
-                }
-
-                byte[] plain;
-                var nonce = PairingCrypto.CounterNonce(readCounter);
-                try
-                {
-                    plain = PairingCrypto.ChaCha20Poly1305Decrypt(readKey, nonce, body, lengthHeader);
-                }
-                catch when (!keyResolved)
-                {
-                    // The HKDF info names are receiver-perspective; some stacks
-                    // interpret them the other way. Lock onto whichever works.
-                    (readKey, writeKey) = (writeKey, readKey);
-                    plain = PairingCrypto.ChaCha20Poly1305Decrypt(readKey, nonce, body, lengthHeader);
-                    logger.LogInformation("{Name}: events keys were swapped relative to expectation", DisplayName);
-                }
-
-                keyResolved = true;
-                readCounter++;
-                plaintext.AddRange(plain);
-
-                while (TryTakeRtspRequest(plaintext, out var requestLine, out var cseq, out var requestBody))
-                {
-                    var bodyNote = requestBody.Length > 0 && PropertyListParser.Parse(requestBody) is NSDictionary plist
-                        ? $" plist: {plist.ToXmlPropertyList()}"
-                        : requestBody.Length > 0 ? $" body {requestBody.Length} B" : "";
-                    logger.LogInformation("{Name}: event rx: {Line}{Body}", DisplayName, requestLine, bodyNote);
-
-                    var response = System.Text.Encoding.ASCII.GetBytes(
-                        $"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nServer: AirTunes/745.83\r\nContent-Length: 0\r\n\r\n");
-                    var respHeader = new byte[2];
-                    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(respHeader, (ushort)response.Length);
-                    var respNonce = PairingCrypto.CounterNonce(writeCounter++);
-                    var encrypted = PairingCrypto.ChaCha20Poly1305Encrypt(writeKey, respNonce, response, respHeader);
-                    await stream.WriteAsync(respHeader).ConfigureAwait(false);
-                    await stream.WriteAsync(encrypted).ConfigureAwait(false);
-                }
-            }
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            logger.LogWarning(ex, "{Name}: event channel handler ended", DisplayName);
-        }
-    }
-
-    private static async Task<bool> ReadExactAsync(Stream stream, byte[] buffer)
-    {
-        var read = 0;
-        while (read < buffer.Length)
-        {
-            var n = await stream.ReadAsync(buffer.AsMemory(read)).ConfigureAwait(false);
-            if (n == 0)
-            {
-                return false;
-            }
-
-            read += n;
-        }
-
-        return true;
-    }
-
-    /// <summary>Extracts one complete RTSP/HTTP-style request from the plaintext buffer, if present.</summary>
-    private static bool TryTakeRtspRequest(List<byte> buffer, out string requestLine, out string cseq, out byte[] body)
-    {
-        requestLine = "";
-        cseq = "0";
-        body = [];
-
-        var bytes = buffer.ToArray();
-        var headerEnd = -1;
-        for (var i = 0; i + 3 < bytes.Length; i++)
-        {
-            if (bytes[i] == '\r' && bytes[i + 1] == '\n' && bytes[i + 2] == '\r' && bytes[i + 3] == '\n')
-            {
-                headerEnd = i + 4;
-                break;
-            }
-        }
-
-        if (headerEnd < 0)
-        {
-            return false;
-        }
-
-        var headerText = System.Text.Encoding.ASCII.GetString(bytes, 0, headerEnd);
-        var lines = headerText.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
-        var contentLength = 0;
-        foreach (var line in lines.Skip(1))
-        {
-            var colon = line.IndexOf(':');
-            if (colon <= 0)
-            {
-                continue;
-            }
-
-            var name = line[..colon].Trim();
-            var value = line[(colon + 1)..].Trim();
-            if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
-            {
-                _ = int.TryParse(value, out contentLength);
-            }
-            else if (name.Equals("CSeq", StringComparison.OrdinalIgnoreCase))
-            {
-                cseq = value;
-            }
-        }
-
-        if (bytes.Length < headerEnd + contentLength)
-        {
-            return false; // body not fully received yet
-        }
-
-        requestLine = lines[0];
-        body = bytes[headerEnd..(headerEnd + contentLength)];
-        buffer.RemoveRange(0, headerEnd + contentLength);
-        return true;
-    }
 
     /// <summary>
     /// Queries /info post-pairing and returns the receiver's feature bitmask
@@ -1084,8 +917,15 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 // the instant it arrives — no hardcoded skew.
                 if (!_anchorHeld && !_anchored && _bufferedFramesSent * samplesPerFrame >= 44100)
                 {
+                    // Content age = measured pipeline dwell + the encoder's
+                    // priming: the AU carrying rtpTime R decodes to content
+                    // captured EncoderDelaySamples before R, and a raw-frame
+                    // receiver plays every AU verbatim, so the anchor must
+                    // state decode-output time or the whole stream renders
+                    // that much late (23 ms vs the ALAC paths, which have no
+                    // codec delay).
                     var ageSamples = _aac is { } aac
-                        ? Math.Max(0, aac.PcmSamplesIn - (_bufferedFramesSent + _bufferedFramesDropped) * samplesPerFrame)
+                        ? Math.Max(0, aac.PcmSamplesIn - (_bufferedFramesSent + _bufferedFramesDropped) * samplesPerFrame) + AacEncoderPipe.EncoderDelaySamples
                         : 0;
                     // Capture-counter index of the frame being anchored (ALAC
                     // has no encoder pipeline; its packed-queue skew was never

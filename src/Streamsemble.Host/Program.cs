@@ -3,12 +3,15 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Streamsemble.AirPlay.Receiver;
+using Streamsemble.AirPlay.Receiver.Video;
 using Streamsemble.AirPlay.Sender;
 using Streamsemble.AirPlay.Sender.AirPlay2;
+using Streamsemble.AirPlay.Sender.Video;
 using Streamsemble.Cast.Stub;
 using Streamsemble.Core;
 using Streamsemble.Core.Abstractions;
 using Streamsemble.Core.Audio;
+using Streamsemble.Core.Video;
 using Streamsemble.Discovery;
 using Streamsemble.Host;
 using Streamsemble.Spotify;
@@ -94,7 +97,60 @@ if (builder.Configuration.GetValue("Streamsemble:TestTone", false))
 
 builder.Services.AddSingleton<AirPlayReceiverSource>();
 builder.Services.AddSingleton<IAudioSource>(sp => sp.GetRequiredService<AirPlayReceiverSource>());
+// Screen mirroring's video half. It is a singleton alongside the audio source
+// because one mirror session feeds both: the Mac's picture arrives on the
+// type-110 stream while its sound keeps flowing through the audio path, and
+// both are stamped on the same grandmaster clock so they stay together.
+builder.Services.AddSingleton<MirrorVideoSource>();
 builder.Services.AddHostedService<AirPlayReceiverService>();
+
+// Video fan-out: the mirrored screen goes back out to the display named by
+// AirPlaySender:VideoTarget. It rides the SAME grandmaster clock the speakers
+// do — the mirror timing server serves that clock, and every frame carries the
+// render deadline the Mac stated — so picture and sound land together without
+// either side estimating the other's delay.
+builder.Services.AddSingleton<MirrorNtpServer>(sp =>
+    new MirrorNtpServer(sp.GetRequiredService<ILogger<MirrorNtpServer>>()));
+builder.Services.AddSingleton<VideoTargetGroup>();
+// While a display is showing the mirrored screen it gets its audio through the
+// mirror session, so the speaker fan-out must not also stream to it — a TV that
+// accepts only one AirPlay session at a time will drop the mirror when a second
+// one arrives.
+//
+// The trigger is the INBOUND source going active, not the outbound session
+// coming up: the speaker group reconciles as soon as audio starts flowing,
+// which is before the outbound mirror has finished connecting, so keying off
+// the outbound session loses the race and the TV gets both.
+builder.Services.AddSingleton<IHostedService>(sp =>
+{
+    var audio = sp.GetRequiredService<AirPlayTargetGroup>();
+    var mirror = sp.GetRequiredService<MirrorVideoSource>();
+    var video = sp.GetRequiredService<VideoTargetGroup>();
+    var configured = sp.GetRequiredService<IOptions<AirPlaySenderOptions>>().Value.VideoTarget;
+    audio.ActiveVideoTargetName = () => mirror.IsActive ? configured : null;
+
+    // The mirror session carries a type-96 companion audio stream, so the
+    // excluded display still gets sound — through the one session it can hold.
+    // The send loop hands each paced frame (and its audible instant) over.
+    audio.MirrorCarriesAudio = true;
+    audio.MirrorAudioSink = video.WriteAudioAsync;
+
+    // A realtime mirror's stamps lead by less than the speakers' group
+    // latency, so the audio timeline runs uniformly late by the deficit; the
+    // picture must trail by exactly the same amount to keep lip sync.
+    video.AudioTimelineShiftNanos = () => audio.StampShiftNanos;
+
+    // And if the group is ALREADY streaming to that TV when mirroring starts,
+    // reconcile again so it is dropped (and taken back when mirroring ends).
+    mirror.ActiveChanged += (_, _) => _ = audio.ReconcileAsync(CancellationToken.None);
+    return new NoopHostedService();
+});
+builder.Services.AddSingleton<IVideoSink>(sp => sp.GetRequiredService<VideoTargetGroup>());
+builder.Services.AddSingleton(sp => new VideoPump(
+    sp.GetRequiredService<MirrorVideoSource>(),
+    sp.GetRequiredService<IVideoSink>(),
+    sp.GetRequiredService<ILogger<VideoPump>>()));
+builder.Services.AddHostedService<VideoPumpService>();
 
 // Lighting: WLED UDP realtime. The lighting service turns the tapped frame
 // stream into per-strip light shows, and schedules every light frame on the
@@ -138,7 +194,15 @@ if (configuredTargets.Count > 0)
 _ = app.Services.GetRequiredService<WledDeviceGroup>();
 
 app.UseDefaultFiles();
-app.UseStaticFiles();
+// no-cache ≠ don't cache: the browser may keep a copy but must revalidate
+// before using it (a 304 when unchanged). Without this there is no
+// Cache-Control at all and browsers cache heuristically off Last-Modified —
+// after a redeploy the UI keeps rendering with the previous page's script
+// against the new API until someone thinks to hard-refresh.
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = ctx => ctx.Context.Response.Headers.CacheControl = "no-cache",
+});
 app.MapStreamsembleApi();
 app.MapFallbackToFile("index.html");
 

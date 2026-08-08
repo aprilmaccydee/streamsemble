@@ -12,6 +12,14 @@ public sealed class AirPlaySenderOptions
 
     /// <summary>mDNS scan time when resolving targets by name.</summary>
     public double ScanSeconds { get; set; } = 4;
+
+    /// <summary>
+    /// Display to send the mirrored screen to, by advertised name or host.
+    /// Matched against <see cref="Targets"/> first so a configured entry's port
+    /// and latency trim apply; unset means video is received but not forwarded,
+    /// which is still useful on its own.
+    /// </summary>
+    public string? VideoTarget { get; set; }
 }
 
 public sealed class AirPlayTargetOptions

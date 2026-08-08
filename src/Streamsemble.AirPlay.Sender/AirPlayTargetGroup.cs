@@ -358,14 +358,30 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     private TargetBase? _sourceTargetBase;
 
     /// <summary>
+    /// Uniform lateness the whole timeline runs behind the source's render
+    /// stamps, set at anchor when the stamps lead by less than the group
+    /// latency (a realtime mirror's do — its transmission lead is ~170 ms).
+    /// Zero for a source with real margin. Published so the OTHER renderers
+    /// of the same content — the mirrored display's picture, the lights —
+    /// trail by the identical amount and stay in lock-step with the audio.
+    /// </summary>
+    private long _stampShiftNanos;
+
+    public long StampShiftNanos => Volatile.Read(ref _stampShiftNanos);
+
+    /// <summary>
     /// Render stamp for a capture index on the current timeline, or -1 when
     /// the source is unstamped. Sessions anchor receivers directly at this —
-    /// the source's own render deadline — instead of "now + latency − age".
+    /// the source's own render deadline, plus the timeline's uniform shift —
+    /// instead of "now + latency − age".
     /// </summary>
     private long TargetNanosForCapture(long captureSample)
     {
         var b = Volatile.Read(ref _sourceTargetBase);
-        return b is null ? -1 : b.TargetNanos + (captureSample - b.CaptureTs) * 1_000_000_000L / 44100;
+        return b is null
+            ? -1
+            : b.TargetNanos + Volatile.Read(ref _stampShiftNanos)
+              + (captureSample - b.CaptureTs) * 1_000_000_000L / 44100;
     }
 
     /// <summary>
@@ -383,7 +399,8 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     {
         if (Volatile.Read(ref _sourceTargetBase) is { } stamped)
         {
-            var nanos = stamped.TargetNanos + (captureSample - stamped.CaptureTs) * 1_000_000_000L / 44100;
+            var nanos = stamped.TargetNanos + Volatile.Read(ref _stampShiftNanos)
+                        + (captureSample - stamped.CaptureTs) * 1_000_000_000L / 44100;
             return (nanos - Timing.Ptp.PtpReceiverClock.NowNanos) / 1e9;
         }
 
@@ -457,6 +474,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _timestampBase = null;
         _sourceEpochNanos = long.MaxValue;
         _sourceTargetBase = null;
+        _stampShiftNanos = 0;
         _staleDroppedSamples = 0;
         _rtpHead = _rtpBase;
         _sendMarker = true;
@@ -479,6 +497,58 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         await ReconcileAsync(ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Set by the host to the display currently receiving mirrored video, so
+    /// that speaker reconciliation can leave it out. Null when nothing is
+    /// mirroring, which is the ordinary case.
+    ///
+    /// Only meaningful once the mirror session carries audio itself. Until it
+    /// does, excluding the display leaves it with NO sound rather than sound
+    /// from a better source, so <see cref="MirrorCarriesAudio"/> gates it.
+    /// </summary>
+    public Func<string?>? ActiveVideoTargetName { get; set; }
+
+    /// <summary>
+    /// Whether the outbound mirror session sends audio as well as video.
+    /// <c>MirrorSenderSession</c> opens a type-96 companion stream alongside
+    /// the video and <see cref="MirrorAudioSink"/> feeds it, so the exclusion
+    /// applies: the display gets ALL its media through the one mirror session
+    /// it can hold.
+    /// </summary>
+    public bool MirrorCarriesAudio { get; set; }
+
+    /// <summary>
+    /// Where the mirrored display's audio goes: wired by the host to the video
+    /// group's <c>WriteAudioAsync</c>. The send loop invokes it with each frame
+    /// it just paced and the grandmaster instant that frame turns audible, so
+    /// the display renders on the same instant the speakers do. Same hook
+    /// pattern as <see cref="ActiveVideoTargetName"/> — the audio group stays
+    /// ignorant of the video pipeline's shape.
+    /// </summary>
+    public Func<ReadOnlyMemory<byte>, long, CancellationToken, ValueTask>? MirrorAudioSink { get; set; }
+
+    private bool IsActiveVideoTarget(AirPlayTargetOptions target)
+    {
+        if (!MirrorCarriesAudio || ActiveVideoTargetName?.Invoke() is not { Length: > 0 } videoTarget)
+        {
+            return false;
+        }
+
+        // Same substring match the mDNS resolver uses, so "Living room" in
+        // config finds "Living room TV" on the network.
+        var match = (target.Name?.Contains(videoTarget, StringComparison.OrdinalIgnoreCase) ?? false)
+            || (videoTarget.Contains(target.Name ?? "\u0000", StringComparison.OrdinalIgnoreCase))
+            || (target.Host?.Equals(videoTarget, StringComparison.OrdinalIgnoreCase) ?? false);
+        if (match)
+        {
+            _logger.LogInformation(
+                "{Name} is showing the mirrored screen — leaving it out of the speaker group so it does not play the audio twice",
+                target.Name ?? target.Host);
+        }
+
+        return match;
+    }
+
     private static string TargetKey(AirPlayTargetOptions target)
         => target.Host is { } host ? $"host:{host}:{target.Port}" : $"name:{target.Name}";
 
@@ -499,7 +569,13 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 return;
             }
 
-            var desired = _selectedTargets.Current.ToDictionary(TargetKey, t => t, StringComparer.OrdinalIgnoreCase);
+            // A display receiving the mirrored screen gets its audio through
+            // the mirror session itself, so it must NOT also be a member of the
+            // buffered speaker group: it would receive the same content twice,
+            // on two independently-anchored timelines, and play both.
+            var desired = _selectedTargets.Current
+                .Where(t => !IsActiveVideoTarget(t))
+                .ToDictionary(TargetKey, t => t, StringComparer.OrdinalIgnoreCase);
             string[] liveKeys;
             lock (_gate)
             {
@@ -714,6 +790,18 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         CancellationToken ct,
         IReadOnlyList<Streamsemble.Discovery.ResolvedTarget>? preScanned = null)
     {
+        // A reconcile can be mid-flight when the stream stops (the mirror
+        // ending re-adds the display in the same instant the arbiter tears
+        // the stream down); the shared control channel is gone then, and a
+        // session without it is unanchorable. Snapshot rather than trust —
+        // the next StartStream reconciles again with everything in place.
+        if (_control is not { } control)
+        {
+            _logger.LogInformation("{Name}: connect skipped — the stream stopped mid-reconcile",
+                target.Name ?? target.Host);
+            return null;
+        }
+
         try
         {
             var scanTime = TimeSpan.FromSeconds(_options.Value.ScanSeconds);
@@ -790,7 +878,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 ap2.GroupAnchor = _groupAnchor;
                 ap2.TrueContentAgeSamples = TrueCaptureAgeSamples;
                 ap2.TargetNanosForCapture = TargetNanosForCapture;
-                await ap2.ConnectAsync(_timingResponder.Port, _control!.Port, _seq, startRtp, ct).ConfigureAwait(false);
+                await ap2.ConnectAsync(_timingResponder.Port, control.Port, _seq, startRtp, ct).ConfigureAwait(false);
                 session = ap2;
             }
             else
@@ -807,7 +895,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 };
 
                 var raop = new RaopSession(name, address, port, encrypted, target.LatencyTrimMs, _logger);
-                await raop.ConnectAsync(_aesKey, _aesIv, _control!.Port, _timingResponder.Port, _seq, startRtp, ct).ConfigureAwait(false);
+                await raop.ConnectAsync(_aesKey, _aesIv, control.Port, _timingResponder.Port, _seq, startRtp, ct).ConfigureAwait(false);
                 session = raop;
             }
 
@@ -923,20 +1011,23 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 if (_timestampBase is null)
                 {
                     // Skip backlog that predates the (re)start: playing it
-                    // would set the whole timeline late by its age. A stamped
-                    // frame (live source) is stale when its render deadline
-                    // no longer allows the group latency to elapse before it;
-                    // an unstamped one when its sample-clock age exceeds
-                    // MaxStartBacklogSeconds. Order is monotonic, so once a
-                    // fresh frame arrives nothing older follows.
+                    // would set the whole timeline late by its age. Staleness
+                    // is the frame's wall-true EMIT age — how long ago the
+                    // source produced it — never its render deadline: a live
+                    // realtime mirror emits frames whose deadlines lead by
+                    // less than the group latency, and measuring those against
+                    // deliverability declared every frame it would ever send
+                    // stale and dropped the stream whole. An unmeetable
+                    // deadline on a FRESH frame is the anchor clamp's job
+                    // below (uniform lateness), not a reason to skip. Order is
+                    // monotonic, so once a fresh frame arrives nothing older
+                    // follows.
                     var nowNs = Timing.Ptp.PtpReceiverClock.NowNanos;
                     var groupLatencyNs = (long)(AirPlay2.AirPlay2Session.GroupPresentationLatencySeconds * 1_000_000_000);
                     var epochNs = Volatile.Read(ref _sourceEpochNanos);
-                    var stale = frame.TargetNanos > 0
-                        ? frame.TargetNanos - groupLatencyNs < nowNs
-                        : epochNs != long.MaxValue
-                            && nowNs - (epochNs + frame.Timestamp * 1_000_000_000L / 44100)
-                                > (long)(MaxStartBacklogSeconds * 1_000_000_000);
+                    var stale = epochNs != long.MaxValue
+                        && nowNs - (epochNs + frame.Timestamp * 1_000_000_000L / 44100)
+                            > (long)(MaxStartBacklogSeconds * 1_000_000_000);
                     if (stale)
                     {
                         _staleDroppedSamples += frame.SampleCount;
@@ -960,27 +1051,32 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                         // every receiver mode — buffered anchor and realtime
                         // pacing alike — presents it on the stated instant.
                         // No StartLead, no dwell estimate: the timeline IS the
-                        // source's intent. (The clamp only fires if the stamp
-                        // is impossibly close — budget too small — and the
-                        // deficit is logged as lateness, never silence.)
+                        // source's intent. The clamp fires when the stamps
+                        // lead by less than the group latency (a realtime
+                        // mirror's do): the whole timeline then runs uniformly
+                        // late by the deficit — logged, and published as
+                        // StampShiftNanos so the picture and the lights trail
+                        // by the same amount — never silence.
                         var dueOffset = (frame.TargetNanos - nowNs - groupLatencyNs) / 1e9;
+                        var clampedOffset = Math.Max(dueOffset, 0.01);
                         if (dueOffset < 0.01)
                         {
                             _logger.LogWarning(
-                                "source render stamp leaves no send margin ({Deficit:F0} ms short) — audio will trail by that much",
-                                (0.01 - dueOffset) * 1000);
-                            dueOffset = 0.01;
+                                "source render stamp leaves no send margin ({Deficit:F0} ms short) — the whole timeline (audio, picture, lights) trails by that much",
+                                (clampedOffset - dueOffset) * 1000);
                         }
 
-                        _anchorSeconds = _clock.NowSeconds + dueOffset;
+                        Volatile.Write(ref _stampShiftNanos, (long)((clampedOffset - dueOffset) * 1e9));
+                        _anchorSeconds = _clock.NowSeconds + clampedOffset;
                         Volatile.Write(ref _sourceTargetBase, new TargetBase(frame.Timestamp, frame.TargetNanos));
                         _logger.LogInformation(
                             "send timeline derived from source render stamps (first frame audible in {Ms:F0} ms, ts={Ts})",
-                            (frame.TargetNanos - nowNs) / 1e6, frame.Timestamp);
+                            (frame.TargetNanos + Volatile.Read(ref _stampShiftNanos) - nowNs) / 1e6, frame.Timestamp);
                     }
                     else
                     {
                         _anchorSeconds = _clock.NowSeconds + StartLeadSeconds;
+                        Volatile.Write(ref _stampShiftNanos, 0);
                         Volatile.Write(ref _sourceTargetBase, null);
                         _logger.LogInformation("send timeline re-based (frame ts={Ts})", frame.Timestamp);
                     }
@@ -1098,6 +1194,23 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                     }
 
                     session.NoteRtpTime(rtpTime);
+                }
+
+                // The mirrored display is not a session — it gets this same
+                // frame through the mirror's companion audio stream, stamped
+                // with the instant the group turns it audible.
+                if (MirrorCarriesAudio && MirrorAudioSink is { } mirrorAudio
+                    && SecondsUntilAudible(frame.Timestamp) is { } untilAudible)
+                {
+                    var audibleNanos = Timing.Ptp.PtpReceiverClock.NowNanos + (long)(untilAudible * 1e9);
+                    try
+                    {
+                        await mirrorAudio(pcm, audibleNanos, ct).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger.LogDebug(ex, "mirror audio forward failed");
+                    }
                 }
 
                 _seq++;
@@ -1265,6 +1378,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _timestampBase = null;
         _sourceEpochNanos = long.MaxValue;
         _sourceTargetBase = null;
+        _stampShiftNanos = 0;
         _sendMarker = true;
         _sendFirstSync = true;
         _syncPending = true;

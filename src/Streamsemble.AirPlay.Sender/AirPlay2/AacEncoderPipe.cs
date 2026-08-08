@@ -14,6 +14,23 @@ public sealed class AacEncoderPipe : IDisposable
 {
     public const int SamplesPerFrame = 1024;
 
+    /// <summary>
+    /// Algorithmic delay (priming) of ffmpeg's native AAC encoder, in samples:
+    /// the AU emitted for input frame k decodes to input samples
+    /// [k·1024 − 1024, (k+1)·1024 − 1024) — AU 0 is pure priming. Raw AAC
+    /// frames on the wire carry no priming signaling (no edit list, no
+    /// iTunSMPB), so a receiver decodes and plays every AU verbatim, and the
+    /// sender must speak decode-output time when it maps RTP timestamps onto
+    /// the capture timeline; otherwise the whole stream renders exactly this
+    /// much late. The value is inherent to the encoder's single 1024-sample
+    /// MDCT window, not tuning — it changes only if the encoder does.
+    /// Measured against ffmpeg 8.1.2 (2026-08-08): an impulse at input sample
+    /// N lands at sample N+1024 of the naive ADTS round-trip
+    /// (encode with the arguments below, decode with
+    /// <c>ffmpeg -f aac -i pipe:0 -f s16le -ar 44100 -ac 2 pipe:1</c>).
+    /// </summary>
+    public const int EncoderDelaySamples = 1024;
+
     private readonly ILogger _logger;
     private readonly Process _process;
     private readonly Channel<byte[]> _frames = Channel.CreateBounded<byte[]>(

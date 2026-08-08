@@ -81,8 +81,8 @@ public sealed class AnchoredPcmScheduler(
                         _budgetWarned = true;
                         logger.LogWarning(
                             "anchored frame is {LateMs:F0} ms past its emit time — the hub group latency exceeds "
-                            + "the sender's transmission lead; audio will trail by about this much "
-                            + "(lower STREAMSEMBLE_GROUP_LATENCY)",
+                            + "the sender's transmission lead; the whole timeline (audio, picture, lights) trails "
+                            + "uniformly by about this much (lower STREAMSEMBLE_GROUP_LATENCY to shrink it)",
                             -aheadNs / 1e6);
                     }
 

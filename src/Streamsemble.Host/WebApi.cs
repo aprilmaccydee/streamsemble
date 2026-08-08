@@ -1,6 +1,8 @@
 using System.Net.Sockets;
 using Microsoft.Extensions.Options;
+using Streamsemble.AirPlay.Receiver.Video;
 using Streamsemble.AirPlay.Sender;
+using Streamsemble.AirPlay.Sender.Video;
 using Streamsemble.Core;
 using Streamsemble.Core.Abstractions;
 using Streamsemble.Discovery;
@@ -32,16 +34,27 @@ public static class WebApi
             DiscoveredTargetStore discovered,
             SelectedTargetStore selected,
             AirPlayTargetGroup group,
+            VideoTargetGroup video,
+            MirrorVideoSource mirror,
             WledDeviceGroup wled,
             PlaybackStatus status) =>
         {
             var meta = status.Metadata;
             var speakers = group.SpeakerStatuses();
             var telemetry = group.Telemetry();
+            var videoTelemetry = video.Telemetry();
             // The headline volume is what the speakers are actually at (their
             // mean), not the last slider position; slider position is the
-            // fallback while nothing is connected/known.
-            var averageVolume = group.AverageSpeakerVolume;
+            // fallback while nothing is connected/known. A mirroring display
+            // plays the group's audio too — through the mirror session, not a
+            // speaker session — so its volume belongs in the mean.
+            var knownVolumes = speakers.Select(sp => sp.Volume).OfType<float>().ToList();
+            if (videoTelemetry is { Streaming: true, CarriesAudio: true, TargetVolume: { } mirrorVolume })
+            {
+                knownVolumes.Add(mirrorVolume);
+            }
+
+            var averageVolume = knownVolumes.Count > 0 ? knownVolumes.Average() : (float?)null;
             return Results.Json(new
             {
                 activeSource = status.ActiveSource,
@@ -99,6 +112,7 @@ public static class WebApi
                     ledCount = d.LedCount,
                     protocol = d.Protocol.ToString(),
                 }),
+                video = BuildVideoState(videoTelemetry, mirror),
                 telemetry = new
                 {
                     streaming = telemetry.Streaming,
@@ -127,11 +141,20 @@ public static class WebApi
                 : Results.NotFound();
         });
 
-        app.MapPost("/api/speakers/volume", async (SpeakerVolumeRequest request, AirPlayTargetGroup group) =>
+        // Per-speaker volume. A display that is showing the mirrored screen is
+        // not a speaker session — its one AirPlay session is the mirror — so
+        // when the audio group doesn't know the name, the request falls
+        // through to the video group, which owns that session.
+        app.MapPost("/api/speakers/volume", async (SpeakerVolumeRequest request, AirPlayTargetGroup group, VideoTargetGroup video) =>
         {
             var volume = Math.Clamp(request.Volume, 0f, 1f);
-            return await group.SetSpeakerVolumeAsync(request.Name, volume)
-                ? Results.Ok(new { name = request.Name, volume })
+            if (await group.SetSpeakerVolumeAsync(request.Name, volume))
+            {
+                return Results.Ok(new { name = request.Name, volume });
+            }
+
+            return await video.SetTargetVolumeAsync(request.Name, volume)
+                ? Results.Ok(new { name = request.Name, volume, via = "mirror" })
                 : Results.NotFound(new { error = $"no live session named \"{request.Name}\"" });
         });
 
@@ -164,11 +187,14 @@ public static class WebApi
             return Results.Ok(new { count = targets.Count });
         });
 
-        app.MapPost("/api/volume", async (VolumeRequest request, IAudioSink sink, PlaybackStatus status) =>
+        app.MapPost("/api/volume", async (VolumeRequest request, IAudioSink sink, VideoTargetGroup video, PlaybackStatus status) =>
         {
             var volume = Math.Clamp(request.Volume, 0f, 1f);
             status.Volume = volume;
             await sink.SetVolumeAsync(volume);
+            // The mirrored display sits outside the speaker group but plays
+            // the same audio; "set all speakers" includes it.
+            await video.SetGroupVolumeAsync(volume);
             return Results.Ok(new { volume });
         });
 
@@ -311,6 +337,38 @@ public static class WebApi
             tone.DebugCutover();
             return Results.Ok(new { op = "cutover" });
         });
+    }
+
+    /// <summary>
+    /// Screen mirroring, both halves: what is arriving from the Mac and what is
+    /// going back out to the display. They are reported together because
+    /// "receiving but not forwarding" is a real and useful state — inbound
+    /// works on its own — and the UI has to be able to tell it apart from
+    /// nothing happening at all.
+    /// </summary>
+    private static object BuildVideoState(VideoTelemetry telemetry, MirrorVideoSource mirror)
+    {
+        return new
+        {
+            receiving = mirror.IsActive,
+            source = new
+            {
+                resolution = mirror.CodecConfig?.Describe(),
+                framesReceived = mirror.FramesEmitted,
+            },
+            forwarding = telemetry.Streaming,
+            target = telemetry.TargetName,
+            resolution = telemetry.Resolution,
+            pairing = telemetry.Pairing,
+            packetsSent = telemetry.PacketsSent,
+            bytesSent = telemetry.BytesSent,
+            framesDropped = telemetry.FramesDropped,
+            carriesAudio = telemetry.CarriesAudio,
+            targetVolume = telemetry.TargetVolume,
+            audioPacketsSent = telemetry.AudioPacketsSent,
+            timingQueriesAnswered = telemetry.TimingQueriesAnswered,
+            leadMs = telemetry.LeadMs,
+        };
     }
 
     private static async Task ReleaseQuietlyAsync(WledDevice device)

@@ -16,6 +16,13 @@ public sealed class HapSessionKeys
     public required byte[] ControlReadKey { get; init; }
     public required byte[] AudioKey { get; init; }
 
+    /// <summary>
+    /// The raw pairing secret, kept because a screen-mirroring session's
+    /// streams name no key and have to be keyed from it — and which derivation
+    /// they use is decided by trying them, so the input has to survive.
+    /// </summary>
+    public required byte[] SharedSecret { get; init; }
+
     /// <summary>Events channel: what the sender writes with (receiver's read key).</summary>
     public required byte[] EventsWriteKey { get; init; }
 
@@ -38,6 +45,7 @@ public sealed class HapSessionKeys
             ControlWriteKey = controllerRole ? write : read,
             ControlReadKey = controllerRole ? read : write,
             AudioKey = sharedSecret[..32],
+            SharedSecret = sharedSecret,
             // Info names are receiver-perspective: the sender writes with the
             // "read" key and reads with the "write" key.
             EventsWriteKey = controllerRole ? eventsRead : eventsWrite,

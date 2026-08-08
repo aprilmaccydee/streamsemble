@@ -132,6 +132,20 @@ public static class FairPlaySetup
     /// <summary>Mode-indexed table of the four 142-byte phase 1 replies.</summary>
     private static readonly byte[][] ReplyMessages = { Reply0, Reply1, Reply2, Reply3 };
 
+    /// <summary>Offset of the encrypted 128-byte SAP body inside a phase 1 reply.</summary>
+    private const int ReplySapOffset = 14;
+
+    /// <summary>
+    /// The encrypted SAP body we hand a sender for <paramref name="mode"/>.
+    /// Its plaintext is the receiver's half of the key exchange, so a sender's
+    /// <c>ekey</c> can only be unwrapped against the reply we actually sent —
+    /// which is why the FairPlay decryptor reads it from here rather than
+    /// being handed a value from a capture.
+    /// </summary>
+    internal static ReadOnlySpan<byte> ReplySapBody(int mode) => (uint)mode < (uint)ReplyMessages.Length
+        ? ReplyMessages[mode].AsSpan(ReplySapOffset, 128)
+        : throw new ArgumentOutOfRangeException(nameof(mode), mode, "FairPlay mode must be 0..3");
+
     /// <summary>Fixed 12-byte fp-setup phase 2 reply header (FPLY 03 01 04 ...).</summary>
     private static readonly byte[] FpHeader =
     {

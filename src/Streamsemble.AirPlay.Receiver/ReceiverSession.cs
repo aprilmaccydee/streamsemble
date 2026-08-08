@@ -5,8 +5,11 @@ using System.Text;
 using Claunia.PropertyList;
 using Microsoft.Extensions.Logging;
 using Streamsemble.AirPlay.Common.Hap;
+using Streamsemble.AirPlay.Common.FairPlay;
+using Streamsemble.AirPlay.Common.Video;
 using Streamsemble.AirPlay.Receiver.Audio;
 using Streamsemble.AirPlay.Receiver.Rtsp;
+using Streamsemble.AirPlay.Receiver.Video;
 using Streamsemble.Core.Audio;
 using Streamsemble.Core.Metadata;
 using Streamsemble.Timing.Ptp;
@@ -30,9 +33,11 @@ public sealed record ReceiverIdentity(string Name, string DeviceId, string Pi, b
 public sealed class ReceiverSession(
     RtspServerConnection connection,
     AirPlayReceiverSource source,
+    MirrorVideoSource videoSource,
     ReceiverIdentity identity,
     PtpReceiverClock ptp,
     int presentationLatencySamples,
+    MirrorDisplay display,
     ILogger logger) : IRtspConnectionHandler
 {
     private readonly TransientPairSetupServer _pairSetup = new();
@@ -42,12 +47,44 @@ public sealed class ReceiverSession(
     private TcpListener? _eventListener;
     private BufferedAudioServer? _audioServer;
     private RealtimeAudioServer? _realtimeServer;
+    private MirrorDataServer? _mirrorServer;
+    private MirrorNtpClient? _mirrorTiming;
     private AacDecoderPipe? _decoder;
     private PacedPcmEmitter? _emitter;
     private AnchoredPcmScheduler? _scheduler;
     private UdpClient? _controlSocket;
     private CancellationTokenSource? _streamCts;
     private TrackMetadata _metadata = new();
+
+    /// <summary>
+    /// The 164-byte fp-setup phase-2 body, retained because a FairPlay-keyed
+    /// stream SETUP's <c>ekey</c> is only meaningful against it. Kept even
+    /// though senders steered to HAP never send one — the cost is 164 bytes and
+    /// the alternative is discovering mid-SETUP that the material is gone.
+    /// </summary>
+    private byte[]? _fairPlayKeyMessage;
+
+    /// <summary>
+    /// The sender's timing arrangement, captured at session SETUP. Under PTP
+    /// the hub IS the grandmaster, so a mirror packet's presentation stamp is
+    /// already on our timeline; under NTP the stamps are on the sender's clock
+    /// and have to be polled for. Getting this wrong does not fail loudly — it
+    /// silently offsets every video frame by the gap between two clocks.
+    /// </summary>
+    private bool _senderUsesPtpTiming;
+    private int _senderTimingPort;
+    private bool _senderIsMirroring;
+
+    /// <summary>
+    /// The FairPlay-wrapped stream key, when a sender sends one. It arrives in
+    /// the SESSION SETUP rather than the stream SETUP — the one place it is
+    /// easy to look past, since every other key on this connection travels with
+    /// the stream it belongs to. A transiently-paired macOS mirror sends none.
+    /// </summary>
+    private byte[]? _sessionEncryptedKey;
+
+    /// <summary>The session SETUP's <c>eiv</c> — the CBC IV a mirror's companion audio uses.</summary>
+    private byte[]? _sessionEncryptedIv;
 
     public Task<RtspReply> HandleAsync(RtspRequest request, CancellationToken ct)
     {
@@ -142,8 +179,41 @@ public sealed class ReceiverSession(
             { "volumeControlType", new NSNumber(3) },
             { "txtAirPlay", new NSData(BuildTxtAirPlay()) },
         };
+
+        // A sender sizes and paces its video encoder from this array, and
+        // without it a Mac completes the whole session — pairing, fp-setup,
+        // session SETUP, RECORD — and then tears down without ever asking for a
+        // video stream, because as far as it knows there is no screen here to
+        // send one to. Advertised only when mirroring is enabled: the audio
+        // negotiation is proven against an /info that has no displays key.
+        if (ReceiverFeatures.ScreenMirroringAdvertised)
+        {
+            info.Add("displays", new NSArray(BuildDisplay(display, identity.Pi)));
+        }
+
         return PlistReply(info);
     }
+
+    /// <summary>
+    /// The screen we claim to be. The uuid is derived from our stable identity
+    /// rather than generated per session, so a sender that remembers this
+    /// display across reconnects sees the same one.
+    /// </summary>
+    internal static NSDictionary BuildDisplay(MirrorDisplay display, string uuid) => new()
+    {
+        { "features", new NSNumber(14) },
+        { "height", new NSNumber(display.Height) },
+        { "heightPhysical", new NSNumber(0) },
+        { "heightPixels", new NSNumber(display.Height) },
+        { "maxFPS", new NSNumber(display.Fps) },
+        { "overscanned", new NSNumber(false) },
+        { "refreshRate", new NSNumber(display.Fps) },
+        { "rotation", new NSNumber(false) },
+        { "uuid", new NSString(uuid) },
+        { "width", new NSNumber(display.Width) },
+        { "widthPhysical", new NSNumber(0) },
+        { "widthPixels", new NSNumber(display.Width) },
+    };
 
     /// <summary>
     /// The TV's exact entry set (types 100/101/102, same audioType variants,
@@ -193,12 +263,22 @@ public sealed class ReceiverSession(
     {
         // With the Sonos-style features mask real senders never ask for this,
         // but the responder costs nothing and covers stricter SDKs.
-        var body = request.Body.Length switch
+        byte[] body;
+        switch (request.Body.Length)
         {
-            16 => FairPlaySetup.HandleSetupPhase1(request.Body),
-            164 => FairPlaySetup.HandleSetupPhase2(request.Body),
-            _ => throw new IOException($"unexpected fp-setup request length {request.Body.Length}"),
-        };
+            case 16:
+                body = FairPlaySetup.HandleSetupPhase1(request.Body);
+                break;
+            case 164:
+                // Retain it: a later stream SETUP may key itself with an ekey,
+                // which is meaningless without this exact message.
+                _fairPlayKeyMessage = request.Body;
+                body = FairPlaySetup.HandleSetupPhase2(request.Body);
+                break;
+            default:
+                throw new IOException($"unexpected fp-setup request length {request.Body.Length}");
+        }
+
         return new RtspReply { Body = body, ContentType = "application/octet-stream" };
     }
 
@@ -262,6 +342,23 @@ public sealed class ReceiverSession(
 
         // Ground truth for reply shapes: log what the Mac itself sends here.
         logger.LogDebug("SETUP session keys: {Keys}", string.Join(", ", plist.Keys));
+
+        // Mirror video stamps are read against whichever of these the sender
+        // chose, so capture it before any stream SETUP arrives.
+        _senderUsesPtpTiming = tp?.ToString().Contains("PTP", StringComparison.OrdinalIgnoreCase) ?? false;
+        _senderTimingPort = plist.TryGetValue("timingPort", out var senderTimingPort) && senderTimingPort is NSNumber port
+            ? (int)port.ToLong()
+            : 0;
+        if (plist.TryGetValue("ekey", out var sessionEkey) && sessionEkey is NSData ekeyData)
+        {
+            _sessionEncryptedKey = ekeyData.Bytes;
+            logger.LogInformation("session SETUP carries a FairPlay ekey ({Bytes} B)", _sessionEncryptedKey.Length);
+        }
+
+        if (plist.TryGetValue("eiv", out var sessionEiv) && sessionEiv is NSData eivData)
+        {
+            _sessionEncryptedIv = eivData.Bytes;
+        }
         if (plist.TryGetValue("timingPeerInfo", out var peerInfo))
         {
             logger.LogDebug("sender timingPeerInfo: {Info}", peerInfo.ToXmlPropertyList());
@@ -280,7 +377,20 @@ public sealed class ReceiverSession(
         // (rounds 3-6 were all this machine streaming to itself). Not binding
         // also keeps the receiver from hijacking the sender role's PtpEngine
         // ports mid-cast and preserves the loopback WAV rig.
-        if (IsOwnAddress(CleanAddress(connection.RemoteAddress)))
+        //
+        // A screen-mirroring session is NTP-timed and never speaks PTP, so
+        // starting the grandmaster for one only adds a peer that is tracked and
+        // dropped again with nothing in between. Start our own timing client
+        // against the sender instead — and start it HERE rather than at stream
+        // SETUP, so the offset has locked by the time the first video packet
+        // arrives; a frame whose stamp cannot be translated yet goes out
+        // unstamped and loses its place on the group timeline.
+        _senderIsMirroring = IsMirroringSession(plist);
+        if (_senderIsMirroring)
+        {
+            StartMirrorTiming();
+        }
+        else if (IsOwnAddress(CleanAddress(connection.RemoteAddress)))
         {
             logger.LogWarning(
                 "sender {Remote} is this machine — same-host AirPlay cannot form a PTP timing relationship, " +
@@ -305,7 +415,9 @@ public sealed class ReceiverSession(
         var reply = new NSDictionary
         {
             { "eventPort", new NSNumber(((IPEndPoint)_eventListener.LocalEndpoint).Port) },
-            { "timingPort", new NSNumber(0) },
+            // Dummy under PTP, but a mirroring sender is told the real port our
+            // timing client speaks from.
+            { "timingPort", new NSNumber(_mirrorTiming?.LocalPort ?? 0) },
             { "timingPeerInfo", new NSDictionary
                 {
                     { "Addresses", new NSArray(new NSString(local)) },
@@ -441,6 +553,8 @@ public sealed class ReceiverSession(
                 break;
             case 96:
                 return SetupRealtimeStream(stream);
+            case 110:
+                return SetupMirrorStream(stream);
             default:
                 logger.LogWarning("stream SETUP type {Type} not supported", type);
                 return RtspReply.Error(453, "Not Enough Bandwidth");
@@ -511,14 +625,37 @@ public sealed class ReceiverSession(
         // negotiation: streamConnections/streamConnectionID arrived here long
         // before any reference receiver code handled them.
         logger.LogDebug("realtime stream SETUP: {Stream}", stream.ToXmlPropertyList());
-        if (stream.TryGetValue("shk", out var shkObj) is false || shkObj is not NSData shk)
+
+        // A screen mirror's companion audio arrives here and names no key: it
+        // sets streamConnectionKeyUseStreamEncryptionKey and expects the key to
+        // come from the pairing, exactly as its video stream does.
+        // A mirror's companion audio names no key either, and sets the same
+        // streamConnectionKeyUseStreamEncryptionKey flag its video does — so
+        // try that stream's own data-stream derivation FIRST, then the older
+        // shapes. The Poly1305 tag picks the winner.
+        var audioKeys = StreamData(stream, "shk") is { Length: > 0 } shk
+            ? StreamKeyCandidates.Single(shk)
+            : [
+                .. StreamKeyCandidates.ForDataStream(_keys?.SharedSecret ?? [], StreamConnectionId(stream)),
+                .. StreamKeyCandidates.FromSharedSecret(_keys?.SharedSecret ?? []),
+            ];
+        if (audioKeys.Count == 0)
         {
+            logger.LogWarning("realtime stream SETUP named no key and the session established none");
             return RtspReply.Error(400, "Bad Request");
         }
 
         var streamId = StreamId(stream);
 
+        // ct 2 = ALAC (what macOS system output sends), ct 4 = AAC-LC (what a
+        // screen mirror's companion audio sends, at 1024 samples per frame).
+        var compression = stream.TryGetValue("ct", out var ctObj) ? (int)((NSNumber)ctObj).ToLong() : 2;
         var spf = stream.TryGetValue("spf", out var s) ? (int)((NSNumber)s).ToLong() : PcmFrame.SamplesPerFrame;
+        if (compression == 4)
+        {
+            return SetupRealtimeAacStream(stream, streamId, audioKeys, spf, MirrorAudioCipherOrNull());
+        }
+
         var alac = new AlacDecoder(AlacSpecificConfig(spf));
         _streamCts = new CancellationTokenSource();
 
@@ -541,7 +678,7 @@ public sealed class ReceiverSession(
         var pending = new List<byte>(PcmFrame.CanonicalFrameBytes * 2);
         var active = false;
         var nextRtp = 0u;
-        _realtimeServer = new RealtimeAudioServer(shk.Bytes, logger)
+        _realtimeServer = new RealtimeAudioServer(audioKeys, logger)
         {
             OnAnchor = scheduler.SetAnchor,
             OnPacket = (packet, _) =>
@@ -649,6 +786,337 @@ public sealed class ReceiverSession(
             { "streams", new NSArray(replyStream) },
         };
         return PlistReply(reply);
+    }
+
+    /// <summary>
+    /// The companion audio of a screen mirror: realtime transport like the ALAC
+    /// path above, but carrying AAC-LC at 1024 samples per frame rather than
+    /// ALAC at 352. It shares the ChaCha envelope, the 0xD7 anchors and the
+    /// scheduler; only the decoder differs.
+    ///
+    /// Decoding runs through ffmpeg, which returns PCM on a stream with no
+    /// timestamps of its own, so the RTP correspondence is reconstructed rather
+    /// than read: the cursor is seeded from the first packet's RTP time and
+    /// advances by the samples that come out. That holds because AAC-LC is
+    /// order-preserving and one frame in is one frame out — but it does inherit
+    /// the decoder's priming delay as a constant offset, which would show up as
+    /// a fixed lip-sync error rather than drift.
+    /// </summary>
+    /// <summary>
+    /// The CBC cipher a screen mirror's companion audio needs, or null for an
+    /// ordinary music session. A mirror's audio is keyed from exactly the same
+    /// material as its video — SHA-512(aesKey ‖ ecdhSecret)[:16] — with the
+    /// session SETUP's eiv as the IV, and carries no authentication tag.
+    /// </summary>
+    private MirrorAudioCipher? MirrorAudioCipherOrNull()
+    {
+        if (_keys?.SharedSecret is not { Length: > 0 } secret || !_senderIsMirroring)
+        {
+            return null;
+        }
+
+        ReadOnlySpan<byte> aesKey = default;
+        if (_sessionEncryptedKey is { Length: > 0 } ekey && _fairPlayKeyMessage is { } keyMessage)
+        {
+            aesKey = FairPlayKeys.UnwrapStreamKey(keyMessage, ekey);
+        }
+
+        var material = MirrorAesCtrCipher.DeriveKeyMaterial(aesKey, secret);
+        logger.LogInformation(
+            "mirror companion audio: AES-CBC keyed from the session material ({Source})",
+            aesKey.Length > 0 ? "FairPlay ekey + pairing secret" : "pairing secret only");
+        return new MirrorAudioCipher(material, _sessionEncryptedIv ?? new byte[16]);
+    }
+
+    private RtspReply SetupRealtimeAacStream(
+        NSDictionary stream, long streamId, IReadOnlyList<StreamKeyCandidate> audioKeys, int spf,
+        MirrorAudioCipher? mirrorCipher)
+    {
+        _streamCts = new CancellationTokenSource();
+        var decoder = new AacDecoderPipe(logger);
+        _decoder = decoder;
+
+        var scheduler = new AnchoredPcmScheduler((pcm, target) =>
+        {
+            source.MarkActive();
+            source.PushDecodedPcm(pcm, target);
+        }, logger, presentationLatencySamples * 1_000_000_000L / 44100);
+        _scheduler = scheduler;
+        _ = RunSchedulerAsync(scheduler, _streamCts.Token);
+
+        // Written by the socket read loop before any PCM can come back out of
+        // ffmpeg, read by the decode loop; -1 until the first packet lands.
+        long firstRtp = -1;
+        _ = RunAacDecodeLoopAsync(decoder, scheduler, () => Volatile.Read(ref firstRtp), _streamCts.Token);
+
+        var active = false;
+        Func<RealtimeAudioPacket, CancellationToken, ValueTask> onPacket = async (packet, ct) =>
+            {
+                if (Volatile.Read(ref firstRtp) < 0)
+                {
+                    Volatile.Write(ref firstRtp, packet.RtpTime);
+                }
+
+                if (!active)
+                {
+                    active = true;
+                    logger.LogInformation(
+                        "mirror companion audio flowing (AAC-LC, seq {Seq}, {Spf} samples/frame)", packet.Sequence, spf);
+                }
+
+                await decoder.WriteFrameAsync(packet.Frame, ct).ConfigureAwait(false);
+            };
+
+        // Verifiable keys first, CBC only as a last resort — ChaCha's tag can
+        // prove itself right, CBC can only fail silently.
+        _realtimeServer = new RealtimeAudioServer(audioKeys, logger)
+        {
+            OnAnchor = scheduler.SetAnchor,
+            OnPacket = onPacket,
+            LegacyCbcFallback = mirrorCipher,
+        };
+        _realtimeServer.Start();
+
+        logger.LogInformation("realtime AAC stream SETUP ok (data :{Data}, control :{Control})",
+            _realtimeServer.DataPort, _realtimeServer.ControlPort);
+        return PlistReply(new NSDictionary
+        {
+            { "streams", new NSArray(BuildRealtimeReply(stream, streamId, 96)) },
+        });
+    }
+
+    /// <summary>
+    /// Re-chunks ffmpeg's PCM into canonical frames and hands them to the
+    /// scheduler with a running RTP cursor.
+    /// </summary>
+    private async Task RunAacDecodeLoopAsync(
+        AacDecoderPipe decoder, AnchoredPcmScheduler scheduler, Func<long> firstRtp, CancellationToken ct)
+    {
+        try
+        {
+            var pending = new List<byte>(PcmFrame.CanonicalFrameBytes * 2);
+            var cursor = 0u;
+            var seeded = false;
+
+            await foreach (var chunk in decoder.Pcm.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                if (!seeded)
+                {
+                    if (firstRtp() < 0)
+                    {
+                        continue; // PCM before any packet is impossible, but do not guess a cursor
+                    }
+
+                    cursor = (uint)firstRtp();
+                    seeded = true;
+                }
+
+                pending.AddRange(chunk);
+                var offset = 0;
+                while (pending.Count - offset >= PcmFrame.CanonicalFrameBytes)
+                {
+                    var frame = new byte[PcmFrame.CanonicalFrameBytes];
+                    pending.CopyTo(offset, frame, 0, frame.Length);
+                    offset += frame.Length;
+                    scheduler.Enqueue(cursor, frame);
+                    cursor += PcmFrame.SamplesPerFrame;
+                }
+
+                pending.RemoveRange(0, offset);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "AAC decode loop failed");
+        }
+    }
+
+    /// <summary>
+    /// The realtime stream reply both codec paths share: ports, the echoed
+    /// connection id, and the streamConnections mirror the modern transport
+    /// reads its ports from.
+    /// </summary>
+    private NSDictionary BuildRealtimeReply(NSDictionary stream, long streamId, int type)
+    {
+        var replyStream = new NSDictionary
+        {
+            { "streamID", new NSNumber(streamId) },
+            { "type", new NSNumber(type) },
+            { "dataPort", new NSNumber(_realtimeServer!.DataPort) },
+            { "controlPort", new NSNumber(_realtimeServer.ControlPort) },
+        };
+        if (stream.TryGetValue("streamConnectionID", out var scid))
+        {
+            replyStream.Add("streamConnectionID", scid);
+        }
+
+        if (stream.ContainsKey("streamConnections"))
+        {
+            replyStream.Add("streamConnections", new NSDictionary
+            {
+                { "streamConnectionTypeRTP", new NSDictionary
+                    {
+                        { "streamConnectionKeyPort", new NSNumber(_realtimeServer.DataPort) },
+                        { "streamConnectionKeyUseStreamEncryptionKey", new NSNumber(true) },
+                    }
+                },
+                { "streamConnectionTypeRTCP", new NSDictionary
+                    {
+                        { "streamConnectionKeyPort", new NSNumber(_realtimeServer.ControlPort) },
+                    }
+                },
+            });
+        }
+
+        return replyStream;
+    }
+
+    /// <summary>
+    /// Screen mirroring (type 110): H.264 access units over their own TCP data
+    /// channel, keyed per stream and stamped on the sender's timing clock. The
+    /// shape is the video analogue of the realtime audio stream — we open a
+    /// listener, hand its port back as <c>dataPort</c>, and the sender connects
+    /// in — but the failure modes differ enough to be worth naming. There is no
+    /// loss and no reordering to tolerate (it is TCP), and there is no format
+    /// negotiation: the sender states its parameter sets in a config packet
+    /// once the channel is up, and we pass its H.264 through untouched.
+    /// </summary>
+    private RtspReply SetupMirrorStream(NSDictionary stream)
+    {
+        logger.LogInformation("mirror stream SETUP: {Stream}", stream.ToXmlPropertyList());
+
+        var connectionId = StreamConnectionId(stream);
+        var request = new MirrorKeyRequest(
+            SharedKey: StreamData(stream, "shk"),
+            EncryptedKey: StreamData(stream, "ekey") ?? _sessionEncryptedKey,
+            FairPlayKeyMessage: _fairPlayKeyMessage,
+            StreamConnectionId: connectionId,
+            SessionKey: _keys?.SharedSecret);
+
+        IMirrorStreamCipher cipher;
+        MirrorKeySource keySource;
+        try
+        {
+            cipher = request.Resolve(out keySource);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or ArgumentException)
+        {
+            // Refuse rather than accept and mis-key: a sender told no gives up
+            // cleanly, while one whose key we got wrong streams megabytes of
+            // undecodable video and reports nothing wrong at either end.
+            logger.LogWarning(ex, "mirror stream SETUP carried unusable key material");
+            return RtspReply.Error(400, "Bad Request");
+        }
+
+        var mapTimestamp = BuildMirrorTimestampMapping();
+
+        _mirrorServer = new MirrorDataServer(cipher, logger)
+        {
+            // The modern envelope is tried first: a HomeKit-paired sender keys
+            // its video with HKDF+ChaCha20-Poly1305, and only a legacy sender
+            // uses the AES-CTR scheme above. The Poly1305 tag decides, so this
+            // costs one packet and cannot pick wrong.
+            DataStreamCandidates = _keys?.SharedSecret is { Length: > 0 } dsSecret
+                ? MirrorDataStreamCipher.Candidates(dsSecret, connectionId)
+                : null,
+            MapTimestamp = mapTimestamp,
+            OnCodecConfig = videoSource.PushCodecConfig,
+            OnAccessUnit = (frame, _) =>
+            {
+                videoSource.MarkActive();
+                videoSource.PushAccessUnit(frame);
+                return ValueTask.CompletedTask;
+            },
+            OnClosed = videoSource.MarkIdle,
+        };
+        _mirrorServer.Start();
+
+        logger.LogInformation(
+            "mirror stream SETUP ok (data :{Data}, key {Key}, streamConnectionID {Id})",
+            _mirrorServer.Port, keySource.Describe(), connectionId);
+
+        var replyStream = new NSDictionary
+        {
+            { "streamID", new NSNumber(StreamId(stream)) },
+            { "type", new NSNumber(110) },
+            { "dataPort", new NSNumber(_mirrorServer.Port) },
+        };
+        if (stream.TryGetValue("streamConnectionID", out var scid))
+        {
+            replyStream.Add("streamConnectionID", scid);
+        }
+
+        return PlistReply(new NSDictionary { { "streams", new NSArray(replyStream) } });
+    }
+
+    /// <summary>
+    /// A session the sender opened to mirror its screen. macOS says so
+    /// outright; anything else declaring NTP timing with a port to poll is
+    /// treated the same way, since that combination only arises for video.
+    /// </summary>
+    private bool IsMirroringSession(NSDictionary plist) =>
+        (plist.TryGetValue("isScreenMirroringSession", out var flag) && flag is NSNumber { } n && n.ToBool())
+        || (!_senderUsesPtpTiming && _senderTimingPort > 0);
+
+    /// <summary>Starts polling the sender's clock, if it gave us somewhere to poll.</summary>
+    private void StartMirrorTiming()
+    {
+        if (_mirrorTiming is not null || _senderTimingPort <= 0)
+        {
+            return;
+        }
+
+        var peer = new IPEndPoint(CleanAddress(connection.RemoteAddress), _senderTimingPort);
+        _mirrorTiming = new MirrorNtpClient(peer, logger);
+        _mirrorTiming.Start();
+        logger.LogInformation("mirror timing: polling the sender's NTP clock at {Peer}", peer);
+    }
+
+    /// <summary>
+    /// Turns a mirror packet's presentation stamp into grandmaster nanoseconds.
+    /// Under PTP the sender has already disciplined to our clock, so the stamp
+    /// needs nothing but a format conversion; under NTP it is on a clock we
+    /// have to go and measure, and frames that arrive before that measurement
+    /// lands are emitted unstamped rather than scheduled against a guess.
+    /// </summary>
+    private Func<ulong, long> BuildMirrorTimestampMapping()
+    {
+        StartMirrorTiming();
+        if (_mirrorTiming is not { } timing)
+        {
+            logger.LogInformation(
+                "mirror stamps read directly on the hub grandmaster (sender offered no NTP clock to poll)");
+            return MirrorPacketHeader.PresentationStampToNanos;
+        }
+
+        return ntp => timing.IsLocked ? timing.ToLocalNanos(MirrorPacketHeader.PresentationStampToNanos(ntp)) : 0;
+    }
+
+    private static byte[]? StreamData(NSDictionary stream, string key) =>
+        stream.TryGetValue(key, out var value) && value is NSData data ? data.Bytes : null;
+
+    /// <summary>
+    /// The SETUP's <c>streamConnectionID</c>. It is hashed into the stream key
+    /// and IV, so it is not bookkeeping — a missing or misread value produces a
+    /// cipher that decrypts everything to noise. Senders send it as a number;
+    /// some send the decimal string, which is the form it is hashed in anyway.
+    /// </summary>
+    private static ulong StreamConnectionId(NSDictionary stream)
+    {
+        if (!stream.TryGetValue("streamConnectionID", out var value))
+        {
+            return 0;
+        }
+
+        return value switch
+        {
+            NSNumber number => unchecked((ulong)number.ToLong()),
+            NSString text when ulong.TryParse(text.Content, out var parsed) => parsed,
+            _ => 0,
+        };
     }
 
     /// <summary>
@@ -956,15 +1424,52 @@ public sealed class ReceiverSession(
 
     private RtspReply TeardownReply(RtspRequest request)
     {
-        var streamOnly = request.Body.Length > 0
+        var streams = request.Body.Length > 0
             && PropertyListParser.Parse(request.Body) is NSDictionary plist
-            && plist.ContainsKey("streams");
-        logger.LogInformation("TEARDOWN ({Scope})", streamOnly ? "stream" : "session");
-        StopStream();
+            && plist.TryGetValue("streams", out var streamsObj)
+            && streamsObj is NSArray array
+                ? array.OfType<NSDictionary>().ToList()
+                : null;
+
+        if (streams is null)
+        {
+            logger.LogInformation("TEARDOWN (session)");
+            StopStream();
+            return RtspReply.Ok();
+        }
+
+        // A stream-scoped teardown is ROUTINE, not an ending: a sender that
+        // advertised supportsDynamicStreamID replaces its audio stream this
+        // way (teardown one type 96, SETUP the next) while the mirror video
+        // keeps flowing. Tearing the whole session down here took the video
+        // with it, marked both sources idle, and ended the mirror over an
+        // audio format switch.
+        var types = streams
+            .Select(s => s.TryGetValue("type", out var t) && t is NSNumber n ? n.ToLong() : -1)
+            .ToList();
+        logger.LogInformation("TEARDOWN (stream: {Types}) — other streams keep flowing",
+            string.Join(", ", types));
+
+        foreach (var type in types)
+        {
+            switch (type)
+            {
+                case 96 or 103:
+                    StopAudioStream();
+                    break;
+                case 110:
+                    StopVideoStream();
+                    break;
+                default:
+                    logger.LogWarning("TEARDOWN named unrecognized stream type {Type} — nothing stopped for it", type);
+                    break;
+            }
+        }
+
         return RtspReply.Ok();
     }
 
-    private void StopStream()
+    private void StopAudioStream()
     {
         _streamCts?.Cancel();
         _audioServer?.Dispose();
@@ -978,6 +1483,23 @@ public sealed class ReceiverSession(
         _scheduler = null;
         _controlSocket = null;
         source.MarkIdle();
+    }
+
+    private void StopVideoStream()
+    {
+        _mirrorServer?.Dispose();
+        _mirrorServer = null;
+        videoSource.MarkIdle();
+    }
+
+    private void StopStream()
+    {
+        StopAudioStream();
+        StopVideoStream();
+        // Session-scoped: the timing client outlives any one stream — a
+        // replacement video stream reuses the lock instead of re-acquiring it.
+        _mirrorTiming?.Dispose();
+        _mirrorTiming = null;
     }
 
     private static RtspReply PlistReply(NSDictionary dict) => new()

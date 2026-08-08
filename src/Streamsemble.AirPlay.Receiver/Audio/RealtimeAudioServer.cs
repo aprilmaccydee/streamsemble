@@ -24,9 +24,40 @@ public readonly record struct RealtimeAudioPacket(ushort Sequence, uint RtpTime,
 /// time the window slides past it is a dropped-frame glitch, exactly like a
 /// lossy speaker.
 /// </summary>
-public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisposable
+public sealed class RealtimeAudioServer(
+    IReadOnlyList<StreamKeyCandidate> keyCandidates, ILogger logger) : IDisposable
 {
     private const int ReorderWindow = 16;
+
+    public RealtimeAudioServer(byte[] audioKey, ILogger logger)
+        : this(StreamKeyCandidates.Single(audioKey), logger)
+    {
+    }
+
+    /// <summary>
+    /// The key that actually authenticates, once one has. Until then every
+    /// candidate is tried per packet; after, only the winner is used.
+    /// </summary>
+    private byte[]? _resolvedKey;
+    private int _undecryptable;
+
+    /// <summary>
+    /// Set for a screen mirror's companion audio, which uses AES-CBC keyed from
+    /// the session's FairPlay material instead of the per-packet ChaCha
+    /// envelope a music session uses. Present means the envelope is settled and
+    /// there is nothing to search for.
+    /// </summary>
+    private MirrorAudioCipher? _mirrorCipher;
+    private bool _cbcAnnounced;
+
+    /// <summary>
+    /// A mirror session's legacy AES-CBC envelope, used only if no candidate
+    /// key authenticates first.
+    /// </summary>
+    public MirrorAudioCipher? LegacyCbcFallback
+    {
+        init => _mirrorCipher = value;
+    }
 
     private UdpClient? _data;
     private UdpClient? _control;
@@ -89,18 +120,8 @@ public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisp
                 var seq = BinaryPrimitives.ReadUInt16BigEndian(packet.AsSpan(2));
                 var rtpTime = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(4));
 
-                byte[] frame;
-                try
+                if (TryDecrypt(packet, seq) is not { } frame)
                 {
-                    frame = PairingCrypto.ChaCha20Poly1305Decrypt(
-                        audioKey,
-                        PairingCrypto.Nonce(packet[^8..]),
-                        packet[12..^8],
-                        packet[4..12]);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogDebug(ex, "realtime packet decrypt failed (seq {Seq})", seq);
                     continue;
                 }
 
@@ -117,6 +138,79 @@ public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisp
         {
             logger.LogWarning(ex, "realtime data channel failed");
         }
+    }
+
+    /// <summary>
+    /// Decrypts a packet, resolving which key the sender is using on the way if
+    /// that is still open. The Poly1305 tag is the arbiter: a candidate that
+    /// authenticates is the right key, and one that does not cannot be.
+    /// </summary>
+    private byte[]? TryDecrypt(byte[] packet, ushort seq)
+    {
+        var nonce = PairingCrypto.Nonce(packet[^8..]);
+        var body = packet[12..^8];
+        var aad = packet[4..12];
+
+        if (_resolvedKey is { } key)
+        {
+            try
+            {
+                return PairingCrypto.ChaCha20Poly1305Decrypt(key, nonce, body, aad);
+            }
+            catch (Exception ex)
+            {
+                // Past the point of ambiguity, so this is ordinary corruption.
+                // Rate-limited: at 43 packets a second a per-packet log buries
+                // everything else in the file.
+                if (++_undecryptable % 500 == 1)
+                {
+                    logger.LogDebug(ex, "realtime packet decrypt failed (seq {Seq}, {Count} so far)", seq, _undecryptable);
+                }
+
+                return null;
+            }
+        }
+
+        foreach (var candidate in keyCandidates)
+        {
+            try
+            {
+                var frame = PairingCrypto.ChaCha20Poly1305Decrypt(candidate.Key, nonce, body, aad);
+                _resolvedKey = candidate.Key;
+                logger.LogInformation(
+                    "realtime audio key resolved: {Name} (authenticated on seq {Seq})", candidate.Name, seq);
+                return frame;
+            }
+            catch
+            {
+                // Wrong candidate; the tag said so.
+            }
+        }
+
+        // Nothing authenticated. A mirror session gets one last option: the
+        // legacy AES-CBC envelope, which carries no tag and so can only be
+        // tried once everything verifiable has been ruled out.
+        if (_mirrorCipher is { } mirror)
+        {
+            if (!_cbcAnnounced)
+            {
+                _cbcAnnounced = true;
+                logger.LogInformation(
+                    "no authenticated key for the companion audio — falling back to the legacy AES-CBC envelope, "
+                    + "which cannot be verified, so silence or noise from here means the key is wrong");
+            }
+
+            return mirror.Decrypt(packet.AsSpan(12));
+        }
+
+        if (++_undecryptable % 500 == 1)
+        {
+            logger.LogWarning(
+                "no key candidate authenticates the realtime audio ({Count} packets so far, {Tried} candidates tried: {Names})",
+                _undecryptable, keyCandidates.Count, string.Join(", ", keyCandidates.Select(c => c.Name)));
+        }
+
+        return null;
     }
 
     private async ValueTask DeliverInOrderAsync(RealtimeAudioPacket packet, CancellationToken ct)
@@ -192,6 +286,28 @@ public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisp
 
                     OnAnchor?.Invoke(frame, localNanos);
                 }
+                else if (type == 0x54 && packet.Length >= 20)
+                {
+                    // 0x54 (0xD4) = the NTP-timed sync an NTP session (screen
+                    // mirror) sends instead of 0xD7: frame F [4..8) is audible
+                    // at sender-NTP T [8..16) (1900-epoch fixed point). T is
+                    // also this packet's send instant — the sender writes "NTP
+                    // now" and states which frame is turning audible now — so
+                    // the same arrival min-filter maps it onto our clock.
+                    var frame = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(4));
+                    var senderNanos = NtpToNanos(BinaryPrimitives.ReadUInt64BigEndian(packet.AsSpan(8)));
+                    var offset = _senderClockOffset.Update(PtpReceiverClock.NowNanos - senderNanos);
+                    var localNanos = senderNanos + offset;
+                    if (anchorsSeen++ == 0)
+                    {
+                        logger.LogInformation(
+                            "realtime 0xD4 sync anchor: frame {Frame} audible at sender ntp ns {Sender} = local ns {Local} "
+                            + "(clock offset {OffsetS:F3} s)",
+                            frame, senderNanos, localNanos, offset / 1e9);
+                    }
+
+                    OnAnchor?.Invoke(frame, localNanos);
+                }
                 else
                 {
                     logger.LogTrace("realtime control packet type 0x{Type:X2} ({Len} B)", type, packet.Length);
@@ -206,8 +322,14 @@ public sealed class RealtimeAudioServer(byte[] audioKey, ILogger logger) : IDisp
         }
     }
 
+    /// <summary>1900-epoch NTP fixed point → UNIX nanoseconds (on the sender's timeline).</summary>
+    private static long NtpToNanos(ulong ntp) =>
+        (long)((ntp >> 32) - 2_208_988_800UL) * 1_000_000_000L
+        + (long)(((ntp & 0xFFFFFFFFUL) * 1_000_000_000UL) >> 32);
+
     public void Dispose()
     {
+        _mirrorCipher?.Dispose();
         _cts?.Cancel();
         _data?.Dispose();
         _control?.Dispose();

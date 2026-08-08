@@ -18,6 +18,7 @@ namespace Streamsemble.AirPlay.Receiver;
 public sealed class AirPlayReceiverService(
     IOptions<AirPlayReceiverOptions> options,
     AirPlayReceiverSource source,
+    Video.MirrorVideoSource videoSource,
     ServiceAdvertiser advertiser,
     PtpReceiverClock ptp,
     ILogger<AirPlayReceiverService> logger) : IHostedService
@@ -32,13 +33,19 @@ public sealed class AirPlayReceiverService(
             return Task.CompletedTask;
         }
 
+        // Set before the identity/TXT records are built: the mask feeds both.
+        ReceiverFeatures.ScreenMirroringAdvertised = options.Value.ScreenMirroring;
+
         var identity = BuildIdentity(options.Value.Name ?? "Streamsemble");
 
         // The process-wide hub clock (DI singleton, shared with the speaker
         // fan-out so every role runs on ONE grandmaster). Lazily binds
         // 319/320 on the first PTP session SETUP.
+        var display = new MirrorDisplay(
+            options.Value.ScreenWidth, options.Value.ScreenHeight, options.Value.ScreenFps);
         _server = new RtspServer(conn => new ReceiverSession(
-            conn, source, identity, ptp, options.Value.PresentationLatencySamples, logger), logger);
+            conn, source, videoSource, identity, ptp,
+            options.Value.PresentationLatencySamples, display, logger), logger);
         _server.Start(options.Value.Port);
 
         // _airplay._tcp ONLY — deliberately no _raop._tcp. The _raop service
@@ -52,6 +59,15 @@ public sealed class AirPlayReceiverService(
 
         logger.LogInformation("AirPlay receiver \"{Name}\" up: RTSP :{Port}, deviceid {DeviceId}, pk {Pk}",
             identity.Name, options.Value.Port, identity.DeviceId, identity.PkHex[..16] + "…");
+        if (options.Value.ScreenMirroring)
+        {
+            logger.LogWarning(
+                "screen mirroring advertised (features 0x{Mask:X}, offering {Width}x{Height}@{Fps}) — this changes "
+                + "the mask the working audio negotiation depends on; capture the next Mac session into "
+                + "debug/airplay-mirror/",
+                ReceiverFeatures.AdvertisedMask, display.Width, display.Height, display.Fps);
+        }
+
         return Task.CompletedTask;
     }
 
