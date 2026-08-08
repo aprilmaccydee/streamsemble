@@ -5,6 +5,10 @@ A cross-platform (.NET 8) audio hub that receives from **Spotify Connect**,
 AirPlay 2 speakers**, kept in sync. Built with the .NET Generic Host and
 dependency injection throughout.
 
+**Website & guides:** <https://aprilmaccydee.github.io/streamsemble/> —
+quick start (Docker + native), the web UI, and advanced setup in plain
+English. This README is the deeper technical reference.
+
 ```
  Spotify Connect  ┐
  AirPlay 2 (recv) ┼─► arbiter ─► pump ─► AirPlayTargetGroup ─► speaker A
@@ -312,3 +316,10 @@ above is the packaged form of the same thing. The PTP clock needs
 ports 319/320 (`setcap CAP_NET_BIND_SERVICE` or root) and conflicts with any
 nqptp/shairport-sync on the same host. The librespot event helper uses
 `curl` (present on typical Linux hosts).
+
+## License
+
+[AGPL-3.0](LICENSE). The ALAC decoder is a port of Apple's open-source ALAC
+codec and remains under its original Apache License 2.0 (see the header in
+`AlacDecoder.cs`); librespot is MIT-licensed upstream — this repo ships only
+a patch for it.
