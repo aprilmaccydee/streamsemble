@@ -1,0 +1,93 @@
+---
+import Base from '../layouts/Base.astro';
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
+---
+<Base
+  title="The web UI — Streamsemble"
+  description="One page controls the whole hub: pick speakers live, set volumes, watch the sync, and run the lights — from any browser on your network."
+  current="webui"
+>
+  <main class="doc wrap">
+    <header>
+      <h1>The web UI</h1>
+      <p class="doc__lede">
+        Open <code>http://&lt;your hub&gt;:8088</code> from any phone or laptop
+        on the network. Everything the hub does is on this one page, live.
+      </p>
+    </header>
+
+    <section aria-labelledby="speakers">
+      <h2 id="speakers">Speakers</h2>
+      <p>
+        The page lists every AirPlay speaker it can see on the network — found
+        automatically, nothing to register. Tick one and it joins the music
+        within a few seconds, already in time with the rest; untick it and it
+        drops out. You can do this mid-song, whenever you like.
+      </p>
+    </section>
+
+    <section aria-labelledby="volume">
+      <h2 id="volume">Volume</h2>
+      <p>
+        Each speaker gets its own slider, and the reading comes from the
+        speaker itself — turn a Sonos up from its own app and the slider here
+        moves too. The big slider at the top is the average of them all; move
+        it and every speaker follows.
+      </p>
+    </section>
+
+    <section aria-labelledby="nowplaying">
+      <h2 id="nowplaying">Now playing</h2>
+      <p>
+        The active source, track, artist, and cover art. The artwork shown is
+        the same image the hub sends to the speakers' own displays — if it's
+        blank here, the speakers got nothing either, which makes it a useful
+        honesty check.
+      </p>
+    </section>
+
+    <section aria-labelledby="sync">
+      <h2 id="sync">The sync view</h2>
+      <p>
+        A small live graphic shows each speaker's buffer lead against its
+        target, with a short history. You'll rarely need it — sync is
+        automatic — but when something sounds off, it lets you see which
+        speaker is struggling instead of guessing.
+      </p>
+    </section>
+
+    <section aria-labelledby="lights">
+      <h2 id="lights">Lights</h2>
+      <p>
+        If you've configured WLED strips (see
+        <a href={`${base}advanced/`}>Advanced setup</a>), a Lights card
+        appears: per-strip on/off, the light mode (Pulse, Vu, or Spectrum), a
+        palette (Classic, Solid, or Rainbow), color, brightness, how slowly the
+        lights fall after a beat, and mirror/reverse for how the show sits on
+        the strip. Changes land on the strip within about a frame — you can
+        tune it while the music plays.
+      </p>
+    </section>
+
+    <section aria-labelledby="api">
+      <h2 id="api">The API underneath</h2>
+      <p>
+        Every control on the page is a plain HTTP call you can use yourself:
+      </p>
+      <pre is:raw><code>GET  /api/state              # everything: speakers, volumes, telemetry, lights
+POST /api/targets            # which speakers play
+POST /api/volume             # all speakers
+POST /api/speakers/volume    # one speaker
+POST /api/wled/config        # light mode, palette, brightness…</code></pre>
+      <p>
+        If you want to script the house — a button by the bed that moves the
+        music to the bedroom, say — it's all there.
+      </p>
+    </section>
+
+    <p class="next">
+      <a href={`${base}advanced/`}>Next: advanced setup →</a>
+    </p>
+  </main>
+</Base>

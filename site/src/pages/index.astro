@@ -1,0 +1,131 @@
+---
+import Base from '../layouts/Base.astro';
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
+---
+<Base
+  title="Streamsemble — every speaker in the house, on the same beat"
+  description="A small self-hosted hub that takes Spotify and AirPlay in, and plays out to all your AirPlay 2 speakers in sync. Runs in Docker. Free, source on GitHub."
+>
+  <header class="hero wrap">
+    <p class="hero__path reveal" style="--i: 0">Spotify in. AirPlay in. Every room out.</p>
+    <h1 class="reveal" style="--i: 0">Every speaker in the house, on the same beat.</h1>
+    <p class="hero__lede reveal" style="--i: 1">
+      Streamsemble is a small server you run at home. Your phone sees it as just
+      another speaker — and whatever you play to it comes out of every speaker
+      you choose, all in time with each other. It can run your LED strips to the
+      music, too.
+    </p>
+  </header>
+
+  <section class="map wrap" aria-labelledby="map-title">
+    <h2 id="map-title" class="sr-only">How it fits together</h2>
+    <div class="map__scroller">
+      <svg
+        class="map__svg"
+        viewBox="0 0 880 440"
+        role="img"
+        aria-label="System map: the Spotify app and AirPlay devices play into the Streamsemble hub, which plays out in sync to the Kitchen, the living room TV, the Bedroom, and optional LED strips."
+      >
+        <g class="reveal" style="--i: 2">
+          <rect class="map__box" x="24" y="90" width="180" height="84" rx="8" />
+          <text class="map__name" x="114" y="127" text-anchor="middle">Spotify</text>
+          <text class="map__sub" x="114" y="149" text-anchor="middle">your phone or laptop</text>
+          <rect class="map__box" x="24" y="250" width="180" height="84" rx="8" />
+          <text class="map__name" x="114" y="287" text-anchor="middle">iPhone · Mac</text>
+          <text class="map__sub" x="114" y="309" text-anchor="middle">the AirPlay menu</text>
+        </g>
+
+        <g class="reveal" style="--i: 3">
+          <rect class="map__box map__box--hub" x="340" y="160" width="200" height="110" rx="8" />
+          <text class="map__name" x="440" y="207" text-anchor="middle">Streamsemble</text>
+          <text class="map__sub" x="440" y="229" text-anchor="middle">one box on your network</text>
+          <text class="map__sub" x="440" y="246" text-anchor="middle">one clock for the house</text>
+        </g>
+
+        <g class="reveal" style="--i: 4">
+          <rect class="map__box" x="660" y="40" width="196" height="72" rx="8" />
+          <text class="map__name" x="758" y="72" text-anchor="middle">Kitchen</text>
+          <text class="map__sub" x="758" y="93" text-anchor="middle">Sonos</text>
+          <rect class="map__box" x="660" y="136" width="196" height="72" rx="8" />
+          <text class="map__name" x="758" y="168" text-anchor="middle">Living room TV</text>
+          <text class="map__sub" x="758" y="189" text-anchor="middle">AirPlay 2</text>
+          <rect class="map__box" x="660" y="232" width="196" height="72" rx="8" />
+          <text class="map__name" x="758" y="264" text-anchor="middle">Bedroom</text>
+          <text class="map__sub" x="758" y="285" text-anchor="middle">AirPlay 2</text>
+        </g>
+
+        <g class="reveal" style="--i: 5">
+          <rect class="map__box map__box--optional" x="660" y="328" width="196" height="72" rx="8" />
+          <text class="map__name" x="758" y="360" text-anchor="middle">LED strips</text>
+          <text class="map__sub" x="758" y="381" text-anchor="middle">WLED · optional</text>
+        </g>
+
+        <g class="reveal" style="--i: 6">
+          <path class="map__flow" d="M 204 132 C 272 132 272 196 340 196" />
+          <path class="map__flow" d="M 204 292 C 272 292 272 234 340 234" />
+          <path class="map__flow" d="M 540 192 C 604 192 604 76 660 76" />
+          <path class="map__flow" d="M 540 211 C 604 211 604 172 660 172" />
+          <path class="map__flow" d="M 540 230 C 604 230 604 268 660 268" />
+          <path class="map__flow map__flow--quiet" d="M 540 249 C 604 249 604 364 660 364" />
+          <text class="map__hop" x="272" y="112" text-anchor="middle">Spotify Connect</text>
+          <text class="map__hop" x="272" y="330" text-anchor="middle">AirPlay 2</text>
+          <text class="map__hop" x="604" y="60" text-anchor="middle">in sync</text>
+          <text class="map__hop" x="604" y="404" text-anchor="middle">light frames</text>
+        </g>
+      </svg>
+    </div>
+    <p class="map__legend">
+      Anything you play into the hub comes out of every speaker you've ticked, on
+      one shared clock. The LED strips are optional — they follow whatever is
+      playing.
+    </p>
+  </section>
+
+  <section class="facts wrap" aria-label="What it does, measured">
+    <div>
+      <div class="facts__n"><em>≲25 ms</em></div>
+      <p>Measured drift between speakers on real hardware — a TV and a Sonos, with no manual tuning.</p>
+    </div>
+    <div>
+      <div class="facts__n">1 clock</div>
+      <p>The hub keeps time for the whole house and every speaker follows it. That's the whole trick.</p>
+    </div>
+    <div>
+      <div class="facts__n">0 new apps</div>
+      <p>Play from Spotify or the AirPlay menu you already have. Manage it from a browser.</p>
+    </div>
+  </section>
+
+  <section class="doors wrap" aria-label="Documentation">
+    <a class="door" href={`${base}quick-start/`}>
+      <span class="door__title">Quick start</span>
+      <span class="door__desc">Docker on a Linux box, or natively with .NET. The first build takes a while; after that it starts in seconds.</span>
+      <span class="door__arrow" aria-hidden="true">→</span>
+    </a>
+    <a class="door" href={`${base}web-ui/`}>
+      <span class="door__title">The web UI</span>
+      <span class="door__desc">Tick speakers to bring them in mid-song, set volumes, watch the sync, run the lights.</span>
+      <span class="door__arrow" aria-hidden="true">→</span>
+    </a>
+    <a class="door" href={`${base}advanced/`}>
+      <span class="door__title">Advanced setup</span>
+      <span class="door__desc">Speakers that connect themselves at boot, WLED light strips, house-wide latency, TVs that want a PIN.</span>
+      <span class="door__arrow" aria-hidden="true">→</span>
+    </a>
+  </section>
+
+  <div class="cta-row wrap">
+    <a class="btn btn--outline" href={`${base}quick-start/`}>Get it running</a>
+  </div>
+</Base>
+
+<style>
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+</style>

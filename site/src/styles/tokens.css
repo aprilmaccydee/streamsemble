@@ -1,0 +1,64 @@
+/* Hallmark · genre: modern-minimal · macrostructure: Map / Diagram · theme: Coral
+ * enrichment: tier-B hand-built SVG system map · nav: N5 floating pill · footer: Ft2 inline line
+ * inferred: audience = people who want whole-house audio without buying one vendor's ecosystem
+ * use = get streamsemble installed and understood · tone = plain, warm, technical only when it must be
+ * Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V4
+ * contrast: pass (40–41) · slop: pass (42–45) · honest: pass (46) · chrome: pass (47)
+ * tokens: pass (48) · responsive: pass (49) · icons: pass (30) · mobile: pass (34, 49, 50–57)
+ */
+
+:root {
+  /* Coral palette — warm near-white paper, one coral accent, warm-tinted greys */
+  --color-paper:       oklch(97.5% 0.006 60);
+  --color-paper-2:     oklch(95%   0.008 60);
+  --color-rule:        oklch(88%   0.009 55);
+  --color-neutral:     oklch(45%   0.012 45);
+  --color-muted:       oklch(38%   0.014 40);
+  --color-ink:         oklch(21%   0.012 40);
+  --color-accent:      oklch(62%   0.185 30);   /* coral, decorative weight */
+  --color-accent-deep: oklch(50%   0.165 30);   /* coral for text + focus, 4.5:1 on paper */
+  --color-focus:       oklch(50%   0.165 30);
+  --color-selection:   oklch(90%   0.05  30);
+  --shadow-nav:        0 8px 24px -12px oklch(20% 0.012 40 / 0.22);
+
+  /* Type — Geist display + body, Fraunces wordmark only, Geist Mono for code */
+  --font-body:     "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-display:  "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-wordmark: "Fraunces", ui-serif, Georgia, serif;
+  --font-mono:     "Geist Mono", ui-monospace, "SF Mono", monospace;
+
+  /* Scale — 1.25 ratio from 16px */
+  --text-sm:   0.875rem;
+  --text-base: 1rem;
+  --text-md:   1.25rem;
+  --text-lg:   1.5625rem;
+  --text-xl:   1.9531rem;
+  --text-2xl:  2.4414rem;
+  --text-display: clamp(2.5rem, 5vw + 0.5rem, 4.75rem);
+
+  /* Space — 4pt scale */
+  --space-2xs: 0.25rem;
+  --space-xs:  0.5rem;
+  --space-sm:  0.75rem;
+  --space-md:  1rem;
+  --space-lg:  1.5rem;
+  --space-xl:  2.5rem;
+  --space-2xl: 4rem;
+  --space-3xl: 6rem;
+  --space-4xl: 9rem;
+
+  /* Motion */
+  --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in:     cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+  --dur-long:  420ms;
+
+  /* Rules, radii, z */
+  --rule-hair: 1px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --z-base: 1;
+  --z-sticky: 200;
+}

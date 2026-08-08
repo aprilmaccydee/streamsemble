@@ -1,0 +1,125 @@
+---
+import Base from '../layouts/Base.astro';
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
+---
+<Base
+  title="Quick start — Streamsemble"
+  description="Get Streamsemble running: Docker on a Linux box, or natively with .NET. Then pick it in Spotify or the AirPlay menu and play."
+  current="start"
+>
+  <main class="doc wrap">
+    <header>
+      <h1>Quick start</h1>
+      <p class="doc__lede">
+        Two ways to run it: Docker on a Linux box that's always on (the usual
+        way), or natively with .NET on the machine in front of you.
+      </p>
+    </header>
+
+    <section aria-labelledby="need">
+      <h2 id="need">What you need</h2>
+      <ul>
+        <li>
+          <strong>A computer on the same network as your speakers.</strong> For
+          Docker it has to be Linux — a NAS, a mini PC, anything that stays on.
+          On a Mac or Windows machine, run it natively instead; Docker's host
+          networking can't reach the LAN there, and the speakers would never
+          find the hub.
+        </li>
+        <li>
+          <strong>AirPlay 2 speakers.</strong> Sonos and TV-class receivers are
+          the ones verified on real hardware today. HomePod support is written
+          but hasn't been proven against a real HomePod yet.
+        </li>
+        <li>
+          <strong>Spotify, if you want it.</strong> It's optional — without it
+          you still get the AirPlay hub.
+        </li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="docker">
+      <h2 id="docker">With Docker</h2>
+      <span class="codelabel">terminal, on the Linux box</span>
+      <pre is:raw><code>git clone https://github.com/aprilmaccydee/streamsemble.git
+cd streamsemble
+docker compose up -d --build</code></pre>
+      <p>
+        The first build takes around ten minutes, because it compiles librespot
+        (the Spotify half) from source. Every start after that takes seconds.
+      </p>
+      <p>
+        When it's up, open <code>http://&lt;the box's address&gt;:8088</code> in
+        a browser. That's the web UI — you can already tick speakers and play.
+      </p>
+      <ul>
+        <li>
+          Want speakers to connect on their own at boot? Name them in the
+          <code>environment:</code> block of <code>docker-compose.yml</code> —
+          covered in <a href={`${base}advanced/`}>Advanced setup</a>.
+        </li>
+        <li>
+          Keep the <code>/data</code> volume. It holds speaker pairings and
+          Spotify credentials, so you never have to redo them after a restart.
+        </li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="native">
+      <h2 id="native">Natively with .NET</h2>
+      <p>
+        You'll need the <strong>.NET 8 SDK</strong>, plus
+        <strong>librespot</strong> for Spotify and <strong>ffmpeg</strong> for
+        AirPlay 2 speakers (on a Mac: <code>brew install librespot ffmpeg</code>).
+      </p>
+      <span class="codelabel">terminal</span>
+      <pre is:raw><code>git clone https://github.com/aprilmaccydee/streamsemble.git
+cd streamsemble
+dotnet run --project src/Streamsemble.Host -- \
+  --Streamsemble:Sink=AirPlay \
+  --AirPlayReceiver:Enabled=true --AirPlayReceiver:Name="Streamsemble Hub" \
+  --AirPlaySender:Targets:0:Name="Kitchen" \
+  --AirPlaySender:Targets:1:Name="Living Room"</code></pre>
+      <ul>
+        <li>
+          Swap <code>Kitchen</code> and <code>Living Room</code> for your
+          speakers' names as they appear in the AirPlay menu — or drop the
+          <code>Targets</code> lines entirely and tick speakers in the web UI
+          instead.
+        </li>
+        <li>
+          On Linux, the hub's clock needs to bind UDP ports 319 and 320:
+          either run as root or grant the capability once with
+          <code>sudo setcap CAP_NET_BIND_SERVICE=+ep</code> on the published
+          binary. macOS allows it without any of that.
+        </li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="play">
+      <h2 id="play">Play something</h2>
+      <ul>
+        <li>In Spotify, open the devices list and pick <strong>Streamsemble</strong>.</li>
+        <li>From an iPhone or Mac, pick <strong>Streamsemble Hub</strong> in the AirPlay menu.</li>
+        <li>
+          Open the web UI and tick the speakers you want. They join live,
+          mid-song, already in time with the others.
+        </li>
+      </ul>
+      <div class="note">
+        <p>
+          <strong>One thing not to do:</strong> don't run the hub on the same
+          Mac you AirPlay <em>from</em>. The hub owns the network's clock ports,
+          and macOS refuses to start its own AirPlay while anything holds them.
+          Playing from your phone or another computer to a hub on this Mac is
+          fine.
+        </p>
+      </div>
+    </section>
+
+    <p class="next">
+      <a href={`${base}web-ui/`}>Next: the web UI →</a>
+    </p>
+  </main>
+</Base>

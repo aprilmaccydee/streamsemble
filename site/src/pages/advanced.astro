@@ -1,0 +1,182 @@
+---
+import Base from '../layouts/Base.astro';
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith('/') ? rawBase : rawBase + '/';
+---
+<Base
+  title="Advanced setup — Streamsemble"
+  description="Speakers that connect themselves at boot, WLED light strips, house-wide latency, PIN pairing for TVs, and Spotify options — all environment variables."
+  current="advanced"
+>
+  <main class="doc wrap">
+    <header>
+      <h1>Advanced setup</h1>
+      <p class="doc__lede">
+        Everything here is an environment variable on the Docker container — or
+        the same key in <code>appsettings.json</code> if you run natively.
+      </p>
+    </header>
+
+    <section aria-labelledby="mapping">
+      <h2 id="mapping">How the settings map</h2>
+      <p>
+        Every setting follows one pattern: sections join with double
+        underscores, and list entries get numbers. So this environment
+        variable:
+      </p>
+      <pre is:raw><code>AirPlaySender__Targets__0__Name=Kitchen</code></pre>
+      <p>is the same as this in <code>appsettings.json</code>:</p>
+      <pre is:raw><code>{ "AirPlaySender": { "Targets": [ { "Name": "Kitchen" } ] } }</code></pre>
+    </section>
+
+    <section aria-labelledby="autoplay">
+      <h2 id="autoplay">Speakers that connect themselves</h2>
+      <p>
+        Name your speakers in <code>docker-compose.yml</code> and the hub
+        connects them at boot — no browser needed, ever, if you don't want one:
+      </p>
+      <span class="codelabel">docker-compose.yml · environment:</span>
+      <pre is:raw><code>- AirPlaySender__Targets__0__Name=Kitchen
+- AirPlaySender__Targets__0__Protocol=AirPlay2
+- AirPlaySender__Targets__0__StreamMode=Buffered
+- AirPlaySender__Targets__1__Name=Living room TV
+- AirPlaySender__Targets__1__Protocol=AirPlay2
+- AirPlaySender__Targets__1__StreamMode=Buffered</code></pre>
+      <ul>
+        <li>
+          <strong>Name</strong> is the speaker's name exactly as the AirPlay
+          menu shows it; the hub finds the address itself. If a device is
+          stubborn about discovery, give it <code>Host</code> with an IP
+          instead.
+        </li>
+        <li>
+          <strong>StreamMode=Buffered</strong> is the verified mode for
+          AirPlay 2 speakers — use it unless you have a reason not to.
+        </li>
+        <li>
+          These seed the selection at boot. The web UI can still add and remove
+          speakers live on top of it.
+        </li>
+        <li>
+          If one speaker sits audibly early or late no matter what — some
+          vendors misreport their own latency — nudge just that one with
+          <code>LatencyTrimMs</code>, in milliseconds, positive or negative.
+        </li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="wled">
+      <h2 id="wled">WLED lights</h2>
+      <p>
+        Any WLED-flashed LED strip can light to the music. The hub times each
+        light frame to land when you <em>hear</em> the beat — not when it
+        decoded the audio a second or two earlier — so the flash and the drum
+        hit arrive together.
+      </p>
+      <span class="codelabel">docker-compose.yml · environment: — one block per strip</span>
+      <pre is:raw><code>- Wled__Devices__0__Name=desk
+- Wled__Devices__0__Host=192.168.1.60
+- Wled__Devices__0__LedCount=144
+- Wled__Devices__0__Protocol=Dnrgb        # Dnrgb | Drgb | Drgbw | Warls
+- Wled__Devices__0__Mode=Spectrum         # Spectrum | Vu | Pulse | Off
+- Wled__Devices__0__Palette=Classic       # Classic | Solid | Rainbow
+- Wled__Devices__0__Color=#FF4000
+- Wled__Devices__0__Brightness=0.8        # 0–1
+- Wled__Devices__0__Decay=0               # seconds the glow takes to fall, 0–1
+- Wled__Devices__0__Mirror=false          # grow from the strip's center
+- Wled__Devices__0__Reverse=false         # strip mounted backwards
+- Wled__Devices__0__TimeoutSeconds=2</code></pre>
+      <ul>
+        <li>
+          <strong>Mode</strong>: Spectrum paints frequencies along the strip,
+          Vu is a level meter, Pulse glows the whole strip with the loudness.
+        </li>
+        <li>
+          <strong>Palette</strong> recolors a mode: Classic is each mode's
+          traditional look, Solid uses your color for everything, Rainbow
+          drifts a full rainbow along the strip.
+        </li>
+        <li>
+          All of it — mode, palette, color, brightness, decay, mirror, reverse
+          — is live-tunable from the web UI's Lights card while the music
+          plays. These values are just the boot state.
+        </li>
+        <li>
+          When the music stops, the strip goes back to its own WLED effect
+          after <strong>TimeoutSeconds</strong>.
+        </li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="latency">
+      <h2 id="latency">One latency for the whole house</h2>
+      <pre is:raw><code>- STREAMSEMBLE_GROUP_LATENCY=2.0          # seconds, useful range 1–2</code></pre>
+      <p>
+        Every speaker plays the sample that is "now" at
+        <em>now&nbsp;+&nbsp;this</em>. It's one value for the whole house on
+        purpose — it's the headroom that keeps everyone together, not a knob
+        for fixing sync (sync is automatic). Below about a second, speakers may
+        not have enough runway to start; the hub warns if you leave the useful
+        range.
+      </p>
+    </section>
+
+    <section aria-labelledby="pin">
+      <h2 id="pin">TVs that ask for a PIN</h2>
+      <p>
+        Some receivers — TVs especially — only play for senders they've been
+        formally introduced to. Turn on pairing, start the hub, and the TV
+        puts a PIN on screen. Hand it over:
+      </p>
+      <span class="codelabel">terminal, while the PIN is on screen</span>
+      <pre is:raw><code>docker compose exec streamsemble sh -c 'echo 1234-5678 > /data/.streamsemble/pin.txt'</code></pre>
+      <p>
+        with <code>STREAMSEMBLE_PAIR=1</code> set in the environment. The
+        identity is saved in <code>/data</code>, so you pair once — another
+        reason to keep that volume.
+      </p>
+    </section>
+
+    <section aria-labelledby="spotify">
+      <h2 id="spotify">Spotify options</h2>
+      <ul>
+        <li><code>Spotify__Enabled=false</code> — run as a pure AirPlay hub.</li>
+        <li><code>Spotify__Bitrate</code> — stream quality, if you want to set it explicitly.</li>
+        <li>
+          <code>Spotify__ExtraArgs</code> — passed straight through to
+          librespot, for example <code>--volume-ctrl fixed</code>.
+        </li>
+        <li>
+          Building the image with <code>--build-arg LIBRESPOT_VARIANT=none</code>
+          skips compiling librespot entirely (pair it with
+          <code>Spotify__Enabled=false</code>).
+        </li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="network">
+      <h2 id="network">Networking notes</h2>
+      <ul>
+        <li>
+          <strong>Host networking is required</strong> in Docker. Speaker
+          discovery is multicast and the audio channels are UDP ports the
+          speakers dial directly; behind a bridge network, nothing finds the
+          hub and no audio arrives.
+        </li>
+        <li>
+          UDP ports <strong>319 and 320</strong> must be free on the box — the
+          hub is the house clock and it lives there. If you run nqptp or
+          shairport-sync on the same machine, they'll fight for them.
+        </li>
+        <li>
+          Keep the <code>/data</code> volume across restarts: it holds TV
+          pairings and Spotify credentials.
+        </li>
+      </ul>
+    </section>
+
+    <p class="next">
+      <a href={`${base}quick-start/`}>Back to the quick start →</a>
+    </p>
+  </main>
+</Base>
