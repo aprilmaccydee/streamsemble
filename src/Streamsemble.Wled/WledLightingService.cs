@@ -35,6 +35,14 @@ public sealed class WledLightingService : BackgroundService
     private int _resetPending;
     private long _lateDropped;
 
+    // Where in a window a fresh onset actually sits. Half-overlapping windows
+    // mean a window's first half was already the previous window's second
+    // half, so the first window to contain an onset always holds it
+    // Hop..Window-1 samples in — expected position (Window+Hop)/2. Scheduling
+    // on StartSample made every flash lead the beat by that much (~23–46 ms);
+    // scheduling on the expected onset centers the residual to ±Hop/2.
+    private const int OnsetCenterSamples = (AudioLightAnalyzer.WindowSamples + AudioLightAnalyzer.HopSamples) / 2;
+
     private sealed record Scheduled(int Epoch, long DueStopwatchTimestamp, LightWindow Window);
 
     public WledLightingService(
@@ -105,7 +113,7 @@ public sealed class WledLightingService : BackgroundService
                     // convert to a local stopwatch deadline the send loop can
                     // sleep toward. Unanchored (nothing playing yet, or a
                     // WAV/null sink) falls back to the configured latency.
-                    var wait = _secondsUntilAudible(window.StartSample) ?? _fallbackLatencySeconds;
+                    var wait = _secondsUntilAudible(window.StartSample + OnsetCenterSamples) ?? _fallbackLatencySeconds;
                     var due = Stopwatch.GetTimestamp() + (long)(wait * Stopwatch.Frequency);
                     _pending.Writer.TryWrite(new Scheduled(epoch, due, window));
                 }
