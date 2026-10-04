@@ -82,7 +82,15 @@ English. This README is the deeper technical reference.
   TCP stream during a slow connection instead of discarding frames. On
   connect, the hub replays from the newest queued IDR and catches up to the
   live edge. Each frame retains its codec config so a resize during connection
-  sends the matching parameter sets before the new picture.
+  sends the matching parameter sets before the new picture. Missed render
+  deadlines also retain the reference chain: overdue frames receive fresh
+  presentation times and catch up instead of waiting forever for another IDR.
+- **Mirror AAC must keep each packet's RTP timestamp through decoding.** A
+  cursor based only on decoded PCM erases lost packets from time and drains
+  speaker lead over a long session. The hub maps each decoded AAC block back
+  to its packet, conceals missing samples with silence, then emits canonical
+  352-sample PCM frames. The technical panel's **input loss concealed** counter
+  reports the duration filled during the current realtime receive stream.
 - **Mirror video to a modern TV must be VCL-only, sealed with the ChaCha
   DataStream envelope.** SPS/PPS reach the TV solely via the unencrypted avcC
   config packet — inline parameter sets render as a black screen, and so does
@@ -171,7 +179,8 @@ on the same LAN at `http://<host-ip>:8088`). The page:
 
 The REST API behind it (usable directly): `GET /api/state` (now includes
 `speakers[]` per-session telemetry, a group `telemetry` object, a `video`
-mirroring snapshot and `wled[]` device state), `POST /api/targets`
+mirroring snapshot, `receiver.realtimeConcealedSamples` / `realtimeConcealedMs`
+and `wled[]` device state), `POST /api/targets`
 (`{ "targets": [ { "name": "Living Room" } ] }`),
 `POST /api/volume` (`{ "volume": 0.7 }`, all speakers),
 `POST /api/speakers/volume` (`{ "name": "Kitchen", "volume": 0.4 }`, one

@@ -50,6 +50,7 @@ public sealed class ReceiverSession(
     private MirrorDataServer? _mirrorServer;
     private MirrorNtpClient? _mirrorTiming;
     private AacDecoderPipe? _decoder;
+    private AacRtpPcmMapper? _aacPcmMapper;
     private PacedPcmEmitter? _emitter;
     private AnchoredPcmScheduler? _scheduler;
     private UdpClient? _controlSocket;
@@ -574,6 +575,7 @@ public sealed class ReceiverSession(
         }
 
         _streamCts = new CancellationTokenSource();
+        _aacPcmMapper = null;
         _decoder = new AacDecoderPipe(logger);
         _emitter = new PacedPcmEmitter(
             _decoder.Pcm,
@@ -658,6 +660,7 @@ public sealed class ReceiverSession(
 
         var alac = new AlacDecoder(AlacSpecificConfig(spf));
         _streamCts = new CancellationTokenSource();
+        _aacPcmMapper = null;
 
         // Decoded frames carry their 0xD7-anchored render deadline, not
         // arrival time: the modern sender transmits ~1.75 s ahead of
@@ -672,6 +675,7 @@ public sealed class ReceiverSession(
             source.PushDecodedPcm(pcm, target);
         }, logger, presentationLatencySamples * 1_000_000_000L / 44100);
         _scheduler = scheduler;
+        source.SetRealtimeScheduler(scheduler);
         _ = RunSchedulerAsync(scheduler, _streamCts.Token);
 
         var pcmBuffer = new byte[alac.MaxBytesPerPacket];
@@ -794,13 +798,9 @@ public sealed class ReceiverSession(
     /// ALAC at 352. It shares the ChaCha envelope, the 0xD7 anchors and the
     /// scheduler; only the decoder differs.
     ///
-    /// Decoding runs through ffmpeg, which returns PCM on a stream with no
-    /// timestamps of its own, so the RTP correspondence is reconstructed rather
-    /// than read: the cursor is seeded from the first packet's RTP time and
-    /// advances by the samples that come out. That holds because AAC-LC is
-    /// order-preserving and one frame in is one frame out — but it does inherit
-    /// the decoder's priming delay as a constant offset, which would show up as
-    /// a fixed lip-sync error rather than drift.
+    /// ffmpeg returns unframed PCM, so keep every accepted packet's RTP time
+    /// beside its decoded 1024-sample block. Counting only decoded samples
+    /// would erase lost packets from time and gradually exhaust output lead.
     /// </summary>
     /// <summary>
     /// The CBC cipher a screen mirror's companion audio needs, or null for an
@@ -842,19 +842,21 @@ public sealed class ReceiverSession(
             source.PushDecodedPcm(pcm, target);
         }, logger, presentationLatencySamples * 1_000_000_000L / 44100);
         _scheduler = scheduler;
+        source.SetRealtimeScheduler(scheduler);
         _ = RunSchedulerAsync(scheduler, _streamCts.Token);
 
-        // Written by the socket read loop before any PCM can come back out of
-        // ffmpeg, read by the decode loop; -1 until the first packet lands.
-        long firstRtp = -1;
-        _ = RunAacDecodeLoopAsync(decoder, scheduler, () => Volatile.Read(ref firstRtp), _streamCts.Token);
+        var mapper = new AacRtpPcmMapper(scheduler.Enqueue, scheduler.Flush);
+        _aacPcmMapper = mapper;
+        _ = RunAacDecodeLoopAsync(decoder, mapper, _streamCts.Token);
 
         var active = false;
         Func<RealtimeAudioPacket, CancellationToken, ValueTask> onPacket = async (packet, ct) =>
             {
-                if (Volatile.Read(ref firstRtp) < 0)
+                // Register before writing: decoder stdout may become readable
+                // before WriteFrameAsync finishes flushing its input pipe.
+                if (!mapper.TryQueuePacket(packet.RtpTime))
                 {
-                    Volatile.Write(ref firstRtp, packet.RtpTime);
+                    return;
                 }
 
                 if (!active)
@@ -886,43 +888,16 @@ public sealed class ReceiverSession(
     }
 
     /// <summary>
-    /// Re-chunks ffmpeg's PCM into canonical frames and hands them to the
-    /// scheduler with a running RTP cursor.
+    /// Matches arbitrary decoder stdout chunks to the original AAC RTP times.
     /// </summary>
     private async Task RunAacDecodeLoopAsync(
-        AacDecoderPipe decoder, AnchoredPcmScheduler scheduler, Func<long> firstRtp, CancellationToken ct)
+        AacDecoderPipe decoder, AacRtpPcmMapper mapper, CancellationToken ct)
     {
         try
         {
-            var pending = new List<byte>(PcmFrame.CanonicalFrameBytes * 2);
-            var cursor = 0u;
-            var seeded = false;
-
             await foreach (var chunk in decoder.Pcm.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                if (!seeded)
-                {
-                    if (firstRtp() < 0)
-                    {
-                        continue; // PCM before any packet is impossible, but do not guess a cursor
-                    }
-
-                    cursor = (uint)firstRtp();
-                    seeded = true;
-                }
-
-                pending.AddRange(chunk);
-                var offset = 0;
-                while (pending.Count - offset >= PcmFrame.CanonicalFrameBytes)
-                {
-                    var frame = new byte[PcmFrame.CanonicalFrameBytes];
-                    pending.CopyTo(offset, frame, 0, frame.Length);
-                    offset += frame.Length;
-                    scheduler.Enqueue(cursor, frame);
-                    cursor += PcmFrame.SamplesPerFrame;
-                }
-
-                pending.RemoveRange(0, offset);
+                mapper.WriteDecodedPcm(chunk);
             }
         }
         catch (OperationCanceledException)
@@ -1427,12 +1402,21 @@ public sealed class ReceiverSession(
 
     private RtspReply FlushReply()
     {
-        // Drop whatever is queued for the pace loop; the sender re-anchors after.
-        while (_decoder?.Pcm.TryRead(out _) == true)
+        if (_aacPcmMapper is { } mapper)
         {
+            // Preserve decoder byte/packet correspondence while discarding
+            // pre-flush generations, including a partially returned AAC block.
+            mapper.Flush();
         }
+        else
+        {
+            // Buffered AAC has no per-packet RTP mapping to keep aligned.
+            while (_decoder?.Pcm.TryRead(out _) == true)
+            {
+            }
 
-        _scheduler?.Flush();
+            _scheduler?.Flush();
+        }
 
         // Pause must reach the speakers too: Paused makes the pump flush the
         // fan-out, silencing the group-latency's worth of audio already in
@@ -1500,8 +1484,10 @@ public sealed class ReceiverSession(
         _audioServer = null;
         _realtimeServer = null;
         _decoder = null;
+        _aacPcmMapper = null;
         _emitter = null;
         _scheduler = null;
+        source.SetRealtimeScheduler(null);
         _controlSocket = null;
         source.MarkIdle();
     }

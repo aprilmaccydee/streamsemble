@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using Microsoft.Extensions.Options;
+using Streamsemble.AirPlay.Receiver;
 using Streamsemble.AirPlay.Receiver.Video;
 using Streamsemble.AirPlay.Sender;
 using Streamsemble.AirPlay.Sender.Video;
@@ -36,6 +37,7 @@ public static class WebApi
             DiscoveredTargetStore discovered,
             SelectedTargetStore selected,
             AirPlayTargetGroup group,
+            AirPlayReceiverSource receiver,
             VideoTargetGroup video,
             MirrorVideoSource mirror,
             WledDeviceGroup wled,
@@ -45,6 +47,7 @@ public static class WebApi
             var speakers = group.SpeakerStatuses();
             var telemetry = group.Telemetry();
             var videoTelemetry = video.Telemetry();
+            var concealedSamples = receiver.RealtimeConcealedSamples;
             // The headline volume is what the speakers are actually at (their
             // mean), not the last slider position; slider position is the
             // fallback while nothing is connected/known. A mirroring display
@@ -115,6 +118,11 @@ public static class WebApi
                     protocol = d.Protocol.ToString(),
                 }),
                 video = BuildVideoState(videoTelemetry, mirror),
+                receiver = new
+                {
+                    realtimeConcealedSamples = concealedSamples,
+                    realtimeConcealedMs = concealedSamples * 1000.0 / 44100,
+                },
                 telemetry = new
                 {
                     streaming = telemetry.Streaming,

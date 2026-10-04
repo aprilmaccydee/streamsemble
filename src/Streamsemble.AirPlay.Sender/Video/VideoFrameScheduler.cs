@@ -14,7 +14,6 @@ internal sealed class VideoFrameScheduler
     // the speaker group's much longer delay reliably; that deep buffer must
     // stay in the hub's source queue until this close to the render deadline.
     internal const long SendLeadNanos = 100_000_000;
-    private const long MaxLatenessNanos = 250_000_000;
     private const long WaitToleranceNanos = 2_000_000;
 
     private readonly object _gate = new();
@@ -90,8 +89,9 @@ internal sealed class VideoFrameScheduler
     }
 
     /// <summary>
-    /// Returns null only when the decoder cannot use this frame, an ordinary
-    /// hard-sync deadline was missed, or the stream ended during the wait.
+    /// Returns null only when the decoder cannot use this frame or the stream
+    /// ended during the wait. Missing a deadline never breaks the reference
+    /// chain: overdue units catch up with fresh presentation stamps.
     /// Mode changes re-evaluate the original frame, never an already shifted
     /// or restamped copy.
     /// </summary>
@@ -119,8 +119,8 @@ internal sealed class VideoFrameScheduler
                 if (_appliedModeVersion != mode.Version)
                 {
                     _appliedModeVersion = mode.Version;
-                    // Re-enabling while the low-latency backlog is still
-                    // draining must not drop its remaining reference frames.
+                    // Track the transition until a frame can follow a
+                    // future group deadline again.
                     _catchingUp = _started;
                 }
 
@@ -139,24 +139,31 @@ internal sealed class VideoFrameScheduler
                 var firstPicture = !_started;
                 var caughtUp = false;
 
-                if (!firstPicture && stampedHardSync)
+                if (stampedHardSync)
                 {
-                    if (leadNanos < -MaxLatenessNanos && !_catchingUp)
+                    if (leadNanos <= 0)
                     {
-                        _awaitingKeyframe = true;
-                        return null;
+                        // TCP preserved the reference chain, even if a stall
+                        // made its deadlines expire. Dropping one unit would
+                        // make every later P-frame unusable until an IDR the
+                        // Mac may never send. Keep and decode the whole chain
+                        // immediately, with stamps the display can still meet.
+                        _catchingUp = true;
+                        targetNanos = now + SendLeadNanos;
                     }
-
-                    caughtUp = _catchingUp && leadNanos >= -MaxLatenessNanos;
+                    else if (!firstPicture)
+                    {
+                        caughtUp = _catchingUp;
+                    }
                 }
 
                 // The last hard-sync frame is already about 100 ms ahead at
                 // the display. Do not move its clock backwards when draining
                 // the queue at wire speed, including very rapid toggles.
                 targetNanos = Math.Max(targetNanos, _lastTargetNanos + 1);
-                // An old opening IDR primes the decoder immediately despite
-                // its lateness. A fresh one still waits for its deadline, so
-                // it cannot strand an excessive future stamp at the display.
+                // An old opening IDR now has a fresh stamp and primes the
+                // decoder immediately. A future one waits for its deadline,
+                // so it cannot strand an excessive stamp at the display.
                 waitNanos = stampedHardSync
                     ? targetNanos - SendLeadNanos - now
                     : 0;

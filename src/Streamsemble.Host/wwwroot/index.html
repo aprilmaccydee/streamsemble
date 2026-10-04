@@ -482,6 +482,7 @@
         dd("active source", escapeHtml(s.activeSource || "—")) +
         dd("send queue", `${t.sendQueueDepth ?? 0}/128 frames`) +
         dd("realtime packets", `${(t.realtimePacketsSent ?? 0).toLocaleString()} @ ${(t.realtimePacketRate ?? 0).toFixed(0)}/s`) +
+        dd("input loss concealed", fmtMs(s.receiver?.realtimeConcealedMs ?? 0)) +
         dd("RTP head", t.rtpHead ?? "—") +
         dd("PTP grandmaster", escapeHtml(t.ptpClockId || "—")) +
         dd("presentation latency", fmtMs(t.presentationLatencyMs)) +

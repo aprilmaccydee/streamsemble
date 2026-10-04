@@ -179,16 +179,70 @@ public class VideoFrameSchedulerTests
     }
 
     [Fact]
-    public async Task LowLatencyCannotRepairAReferenceChainAlreadyBrokenByALateDrop()
+    public async Task AnOverdueOpeningKeyframeIsSentWithAValidDisplayTimestamp()
+    {
+        var clock = new ManualClock(10 * Second);
+        var scheduler = new VideoFrameScheduler(() => clock.Now, clock.Delay);
+        var original = Frame(1, 5 * Second, keyframe: true);
+        var ready = await scheduler.ScheduleAsync(original, () => Shift);
+
+        Assert.NotNull(ready);
+        Assert.True(ready.Value.FirstPicture);
+        Assert.Equal(original.Data, ready.Value.Frame.Data);
+        Assert.Equal(clock.Now + VideoFrameScheduler.SendLeadNanos, ready.Value.Frame.TargetNanos);
+        Assert.Equal(0, clock.ActiveDelays);
+        Assert.NotNull(await scheduler.ScheduleAsync(Frame(2, 5 * Second + 33_000_000), () => Shift));
+    }
+
+    [Fact]
+    public async Task AStallPreservesThousandsOfReferenceFramesThenResumesHardSyncWithoutANewIdr()
     {
         var clock = new ManualClock(10 * Second);
         var scheduler = await RunningSchedulerAsync(clock);
-        Assert.Null(await scheduler.ScheduleAsync(Frame(3, 5 * Second), () => Shift));
 
+        // The next P-frame initially has its normal 100 ms presentation lead.
+        // A 500 ms stall makes it late after the stream already caught up;
+        // this used to drop it and latch every subsequent P-frame out forever.
+        var nextSourceStamp = 8_633_000_000L;
+        clock.Advance(TimeSpan.FromMilliseconds(500));
+        long lastStamp = 0;
+        for (var id = 3; id < 3003; id++)
+        {
+            var original = Frame(id, nextSourceStamp);
+            var ready = await scheduler.ScheduleAsync(original, () => Shift);
+            Assert.NotNull(ready);
+            Assert.False(ready.Value.Frame.IsKeyframe);
+            Assert.Equal(original.Data, ready.Value.Frame.Data);
+            Assert.Equal(clock.Now + VideoFrameScheduler.SendLeadNanos, ready.Value.Frame.TargetNanos);
+            Assert.True(ready.Value.Frame.TargetNanos > lastStamp);
+            lastStamp = ready.Value.Frame.TargetNanos;
+            nextSourceStamp += 33_000_000;
+            clock.Advance(TimeSpan.FromMilliseconds(33));
+        }
+
+        Assert.Equal(0, clock.ActiveDelays);
+        Assert.True(scheduler.HardSyncEnabled);
+        Assert.InRange(scheduler.LastLeadMs!.Value, -368, -366);
+
+        // Once a live deadline leads again, the same uninterrupted reference
+        // chain returns to group pacing. No toggle, resize, or IDR is needed.
+        var recoveredTarget = clock.Now + Shift;
+        var pending = scheduler.ScheduleAsync(Frame(3003, clock.Now), () => Shift).AsTask();
+        var wait = await clock.NextDelayAsync();
+        Assert.Equal(TimeSpan.FromMilliseconds(1400), wait.Duration);
+        Assert.False(pending.IsCompleted);
+        wait.Complete();
+        var recovered = await pending;
+        Assert.NotNull(recovered);
+        Assert.True(recovered.Value.CaughtUp);
+        Assert.False(recovered.Value.Frame.IsKeyframe);
+        Assert.Equal(recoveredTarget, recovered.Value.Frame.TargetNanos);
+        Assert.Equal(VideoFrameScheduler.SendLeadNanos, recovered.Value.Frame.TargetNanos - clock.Now);
+        Assert.Equal(0, clock.ActiveDelays);
+
+        // A later mode switch also retains the chain recovered from that stall.
         scheduler.SetHardSyncEnabled(false);
-        Assert.Null(await scheduler.ScheduleAsync(Frame(4, clock.Now), () => Shift));
-        Assert.NotNull(await scheduler.ScheduleAsync(Frame(5, clock.Now, keyframe: true), () => Shift));
-        Assert.NotNull(await scheduler.ScheduleAsync(Frame(6, clock.Now), () => Shift));
+        Assert.NotNull(await scheduler.ScheduleAsync(Frame(3004, clock.Now), () => Shift));
     }
 
     [Fact]
@@ -227,6 +281,8 @@ public class VideoFrameSchedulerTests
         public long Now => Interlocked.Read(ref _nowNanos);
         public int ActiveDelays => Volatile.Read(ref _activeDelays);
         public Task CancellationBarrier { get; set; } = Task.CompletedTask;
+
+        public void Advance(TimeSpan duration) => Interlocked.Add(ref _nowNanos, duration.Ticks * 100);
 
         public async Task Delay(TimeSpan duration, CancellationToken ct)
         {

@@ -234,6 +234,37 @@ public class AnchoredPcmSchedulerTests
     }
 
     [Fact]
+    public async Task FlushDiscardsTheFrameAlreadyWaitingForItsDeadline()
+    {
+        const long anchorNanos = 5_000_000_000_000;
+        var waiting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fresh = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var emitted = new List<byte>();
+        var scheduler = new AnchoredPcmScheduler(
+            (pcm, _) =>
+            {
+                lock (emitted) { emitted.Add(pcm.Span[0]); }
+                if (pcm.Span[0] == 2) fresh.TrySetResult();
+            },
+            NullLogger.Instance,
+            clockNanos: () => { waiting.TrySetResult(); return anchorNanos; });
+        scheduler.SetAnchor(0, anchorNanos + 10_000_000_000);
+        scheduler.Enqueue(0, Frame(1));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var run = scheduler.RunAsync(cts.Token);
+
+        await waiting.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        scheduler.Flush();
+        scheduler.SetAnchor(352, anchorNanos);
+        scheduler.Enqueue(352, Frame(2));
+        await fresh.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        lock (emitted) { Assert.Equal(new byte[] { 2 }, emitted); }
+
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+    }
+
+    [Fact]
     public async Task LargeDiscontinuityDoesNotAllocateUnboundedSilence()
     {
         const long anchorNanos = 5_000_000_000_000;

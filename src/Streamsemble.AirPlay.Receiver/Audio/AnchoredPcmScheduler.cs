@@ -34,7 +34,8 @@ public sealed class AnchoredPcmScheduler(
     private sealed record Anchor(uint Frame, long Nanos);
 
     private readonly object _enqueueGate = new();
-    private readonly Channel<(uint Rtp, byte[] Pcm)> _frames = Channel.CreateUnbounded<(uint, byte[])>();
+    private readonly Channel<(uint Rtp, byte[] Pcm, long Generation)> _frames =
+        Channel.CreateUnbounded<(uint, byte[], long)>();
     private readonly Func<long> _now = clockNanos ?? (() => PtpReceiverClock.NowNanos);
     private Anchor? _anchor;
     private bool _fallback;
@@ -42,11 +43,15 @@ public sealed class AnchoredPcmScheduler(
     private uint? _nextRtp;
     private long _concealedSamples;
     private long _nextConcealmentLogSamples = 1;
+    private long _generation;
 
     /// <summary>Latest 0xD7 mapping: frame is audible at the grandmaster reading.</summary>
     public void SetAnchor(uint frame, long nanos) => Volatile.Write(ref _anchor, new Anchor(frame, nanos));
 
     public bool HasAnchor => Volatile.Read(ref _anchor) is not null;
+
+    /// <summary>Missing realtime samples replaced with silence during this stream.</summary>
+    public long ConcealedSamples => Interlocked.Read(ref _concealedSamples);
 
     public void Enqueue(uint rtp, byte[] pcm)
     {
@@ -94,7 +99,7 @@ public sealed class AnchoredPcmScheduler(
                     while (gap > 0)
                     {
                         var missing = Math.Min(gap, PcmFrame.SamplesPerFrame);
-                        _frames.Writer.TryWrite((next, new byte[missing * blockAlign]));
+                        _frames.Writer.TryWrite((next, new byte[missing * blockAlign], _generation));
                         next = unchecked(next + (uint)missing);
                         gap -= missing;
                     }
@@ -107,7 +112,7 @@ public sealed class AnchoredPcmScheduler(
                 }
             }
 
-            _frames.Writer.TryWrite((rtp, pcm));
+            _frames.Writer.TryWrite((rtp, pcm, _generation));
             _nextRtp = unchecked(rtp + (uint)samples);
         }
     }
@@ -117,6 +122,7 @@ public sealed class AnchoredPcmScheduler(
     {
         lock (_enqueueGate)
         {
+            _generation++;
             while (_frames.Reader.TryRead(out _))
             {
             }
@@ -128,15 +134,21 @@ public sealed class AnchoredPcmScheduler(
     public async Task RunAsync(CancellationToken ct)
     {
         long firstFrameAt = 0;
-        await foreach (var (rtp, pcm) in _frames.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+        await foreach (var (rtp, pcm, generation) in _frames.Reader.ReadAllAsync(ct).ConfigureAwait(false))
         {
             var anchor = Volatile.Read(ref _anchor);
             if (anchor is null && !_fallback)
             {
                 firstFrameAt = firstFrameAt == 0 ? _now() : firstFrameAt;
-                while ((anchor = Volatile.Read(ref _anchor)) is null && _now() - firstFrameAt < 1_000_000_000)
+                while (generation == Volatile.Read(ref _generation)
+                    && (anchor = Volatile.Read(ref _anchor)) is null && _now() - firstFrameAt < 1_000_000_000)
                 {
                     await Task.Delay(50, ct).ConfigureAwait(false);
+                }
+
+                if (generation != Volatile.Read(ref _generation))
+                {
+                    continue;
                 }
 
                 _fallback = anchor is null;
@@ -147,7 +159,7 @@ public sealed class AnchoredPcmScheduler(
             }
 
             long audibleAt = 0;
-            while (anchor is not null)
+            while (anchor is not null && generation == Volatile.Read(ref _generation))
             {
                 audibleAt = anchor.Nanos + unchecked((int)(rtp - anchor.Frame)) * 1_000_000_000L / 44100;
                 var aheadNs = audibleAt - leadNanos - _now();
@@ -171,7 +183,16 @@ public sealed class AnchoredPcmScheduler(
                 anchor = Volatile.Read(ref _anchor);
             }
 
-            emit(pcm, audibleAt);
+            lock (_enqueueGate)
+            {
+                // FLUSH also invalidates a frame already removed from the
+                // queue and waiting for its deadline. Otherwise it can revive
+                // paused playback or contaminate the new decoder generation.
+                if (generation == _generation)
+                {
+                    emit(pcm, audibleAt);
+                }
+            }
         }
     }
 }
