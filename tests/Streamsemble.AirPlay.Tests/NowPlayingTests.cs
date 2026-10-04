@@ -30,6 +30,8 @@ public class NowPlayingTests
         /// <summary>Content types this receiver refuses, mimicking one that renders audio but rejects metadata.</summary>
         public HashSet<string> Reject { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+        public Func<Request, Task>? BeforeReply { get; set; }
+
         public FakeReceiver()
         {
             _listener = new TcpListener(IPAddress.Loopback, 0);
@@ -77,6 +79,11 @@ public class NowPlayingTests
                     lock (Received)
                     {
                         Received.Add(request);
+                    }
+
+                    if (BeforeReply is { } beforeReply)
+                    {
+                        await beforeReply(request).ConfigureAwait(false);
                     }
 
                     var status = request.ContentType is { } type && Reject.Contains(type)
@@ -243,6 +250,107 @@ public class NowPlayingTests
         lock (receiver.Received)
         {
             Assert.Equal(2, receiver.Received.Count(r => r.ContentType!.StartsWith("image/")));
+        }
+    }
+
+    [Fact]
+    public async Task UpdatedArtworkForTheSameTrackReplacesTheEarlierCover()
+    {
+        using var receiver = new FakeReceiver();
+        using var client = new RtspClient(NullLogger.Instance);
+        await client.ConnectAsync(IPAddress.Loopback, receiver.Port, CancellationToken.None);
+        var sender = new NowPlaying(client, "Test Speaker", NullLogger.Instance);
+        var updated = FullTrack with { Artwork = [1, 2, 3, 4] };
+
+        await sender.SendAsync(FullTrack, 44100, CancellationToken.None);
+        await sender.SendAsync(updated, 88200, CancellationToken.None);
+        await sender.SendAsync(updated with { Artwork = [1, 2, 3, 4] }, 132300, CancellationToken.None);
+
+        lock (receiver.Received)
+        {
+            var covers = receiver.Received.Where(r => r.ContentType!.StartsWith("image/")).ToList();
+            Assert.Equal(2, covers.Count);
+            Assert.Equal(FullTrack.Artwork, covers[0].Body);
+            Assert.Equal(updated.Artwork, covers[1].Body);
+        }
+    }
+
+    [Fact]
+    public async Task ChangedArtworkMimeTypeIsResent()
+    {
+        using var receiver = new FakeReceiver();
+        using var client = new RtspClient(NullLogger.Instance);
+        await client.ConnectAsync(IPAddress.Loopback, receiver.Port, CancellationToken.None);
+        var sender = new NowPlaying(client, "Test Speaker", NullLogger.Instance);
+
+        await sender.SendAsync(FullTrack, 44100, CancellationToken.None);
+        await sender.SendAsync(FullTrack with { ArtworkMimeType = "image/png" }, 88200, CancellationToken.None);
+
+        lock (receiver.Received)
+        {
+            var covers = receiver.Received.Where(r => r.ContentType!.StartsWith("image/")).ToList();
+            Assert.Equal(2, covers.Count);
+            Assert.Equal("image/png", covers[1].ContentType);
+        }
+    }
+
+    [Fact]
+    public async Task RejectedArtworkIsRetriedOnTheNextUpdate()
+    {
+        using var receiver = new FakeReceiver();
+        receiver.Reject.Add("image/jpeg");
+        using var client = new RtspClient(NullLogger.Instance);
+        await client.ConnectAsync(IPAddress.Loopback, receiver.Port, CancellationToken.None);
+        var sender = new NowPlaying(client, "Test Speaker", NullLogger.Instance);
+
+        await sender.SendAsync(FullTrack, 44100, CancellationToken.None);
+        receiver.Reject.Clear();
+        await sender.SendAsync(FullTrack, 88200, CancellationToken.None);
+        await sender.SendAsync(FullTrack, 132300, CancellationToken.None);
+
+        lock (receiver.Received)
+        {
+            Assert.Equal(2, receiver.Received.Count(r => r.ContentType == "image/jpeg"));
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentUpdatesKeepEachTrackAndArtworkTogether()
+    {
+        using var receiver = new FakeReceiver();
+        var firstRequestArrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstRequest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        receiver.BeforeReply = request =>
+        {
+            if (request.Headers["RTP-Info"] == "rtptime=44100" && request.ContentType == "text/parameters")
+            {
+                firstRequestArrived.SetResult();
+                return releaseFirstRequest.Task;
+            }
+
+            return Task.CompletedTask;
+        };
+        using var client = new RtspClient(NullLogger.Instance);
+        await client.ConnectAsync(IPAddress.Loopback, receiver.Port, CancellationToken.None);
+        var sender = new NowPlaying(client, "Test Speaker", NullLogger.Instance);
+
+        var first = sender.SendAsync(FullTrack, 44100, CancellationToken.None);
+        await firstRequestArrived.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var second = sender.SendAsync(
+            FullTrack with { TrackId = "spotify:track:second", Title = "Second Song", Artwork = [1, 2, 3, 4] },
+            88200, CancellationToken.None);
+        releaseFirstRequest.SetResult();
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
+
+        lock (receiver.Received)
+        {
+            Assert.Equal(6, receiver.Received.Count);
+            Assert.Equal(
+                ["rtptime=44100", "rtptime=44100", "rtptime=44100", "rtptime=88200", "rtptime=88200", "rtptime=88200"],
+                receiver.Received.Select(r => r.Headers["RTP-Info"]));
+            Assert.Equal("image/jpeg", receiver.Received[2].ContentType);
+            Assert.Contains("Second Song", receiver.Received[4].BodyText);
+            Assert.Equal(new byte[] { 1, 2, 3, 4 }, receiver.Received[5].Body);
         }
     }
 

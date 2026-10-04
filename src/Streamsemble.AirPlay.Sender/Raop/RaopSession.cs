@@ -170,12 +170,15 @@ public sealed class RaopSession(string displayName, IPAddress address, int rtspP
 
     private NowPlaying? _nowPlaying;
 
+    // Concurrent first updates must use the same sender and batch lock.
+    private NowPlaying GetNowPlaying() => LazyInitializer.EnsureInitialized(
+        ref _nowPlaying, () => new NowPlaying(_rtsp, DisplayName, logger));
+
     public async Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct)
     {
         try
         {
-            _nowPlaying ??= new NowPlaying(_rtsp, DisplayName, logger);
-            await _nowPlaying.SendAsync(metadata, _lastKnownRtpTime, ct).ConfigureAwait(false);
+            await GetNowPlaying().SendAsync(metadata, _lastKnownRtpTime, ct).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

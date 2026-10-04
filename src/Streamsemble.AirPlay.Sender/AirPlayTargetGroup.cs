@@ -1293,13 +1293,28 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         }
     }
 
-    public async Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct = default)
+    public Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct = default)
     {
         // Cached so a speaker that connects mid-track (late join, reconnect,
         // health-loop rebuild) gets the current track instead of a blank
         // display until whatever is playing happens to end.
         _metadata = metadata;
-        foreach (var session in SessionSnapshot())
+        return SendMetadataToSessionsAsync(SessionSnapshot(), metadata, _logger, ct);
+    }
+
+    internal static Task SendMetadataToSessionsAsync(
+        IEnumerable<ITargetSession> sessions,
+        TrackMetadata metadata,
+        ILogger logger,
+        CancellationToken ct)
+    {
+        // Enqueue each update on every session before waiting for any of
+        // them. A slow speaker must not hold up the others or let a newer
+        // update overtake this one while the group is walking its sessions.
+        // Each session keeps its own track/artwork batch together.
+        return Task.WhenAll(sessions.Select(SendAsync));
+
+        async Task SendAsync(ITargetSession session)
         {
             try
             {
@@ -1307,7 +1322,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogWarning(ex, "{Name}: metadata update failed", session.DisplayName);
+                logger.LogWarning(ex, "{Name}: metadata update failed", session.DisplayName);
             }
         }
     }

@@ -36,6 +36,27 @@ public sealed record TrackMetadata
         !string.IsNullOrEmpty(Title) || !string.IsNullOrEmpty(Artist) || !string.IsNullOrEmpty(Album);
 
     /// <summary>
+    /// Identifies the artwork itself, independently of the track. AirPlay
+    /// sends text and images separately, so a track can receive corrected
+    /// artwork after its title has already changed.
+    /// </summary>
+    public string? ArtworkVersion()
+    {
+        if (Artwork is not { Length: > 0 } artwork)
+        {
+            return null;
+        }
+
+        using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(
+            System.Security.Cryptography.HashAlgorithmName.SHA256);
+        var mime = string.IsNullOrEmpty(ArtworkMimeType) ? "image/jpeg" : ArtworkMimeType;
+        hash.AppendData(System.Text.Encoding.UTF8.GetBytes(mime));
+        hash.AppendData([0]);
+        hash.AppendData(artwork);
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    /// <summary>
     /// Stable 64-bit identity for the DMAP <c>mper</c> tag: receivers use it to
     /// tell "new track" from "same track, updated progress", and to associate a
     /// cover-art push with the listing item it belongs to.

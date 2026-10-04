@@ -19,48 +19,63 @@ namespace Streamsemble.AirPlay.Sender.Raop;
 /// Order matters: a receiver that gets artwork before a listing item has
 /// nothing to attach it to and drops it.
 ///
-/// Instance state exists for one reason — artwork is by far the largest part
-/// and changes only on a track change, while progress updates arrive on every
-/// play, pause and seek. Sending the same JPEG again on each of those wastes
-/// the control channel and makes some receivers redraw.
+/// Artwork is by far the largest part, while progress updates arrive on every
+/// play, pause and seek. Suppress unchanged artwork after a successful send,
+/// but allow a cover arriving after its track listing to replace an earlier
+/// image. Keep each listing/artwork batch together even when updates overlap.
 /// </summary>
 public sealed class NowPlaying(RtspClient rtsp, string displayName, ILogger logger)
 {
-    private ulong _artworkSentFor;
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private ArtworkKey? _artworkSent;
+    private int _resetVersion;
+
+    private sealed record ArtworkKey(int ResetVersion, ulong TrackId, string Version);
 
     /// <summary>Forget what this receiver has been sent — after a reconnect it is a blank slate again.</summary>
-    public void Reset() => _artworkSentFor = 0;
+    public void Reset() => Interlocked.Increment(ref _resetVersion);
 
     public async Task SendAsync(TrackMetadata metadata, uint rtpTime, CancellationToken ct)
     {
-        var rtpInfo = new Dictionary<string, string> { ["RTP-Info"] = $"rtptime={rtpTime}" };
-
-        await SendOneAsync("progress", "text/parameters", Dmap.Progress(metadata, rtpTime), rtpInfo, ct)
-            .ConfigureAwait(false);
-
-        if (metadata.HasContent)
+        await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            await SendOneAsync("track", Dmap.ContentType, Dmap.TrackItem(metadata), rtpInfo, ct).ConfigureAwait(false);
-        }
+            // A reset during an in-flight send must not let that send populate
+            // the cache for the receiver's new session.
+            var resetVersion = Volatile.Read(ref _resetVersion);
+            var rtpInfo = new Dictionary<string, string> { ["RTP-Info"] = $"rtptime={rtpTime}" };
 
-        if (metadata.Artwork is { Length: > 0 } artwork)
-        {
-            // Non-zero id keeps "sent" distinguishable from the initial state,
-            // so a track whose id happens to hash to 0 still gets its art.
-            var artworkId = metadata.PersistentId() | 1UL;
-            if (artworkId != _artworkSentFor)
+            await SendOneAsync("progress", "text/parameters", Dmap.Progress(metadata, rtpTime), rtpInfo, ct)
+                .ConfigureAwait(false);
+
+            if (metadata.HasContent)
             {
-                var mime = string.IsNullOrEmpty(metadata.ArtworkMimeType) ? "image/jpeg" : metadata.ArtworkMimeType;
-                await SendOneAsync("artwork", mime, artwork, rtpInfo, ct).ConfigureAwait(false);
-                _artworkSentFor = artworkId;
+                await SendOneAsync("track", Dmap.ContentType, Dmap.TrackItem(metadata), rtpInfo, ct).ConfigureAwait(false);
             }
-        }
 
-        logger.LogDebug("{Name}: now-playing sent at rtptime {Rtp} ({Title})",
-            displayName, rtpTime, metadata.Title ?? "no title");
+            if (metadata.Artwork is { Length: > 0 } artwork)
+            {
+                var artworkKey = new ArtworkKey(resetVersion, metadata.PersistentId(), metadata.ArtworkVersion()!);
+                if (artworkKey != _artworkSent)
+                {
+                    var mime = string.IsNullOrEmpty(metadata.ArtworkMimeType) ? "image/jpeg" : metadata.ArtworkMimeType;
+                    if (await SendOneAsync("artwork", mime, artwork, rtpInfo, ct).ConfigureAwait(false))
+                    {
+                        _artworkSent = artworkKey;
+                    }
+                }
+            }
+
+            logger.LogDebug("{Name}: now-playing sent at rtptime {Rtp} ({Title})",
+                displayName, rtpTime, metadata.Title ?? "no title");
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
     }
 
-    private async Task SendOneAsync(
+    private async Task<bool> SendOneAsync(
         string what,
         string contentType,
         byte[] body,
@@ -75,5 +90,7 @@ public sealed class NowPlaying(RtspClient rtsp, string displayName, ILogger logg
             logger.LogDebug("{Name}: {What} metadata rejected ({Status} {Reason})",
                 displayName, what, response.StatusCode, response.ReasonPhrase);
         }
+
+        return response.IsSuccess;
     }
 }

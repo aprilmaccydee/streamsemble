@@ -68,9 +68,9 @@ public static class WebApi
                     discNumber = meta.DiscNumber,
                     durationMs = meta.Duration?.TotalMilliseconds,
                     positionMs = meta.Position?.TotalMilliseconds,
-                    // Versioned by track identity so the browser refetches on
-                    // track change but caches within one track.
-                    artworkUrl = meta.Artwork is { Length: > 0 } ? $"/api/artwork?v={meta.PersistentId():x}" : null,
+                    // Text and artwork arrive separately. A corrected cover
+                    // needs a fresh URL even if the track identity is unchanged.
+                    artworkUrl = meta.ArtworkVersion() is { } artworkVersion ? $"/api/artwork?v={artworkVersion}" : null,
                     artworkSourceUrl = meta.ArtworkUrl,
                 },
                 volume = averageVolume ?? status.Volume,
@@ -130,15 +130,25 @@ public static class WebApi
             });
         });
 
-        // Cover art for the current track, straight from the source's metadata
-        // — the same bytes the speakers were sent, so what the browser shows is
-        // proof of what went out.
-        app.MapGet("/api/artwork", (PlaybackStatus status) =>
+        // Versioned URLs always identify the requested bytes, even if a new
+        // cover arrives between the state poll and the image request.
+        app.MapGet("/api/artwork", (string? v, PlaybackStatus status, HttpResponse response) =>
         {
             var meta = status.Metadata;
-            return meta.Artwork is { Length: > 0 } art
-                ? Results.File(art, meta.ArtworkMimeType ?? "image/jpeg")
-                : Results.NotFound();
+            var version = meta.ArtworkVersion();
+            if (version is null || (v is not null && !string.Equals(v, version, StringComparison.Ordinal)))
+            {
+                response.Headers.CacheControl = "no-store";
+                return Results.NotFound();
+            }
+
+            // The UI rebuilds the image every second. Content-addressed URLs
+            // can be cached; the unversioned compatibility URL cannot.
+            response.Headers.CacheControl = v is not null
+                ? "private, max-age=31536000, immutable"
+                : "no-store";
+            var mime = string.IsNullOrEmpty(meta.ArtworkMimeType) ? "image/jpeg" : meta.ArtworkMimeType;
+            return Results.File(meta.Artwork!, mime);
         });
 
         // Per-speaker volume. A display that is showing the mirrored screen is

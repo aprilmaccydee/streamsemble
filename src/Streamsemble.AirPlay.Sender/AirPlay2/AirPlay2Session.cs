@@ -123,6 +123,11 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
     private Raop.NowPlaying? _nowPlaying;
 
+    // The anchor and source updates can arrive together. They must share
+    // one sender so its batch lock also covers concurrent first updates.
+    private Raop.NowPlaying GetNowPlaying() => LazyInitializer.EnsureInitialized(
+        ref _nowPlaying, () => new Raop.NowPlaying(_rtsp, DisplayName, logger));
+
     public async Task SetMetadataAsync(TrackMetadata metadata, CancellationToken ct)
     {
         _metadata = metadata;
@@ -137,8 +142,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
         try
         {
-            _nowPlaying ??= new Raop.NowPlaying(_rtsp, DisplayName, logger);
-            await _nowPlaying.SendAsync(metadata, CurrentRtpTime, ct).ConfigureAwait(false);
+            await GetNowPlaying().SendAsync(metadata, CurrentRtpTime, ct).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -995,8 +999,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     {
         try
         {
-            _nowPlaying ??= new Raop.NowPlaying(_rtsp, DisplayName, logger);
-            await _nowPlaying.SendAsync(_metadata, currentRtp, ct).ConfigureAwait(false);
+            await GetNowPlaying().SendAsync(_metadata, currentRtp, ct).ConfigureAwait(false);
             logger.LogInformation("{Name}: sent now-playing at anchor ({Title})",
                 DisplayName, _metadata.Title ?? "progress only — no track metadata yet");
         }

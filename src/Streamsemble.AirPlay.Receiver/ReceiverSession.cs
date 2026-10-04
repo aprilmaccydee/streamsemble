@@ -1365,14 +1365,36 @@ public sealed class ReceiverSession(
         {
             if (DmapMetadata.Parse(request.Body) is { } parsed)
             {
-                _metadata = _metadata with { Title = parsed.Title, Artist = parsed.Artist, Album = parsed.Album };
+                var trackId = parsed.PersistentId is { } id ? $"airplay:{id:x16}" : null;
+                var textChanged = (parsed.Title is not null && parsed.Title != _metadata.Title)
+                    || (parsed.Artist is not null && parsed.Artist != _metadata.Artist)
+                    || (parsed.Album is not null && parsed.Album != _metadata.Album);
+                var trackChanged = trackId is not null ? trackId != _metadata.TrackId : textChanged;
+
+                // The listing and cover arrive separately. Start a new track
+                // without the previous cover, but merge optional fields on
+                // same-track updates (including listings that omit mper).
+                var previous = trackChanged ? new TrackMetadata() : _metadata;
+                var next = previous with
+                {
+                    Title = parsed.Title ?? previous.Title,
+                    Artist = parsed.Artist ?? previous.Artist,
+                    Album = parsed.Album ?? previous.Album,
+                    TrackId = trackId ?? previous.TrackId,
+                };
+
+                _metadata = next;
                 source.PushMetadata(_metadata);
                 logger.LogInformation("now playing: {Artist} — {Title}", parsed.Artist, parsed.Title);
             }
         }
         else if (contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
         {
-            _metadata = _metadata with { Artwork = request.Body, ArtworkMimeType = contentType };
+            _metadata = _metadata with
+            {
+                Artwork = request.Body.Length > 0 ? request.Body : null,
+                ArtworkMimeType = request.Body.Length > 0 ? contentType : null,
+            };
             source.PushMetadata(_metadata);
         }
         else if (contentType.Contains("text/parameters", StringComparison.OrdinalIgnoreCase))
@@ -1522,16 +1544,18 @@ public sealed class ReceiverSession(
     }
 }
 
-/// <summary>Minimal DMAP (DAAP) parser for inbound now-playing metadata (mlit{minm,asar,asal}).</summary>
+/// <summary>Minimal DMAP (DAAP) parser for inbound track identity and now-playing text.</summary>
 internal static class DmapMetadata
 {
-    public sealed record Parsed(string? Title, string? Artist, string? Album);
+    public sealed record Parsed(string? Title, string? Artist, string? Album, ulong? PersistentId);
 
     public static Parsed? Parse(byte[] body)
     {
         string? title = null, artist = null, album = null;
+        ulong? persistentId = null;
         Walk(body, 0, body.Length);
-        return title is null && artist is null && album is null ? null : new Parsed(title, artist, album);
+        return title is null && artist is null && album is null && persistentId is null
+            ? null : new Parsed(title, artist, album, persistentId);
 
         void Walk(byte[] data, int offset, int end)
         {
@@ -1558,6 +1582,9 @@ internal static class DmapMetadata
                         break;
                     case "asal":
                         album = Encoding.UTF8.GetString(data, valueStart, length);
+                        break;
+                    case "mper" when length == 8:
+                        persistentId = BinaryPrimitives.ReadUInt64BigEndian(data.AsSpan(valueStart, length));
                         break;
                 }
 
