@@ -22,6 +22,13 @@ namespace Streamsemble.Core.Video;
 /// </param>
 public readonly record struct VideoFrame(ReadOnlyMemory<byte> Data, long TargetNanos, bool IsKeyframe)
 {
+    /// <summary>
+    /// The parameter sets in force when this frame arrived. Queued frames can
+    /// outlive a resolution change, so the source's latest config may no longer
+    /// describe them when an output finishes connecting.
+    /// </summary>
+    public VideoCodecConfig? CodecConfig { get; init; }
+
     /// <summary>Length prefix width of the AVCC framing used throughout the video path.</summary>
     public const int LengthPrefixBytes = 4;
 }

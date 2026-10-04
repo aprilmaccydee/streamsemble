@@ -14,15 +14,20 @@ namespace Streamsemble.Core.Video;
 /// </summary>
 public sealed class VideoPump(IVideoSource source, IVideoSink sink, ILogger<VideoPump> logger) : IAsyncDisposable
 {
+    private const int MaxStartupBacklogFrames = 256;
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly object _stateGate = new();
+    private readonly SemaphoreSlim _sinkGate = new(1, 1);
     private Task _loop = Task.CompletedTask;
+    private Task _pendingStop = Task.CompletedTask;
+    private long _streamGeneration;
     private VideoCodecConfig? _streamConfig;
 
     public void Start(CancellationToken ct)
     {
         _linked = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, ct);
-        _loop = RunAsync(_linked.Token);
         source.ActiveChanged += OnActiveChanged;
+        _loop = RunAsync(_linked.Token);
     }
 
     private CancellationTokenSource? _linked;
@@ -39,21 +44,46 @@ public sealed class VideoPump(IVideoSource source, IVideoSink sink, ILogger<Vide
         _ = StopSinkAsync();
     }
 
-    private async Task StopSinkAsync()
+    private Task StopSinkAsync()
     {
-        if (_streamConfig is null)
+        Task previousStop;
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_stateGate)
         {
-            return;
+            // Invalidate synchronously, before teardown waits for an in-flight
+            // connect/frame. Old replay must never publish its config again.
+            _streamGeneration++;
+            _streamConfig = null;
+            previousStop = _pendingStop;
+            _pendingStop = completion.Task;
         }
 
-        _streamConfig = null;
+        _ = FinishStopAsync(previousStop, completion);
+        return completion.Task;
+    }
+
+    private async Task FinishStopAsync(Task previousStop, TaskCompletionSource completion)
+    {
         try
         {
-            await sink.StopStreamAsync(CancellationToken.None).ConfigureAwait(false);
+            await previousStop.ConfigureAwait(false);
+            await _sinkGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await sink.StopStreamAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                _sinkGate.Release();
+            }
         }
         catch (Exception ex)
         {
             logger.LogWarning(ex, "video sink teardown failed");
+        }
+        finally
+        {
+            completion.TrySetResult();
         }
     }
 
@@ -63,18 +93,27 @@ public sealed class VideoPump(IVideoSource source, IVideoSink sink, ILogger<Vide
         {
             await foreach (var frame in source.Frames.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                var config = source.CodecConfig;
-                if (config is null)
+                var config = frame.CodecConfig ?? source.CodecConfig;
+                if (config is null || !source.IsActive)
                 {
                     // Nothing downstream can decode this yet.
                     continue;
                 }
 
-                if (_streamConfig is null)
+                long generation;
+                bool needsStart;
+                lock (_stateGate)
                 {
-                    _streamConfig = config;
-                    logger.LogInformation("video stream starting: {Config}", config.Describe());
-                    await sink.StartStreamAsync(config, ct).ConfigureAwait(false);
+                    generation = _streamGeneration;
+                    needsStart = _streamConfig is null;
+                }
+
+                if (needsStart)
+                {
+                    if (!await StartSinkAsync(config, generation, ct).ConfigureAwait(false))
+                    {
+                        continue;
+                    }
 
                     // Opening the output takes seconds (pairing, SETUP, a TCP
                     // connect), and the source has been filling its queue the
@@ -88,18 +127,29 @@ public sealed class VideoPump(IVideoSource source, IVideoSink sink, ILogger<Vide
                     // live edge. Frames BEFORE that keyframe are the ones a
                     // display would render as corruption (their references are
                     // gone); those are the ones to drop.
-                    var backlog = new List<VideoFrame> { frame };
-                    while (source.Frames.TryRead(out var queued))
+                    List<VideoFrame> backlog;
+                    lock (_stateGate)
                     {
-                        backlog.Add(queued);
+                        if (generation != _streamGeneration || !source.IsActive)
+                        {
+                            continue;
+                        }
+
+                        backlog = [frame];
+                        // A read releases a blocked TCP producer. Bound this
+                        // snapshot so that producer cannot refill the channel
+                        // into an ever-growing List while we drain it.
+                        for (var i = 0; i < MaxStartupBacklogFrames && source.Frames.TryRead(out var queued); i++)
+                        {
+                            backlog.Add(queued);
+                        }
                     }
 
                     var entry = backlog.FindLastIndex(f => f.IsKeyframe);
                     if (entry < 0)
                     {
-                        // The opening IDR overflowed the queue; nothing held
-                        // now would decode. The display stays dark until the
-                        // source produces a fresh keyframe (a config change).
+                        // We joined without an opening IDR; nothing held now
+                        // would decode. Wait for the source's next keyframe.
                         logger.LogWarning(
                             "dropped {Count} backlogged frames — no keyframe among them, waiting for the source to send one",
                             backlog.Count);
@@ -111,20 +161,16 @@ public sealed class VideoPump(IVideoSource source, IVideoSink sink, ILogger<Vide
                         backlog.Count - entry, entry);
                     foreach (var replay in backlog.Skip(entry))
                     {
-                        await sink.WriteAsync(replay, ct).ConfigureAwait(false);
+                        if (!await ForwardAsync(replay, generation, ct).ConfigureAwait(false))
+                        {
+                            break;
+                        }
                     }
 
                     continue;
                 }
 
-                if (!ReferenceEquals(_streamConfig, config))
-                {
-                    _streamConfig = config;
-                    logger.LogInformation("video stream reconfigured: {Config}", config.Describe());
-                    await sink.ReconfigureAsync(config, ct).ConfigureAwait(false);
-                }
-
-                await sink.WriteAsync(frame, ct).ConfigureAwait(false);
+                await ForwardAsync(frame, generation, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -133,6 +179,80 @@ public sealed class VideoPump(IVideoSource source, IVideoSink sink, ILogger<Vide
         catch (Exception ex)
         {
             logger.LogError(ex, "video pump failed");
+        }
+    }
+
+    private async Task<bool> StartSinkAsync(VideoCodecConfig config, long generation, CancellationToken ct)
+    {
+        Task pendingStop;
+        lock (_stateGate) { pendingStop = _pendingStop; }
+        await pendingStop.WaitAsync(ct).ConfigureAwait(false);
+        await _sinkGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            lock (_stateGate)
+            {
+                if (generation != _streamGeneration || !source.IsActive)
+                {
+                    return false;
+                }
+
+                _streamConfig = config;
+            }
+
+            logger.LogInformation("video stream starting: {Config}", config.Describe());
+            await sink.StartStreamAsync(config, ct).ConfigureAwait(false);
+            lock (_stateGate) { return generation == _streamGeneration; }
+        }
+        finally
+        {
+            _sinkGate.Release();
+        }
+    }
+
+    private async ValueTask<bool> ForwardAsync(VideoFrame frame, long generation, CancellationToken ct)
+    {
+        await _sinkGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var config = frame.CodecConfig ?? source.CodecConfig;
+            bool reconfigure;
+            lock (_stateGate)
+            {
+                if (generation != _streamGeneration || _streamConfig is null)
+                {
+                    return false;
+                }
+
+                reconfigure = config is not null && !ReferenceEquals(_streamConfig, config);
+                if (reconfigure)
+                {
+                    _streamConfig = config;
+                }
+            }
+
+            if (reconfigure)
+            {
+                // A resize can happen while the TV is still connecting. Its
+                // config must precede the new IDR, including backlog replay.
+                logger.LogInformation("video stream reconfigured: {Config}", config!.Describe());
+                await sink.ReconfigureAsync(config, ct).ConfigureAwait(false);
+            }
+
+            lock (_stateGate)
+            {
+                if (generation != _streamGeneration)
+                {
+                    return false;
+                }
+            }
+
+            await sink.WriteAsync(frame, ct).ConfigureAwait(false);
+            lock (_stateGate) { return generation == _streamGeneration; }
+        }
+        finally
+        {
+            _sinkGate.Release();
         }
     }
 
@@ -163,6 +283,7 @@ public sealed class VideoPump(IVideoSource source, IVideoSink sink, ILogger<Vide
         }
 
         await StopSinkAsync().ConfigureAwait(false);
+        _sinkGate.Dispose();
         _linked?.Dispose();
         _lifetime.Dispose();
     }

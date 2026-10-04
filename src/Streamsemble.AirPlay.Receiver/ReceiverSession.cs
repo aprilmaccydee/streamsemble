@@ -1024,11 +1024,10 @@ public sealed class ReceiverSession(
                 : null,
             MapTimestamp = mapTimestamp,
             OnCodecConfig = videoSource.PushCodecConfig,
-            OnAccessUnit = (frame, _) =>
+            OnAccessUnit = async (frame, ct) =>
             {
                 videoSource.MarkActive();
-                videoSource.PushAccessUnit(frame);
-                return ValueTask.CompletedTask;
+                await videoSource.PushAccessUnitAsync(frame, ct).ConfigureAwait(false);
             },
             OnClosed = videoSource.MarkIdle,
         };

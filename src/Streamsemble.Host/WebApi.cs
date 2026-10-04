@@ -20,6 +20,8 @@ public static class WebApi
 
     public sealed record SpeakerVolumeRequest(string Name, float Volume);
 
+    public sealed record VideoSyncRequest(bool? HardSyncEnabled);
+
     public sealed record WledColorRequest(byte R, byte G, byte B, string? Device = null);
 
     public sealed record WledPixelsRequest(byte[][] Pixels, int Start = 0, string? Device = null);
@@ -149,6 +151,17 @@ public static class WebApi
                 : "no-store";
             var mime = string.IsNullOrEmpty(meta.ArtworkMimeType) ? "image/jpeg" : meta.ArtworkMimeType;
             return Results.File(meta.Artwork!, mime);
+        });
+
+        app.MapPost("/api/video/sync", (VideoSyncRequest request, VideoTargetGroup video) =>
+        {
+            if (request.HardSyncEnabled is not { } enabled)
+            {
+                return Results.BadRequest(new { error = "hardSyncEnabled must be true or false" });
+            }
+
+            video.SetHardSyncEnabled(enabled);
+            return Results.Ok(new { hardSyncEnabled = video.HardSyncEnabled });
         });
 
         // Per-speaker volume. A display that is showing the mirrored screen is
@@ -367,6 +380,7 @@ public static class WebApi
                 framesReceived = mirror.FramesEmitted,
             },
             forwarding = telemetry.Streaming,
+            hardSyncEnabled = telemetry.HardSyncEnabled,
             target = telemetry.TargetName,
             resolution = telemetry.Resolution,
             pairing = telemetry.Pairing,

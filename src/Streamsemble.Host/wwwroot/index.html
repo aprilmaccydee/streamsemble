@@ -94,6 +94,13 @@
     .speaker .proto { font-size:10px; padding:1px 6px; border-radius:99px; background:#1e2635; color:var(--muted); border:1px solid var(--line); vertical-align:2px; }
     input[type=checkbox] { width:20px; height:20px; accent-color:var(--accent); cursor:pointer; }
 
+    /* Screen */
+    .screen-sync { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .screen-sync label { display:flex; align-items:center; gap:8px; cursor:pointer; }
+    .screen-sync input:disabled { cursor:wait; }
+    .screen-sync-error { color:var(--serious); font-size:12px; margin-top:6px; }
+    .screen-sync-error:empty { display:none; }
+
     /* Lights */
     .light-row { display:flex; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--line); }
     .light-row:first-of-type { border-top:none; }
@@ -175,8 +182,13 @@
     <section class="card" id="screencard" style="display:none">
       <h2>Screen</h2>
       <div class="groupline" id="screenline"></div>
+      <div class="screen-sync">
+        <label><input type="checkbox" id="videoHardSync" checked aria-describedby="videoSyncNote" /> Hard sync</label>
+        <span class="chip" id="videoSyncMode">Synced with audio</span>
+      </div>
+      <div class="lightnote" id="videoSyncNote">Turn off while arranging windows, then turn back on to sync the picture with the speakers.</div>
+      <div class="screen-sync-error" id="videoSyncError" role="status"></div>
       <dl class="techgrid tech" id="screengrid"></dl>
-      <div class="lightnote">The picture is scheduled on the same timeline as the sound: each frame carries the instant the Mac wanted it visible, and the TV renders it then — the moment the speakers play what goes with it.</div>
     </section>
 
     <section class="card" id="lightscard" style="display:none">
@@ -504,8 +516,55 @@
 
     // ---- Screen mirroring --------------------------------------------------
 
-    function renderScreen(s) {
+    let videoSyncEnabled = true;
+    let videoSyncPending = false;
+    let videoSyncRevision = 0;
+
+    function renderVideoSync(enabled) {
+      videoSyncEnabled = enabled;
+      $("videoHardSync").checked = enabled;
+      $("videoSyncMode").textContent = enabled ? "Synced with audio" : "Low latency";
+      $("videoSyncNote").textContent = enabled
+        ? "Turn off while arranging windows, then turn back on when ready. The picture may briefly pause as sync returns."
+        : "The picture responds sooner and leads the audio. Turn hard sync back on when you're ready to watch.";
+    }
+
+    async function postVideoSync(enabled) {
+      if (videoSyncPending) return;
+      const previous = videoSyncEnabled;
+      videoSyncPending = true;
+      videoSyncRevision++;
+      $("videoHardSync").disabled = true;
+      $("videoSyncMode").textContent = "Switching…";
+      $("videoSyncError").textContent = "";
+      try {
+        const response = await fetch("/api/video/sync", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ hardSyncEnabled: enabled })
+        });
+        if (!response.ok) throw new Error("Video sync request failed");
+        const result = await response.json();
+        if (typeof result.hardSyncEnabled !== "boolean") throw new Error("Invalid video sync response");
+        renderVideoSync(result.hardSyncEnabled);
+      } catch (e) {
+        renderVideoSync(previous);
+        $("videoSyncError").textContent = "Could not change video sync. Try again.";
+      } finally {
+        videoSyncRevision++;
+        videoSyncPending = false;
+        $("videoHardSync").disabled = false;
+        refresh();
+      }
+    }
+
+    $("videoHardSync").addEventListener("change", () => postVideoSync($("videoHardSync").checked));
+
+    function renderScreen(s, syncRevision) {
       const v = s.video || {};
+      // A poll started before the toggle must not overwrite its response.
+      if (!videoSyncPending && syncRevision === videoSyncRevision) {
+        renderVideoSync(v.hardSyncEnabled !== false);
+      }
       // The card stays hidden until a screen actually arrives — nobody wants a
       // permanently empty panel for a feature they aren't using.
       const show = v.receiving || v.forwarding || (v.source && v.source.framesReceived > 0);
@@ -667,6 +726,7 @@
     // ---- Poll loop ---------------------------------------------------------
 
     async function refresh() {
+      const syncRevision = videoSyncRevision;
       try {
         const s = await (await fetch("/api/state")).json();
         lastState = s;
@@ -680,7 +740,7 @@
         renderSync(s);
         renderTech(s);
         renderSpeakers(s);
-        renderScreen(s);
+        renderScreen(s, syncRevision);
         renderLights(s);
       } catch (e) { /* transient */ }
     }

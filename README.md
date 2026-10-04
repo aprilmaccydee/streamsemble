@@ -76,10 +76,13 @@ English. This README is the deeper technical reference.
 - Debugging on macOS: `/usr/bin/log show --predicate 'process ==
   "AirPlayXPCHelper"'` shows the sender's engine/transport decisions
   (activation options, chosen `AudioEngineType`, per-connection dials).
-- **A mirror sender emits ONE keyframe, ever** — at stream open, and again
-  only on a config (resolution) change. Anything that drops it and "waits for
-  the next keyframe" waits forever; on connect the hub replays the queued
-  backlog from its newest IDR and fast-forwards to the live edge instead.
+- **A Mac may send no new keyframe until its resolution changes.** Dropping
+  the opening IDR or its following reference frames can leave the picture
+  blank until a resize. The bounded video queue backpressures the incoming
+  TCP stream during a slow connection instead of discarding frames. On
+  connect, the hub replays from the newest queued IDR and catches up to the
+  live edge. Each frame retains its codec config so a resize during connection
+  sends the matching parameter sets before the new picture.
 - **Mirror video to a modern TV must be VCL-only, sealed with the ChaCha
   DataStream envelope.** SPS/PPS reach the TV solely via the unencrypted avcC
   config packet — inline parameter sets render as a black screen, and so does
@@ -152,6 +155,12 @@ on the same LAN at `http://<host-ip>:8088`). The page:
   out, render lead, the display's volume), and whether the display granted
   the companion audio stream — "receiving but not forwarding" is a real state
   the card can tell apart from nothing happening at all,
+- offers a **Hard sync toggle** in the Screen card: turn it off for a more
+  responsive picture while arranging windows, then back on to align video
+  with the speakers. Audio keeps its group timing, so the picture leads it
+  in low-latency mode. Restoring sync may briefly hold the picture while the
+  delay rebuilds; neither switch requires restarting the mirror. Hard sync
+  defaults to on at hub startup; the choice lasts until the hub restarts,
 - shows a **Lights card** when WLED strips are configured: per-strip on/off,
   light mode (Pulse / Vu / Spectrum), palette (Classic / Solid / Rainbow),
   color, master brightness, fall time, and mirror/reverse geometry, all
@@ -166,7 +175,10 @@ mirroring snapshot and `wled[]` device state), `POST /api/targets`
 (`{ "targets": [ { "name": "Living Room" } ] }`),
 `POST /api/volume` (`{ "volume": 0.7 }`, all speakers),
 `POST /api/speakers/volume` (`{ "name": "Kitchen", "volume": 0.4 }`, one
-speaker) and the `/api/wled/*` endpoints listed under configuration.
+speaker), `POST /api/video/sync` (`{ "hardSyncEnabled": false }` for a
+responsive picture, `true` to restore audio sync; reported as
+`video.hardSyncEnabled` in state), and the `/api/wled/*` endpoints listed
+under configuration.
 Configured `AirPlaySender:Targets` seed the initial selection, so
 headless/config-only operation still works.
 

@@ -17,11 +17,14 @@ public sealed class MirrorVideoSource() : VideoSourceBase("AirPlay Mirror")
     /// <summary>Last frame's render stamp, for the telemetry panel.</summary>
     public long LastTargetNanos { get; private set; }
 
-    internal void PushAccessUnit(VideoFrame frame)
+    internal async ValueTask PushAccessUnitAsync(VideoFrame frame, CancellationToken ct = default)
     {
+        // Config is part of this frame's decoder epoch. A later resolution
+        // change must not configure an older frame that waited in the queue.
+        frame = frame with { CodecConfig = CodecConfig };
+        await EmitFrameAsync(frame, ct).ConfigureAwait(false);
         FramesEmitted++;
         LastTargetNanos = frame.TargetNanos;
-        EmitFrame(frame);
     }
 
     internal void PushCodecConfig(VideoCodecConfig config) => SetCodecConfig(config);
