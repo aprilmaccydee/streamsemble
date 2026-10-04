@@ -1,5 +1,6 @@
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
+using Streamsemble.Core.Audio;
 using Streamsemble.Timing.Ptp;
 
 namespace Streamsemble.AirPlay.Receiver.Audio;
@@ -25,26 +26,102 @@ public sealed class AnchoredPcmScheduler(
     long leadNanos = 0,
     Func<long>? clockNanos = null)
 {
+    // Ordinary packet loss must occupy time in the outgoing sample clock.
+    // Bound concealment so a seek or a new RTP epoch cannot enqueue hours
+    // of silence before its first real frame.
+    internal const int MaxConcealmentSamples = 2 * 44100;
+
     private sealed record Anchor(uint Frame, long Nanos);
 
+    private readonly object _enqueueGate = new();
     private readonly Channel<(uint Rtp, byte[] Pcm)> _frames = Channel.CreateUnbounded<(uint, byte[])>();
     private readonly Func<long> _now = clockNanos ?? (() => PtpReceiverClock.NowNanos);
     private Anchor? _anchor;
     private bool _fallback;
     private bool _budgetWarned;
+    private uint? _nextRtp;
+    private long _concealedSamples;
+    private long _nextConcealmentLogSamples = 1;
 
     /// <summary>Latest 0xD7 mapping: frame is audible at the grandmaster reading.</summary>
     public void SetAnchor(uint frame, long nanos) => Volatile.Write(ref _anchor, new Anchor(frame, nanos));
 
     public bool HasAnchor => Volatile.Read(ref _anchor) is not null;
 
-    public void Enqueue(uint rtp, byte[] pcm) => _frames.Writer.TryWrite((rtp, pcm));
+    public void Enqueue(uint rtp, byte[] pcm)
+    {
+        var blockAlign = AudioFormat.Canonical.BlockAlign;
+        var samples = pcm.Length / blockAlign;
+        if (samples == 0)
+        {
+            return;
+        }
+
+        lock (_enqueueGate)
+        {
+            if (_nextRtp is { } next)
+            {
+                // Signed subtraction follows the RTP cursor across uint wrap.
+                var gap = unchecked((int)(rtp - next));
+                if (gap < 0)
+                {
+                    var overlap = -(long)gap;
+                    if (overlap >= samples)
+                    {
+                        return; // duplicate or an already-concealed late packet
+                    }
+
+                    pcm = pcm.AsSpan((int)overlap * blockAlign).ToArray();
+                    samples -= (int)overlap;
+                    rtp = next;
+                }
+                else if (gap <= MaxConcealmentSamples)
+                {
+                    // Simply omitting a lost packet compresses the source's
+                    // running sample counter. Buffered AAC receivers keep
+                    // their original anchor, so each omission permanently
+                    // consumes their render-head lead until they go silent.
+                    _concealedSamples += gap;
+                    if (_concealedSamples >= _nextConcealmentLogSamples)
+                    {
+                        logger.LogInformation(
+                            "realtime loss concealment: inserted {Samples} samples ({Ms:F0} ms) of silence to preserve the audio timeline",
+                            _concealedSamples, _concealedSamples * 1000.0 / AudioFormat.Canonical.SampleRate);
+                        _nextConcealmentLogSamples = (_concealedSamples / AudioFormat.Canonical.SampleRate + 1)
+                            * AudioFormat.Canonical.SampleRate;
+                    }
+
+                    while (gap > 0)
+                    {
+                        var missing = Math.Min(gap, PcmFrame.SamplesPerFrame);
+                        _frames.Writer.TryWrite((next, new byte[missing * blockAlign]));
+                        next = unchecked(next + (uint)missing);
+                        gap -= missing;
+                    }
+                }
+                else
+                {
+                    logger.LogWarning(
+                        "realtime RTP discontinuity of {GapMs:F0} ms exceeds concealment limit; restarting receive cursor",
+                        gap * 1000.0 / AudioFormat.Canonical.SampleRate);
+                }
+            }
+
+            _frames.Writer.TryWrite((rtp, pcm));
+            _nextRtp = unchecked(rtp + (uint)samples);
+        }
+    }
 
     /// <summary>Sender flush: drop everything queued but keep the anchor mapping.</summary>
     public void Flush()
     {
-        while (_frames.Reader.TryRead(out _))
+        lock (_enqueueGate)
         {
+            while (_frames.Reader.TryRead(out _))
+            {
+            }
+
+            _nextRtp = null;
         }
     }
 
