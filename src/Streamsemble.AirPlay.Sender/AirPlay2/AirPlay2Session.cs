@@ -827,6 +827,10 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
 
     /// <summary>Capture-counter position just past the last PCM handed to this session.</summary>
     private long _pcmCaptureEnd;
+    // The capture cursor and encoder's accepted-input count describe one
+    // completed write. An anchor must never combine counters from different
+    // writes: one 352-sample mismatch anchors this speaker almost 8 ms late.
+    private readonly SemaphoreSlim _pcmInputGate = new(1, 1);
 
     private bool _bufferedAlac;
     private readonly System.Threading.Channels.Channel<byte[]> _alacFrames =
@@ -843,20 +847,33 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     /// position of the first sample (PcmFrame.Timestamp) — the common index
     /// space the group anchor maps onto.
     /// </summary>
-    public ValueTask WritePcmAsync(ReadOnlyMemory<byte> pcm, long captureTimestamp, CancellationToken ct)
+    public async ValueTask WritePcmAsync(ReadOnlyMemory<byte> pcm, long captureTimestamp, CancellationToken ct)
     {
-        Volatile.Write(ref _pcmCaptureEnd, captureTimestamp + pcm.Length / 4);
-
         if (_bufferedAlac)
         {
+            Volatile.Write(ref _pcmCaptureEnd, captureTimestamp + pcm.Length / 4);
             // One PcmFrame (352 samples) per call — pack directly, no encoder.
             var packed = new byte[Raop.AlacPacker.PackedLength(pcm.Length / 4)];
             var length = Raop.AlacPacker.Pack(pcm.Span, packed);
             _alacFrames.Writer.TryWrite(packed[..length]);
-            return ValueTask.CompletedTask;
+            return;
         }
 
-        return _aac?.WritePcmAsync(pcm, ct) ?? ValueTask.CompletedTask;
+        if (_aac is not { } aac)
+        {
+            return;
+        }
+
+        await _pcmInputGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await aac.WritePcmAsync(pcm, ct).ConfigureAwait(false);
+            Volatile.Write(ref _pcmCaptureEnd, captureTimestamp + pcm.Length / 4);
+        }
+        finally
+        {
+            _pcmInputGate.Release();
+        }
     }
 
     private async Task BufferedPumpAsync(Stream tcp, CancellationToken ct)
@@ -928,13 +945,25 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                     // state decode-output time or the whole stream renders
                     // that much late (23 ms vs the ALAC paths, which have no
                     // codec delay).
-                    var ageSamples = _aac is { } aac
-                        ? Math.Max(0, aac.PcmSamplesIn - (_bufferedFramesSent + _bufferedFramesDropped) * samplesPerFrame) + AacEncoderPipe.EncoderDelaySamples
-                        : 0;
-                    // Capture-counter index of the frame being anchored (ALAC
-                    // has no encoder pipeline; its packed-queue skew was never
-                    // tracked and stays untracked).
-                    var captureSample = Volatile.Read(ref _pcmCaptureEnd) - ageSamples;
+                    long ageSamples, captureSample;
+                    await _pcmInputGate.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        ageSamples = _aac is { } aac
+                            ? Math.Max(0, aac.PcmSamplesIn - (_bufferedFramesSent + _bufferedFramesDropped) * samplesPerFrame) + AacEncoderPipe.EncoderDelaySamples
+                            : 0;
+                        // Capture-counter index of the frame being anchored
+                        // (ALAC's packed-queue skew remains untracked). Wait
+                        // for stdin to commit before reading both counters;
+                        // ffmpeg may emit this AU before WritePcmAsync resumes.
+                        captureSample = Volatile.Read(ref _pcmCaptureEnd) - ageSamples;
+                    }
+                    finally
+                    {
+                        // Timing callbacks and RTSP can be slow; only the
+                        // counter snapshot may hold up subsequent PCM writes.
+                        _pcmInputGate.Release();
+                    }
 
                     // Measured but deliberately NOT compensated: the anchor
                     // must stay SEND-relative like everything else. Realtime-
@@ -1141,8 +1170,8 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         var response = await _rtsp.RequestAsync("SETRATEANCHORTIME", ct, "application/x-apple-binary-plist",
             BinaryPropertyListWriter.WriteToArray(body)).ConfigureAwait(false);
         logger.LogInformation(
-            "{Name}: SETRATEANCHORTIME {Status} (rtpTime={Rtp}, secs={Secs}, timeline={Timeline})",
-            DisplayName, response.StatusCode, rtpTime, nanos / 1_000_000_000, Convert.ToHexString(anchor.ClockId));
+            "{Name}: SETRATEANCHORTIME {Status} (rtpTime={Rtp}, captureSample={CaptureSample}, nanos={Nanos}, timeline={Timeline})",
+            DisplayName, response.StatusCode, rtpTime, captureSample, nanos, Convert.ToHexString(anchor.ClockId));
         if (response.IsSuccess)
         {
             _lastAnchorRtp = rtpTime;
