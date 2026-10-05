@@ -673,7 +673,8 @@ public sealed class ReceiverSession(
         {
             source.MarkActive();
             source.PushDecodedPcm(pcm, target);
-        }, logger, presentationLatencySamples * 1_000_000_000L / 44100);
+        }, logger, presentationLatencySamples * 1_000_000_000L / 44100,
+            onDiscontinuity: source.MarkDiscontinuity);
         _scheduler = scheduler;
         source.SetRealtimeScheduler(scheduler);
         _ = RunSchedulerAsync(scheduler, _streamCts.Token);
@@ -840,7 +841,8 @@ public sealed class ReceiverSession(
         {
             source.MarkActive();
             source.PushDecodedPcm(pcm, target);
-        }, logger, presentationLatencySamples * 1_000_000_000L / 44100);
+        }, logger, presentationLatencySamples * 1_000_000_000L / 44100,
+            onDiscontinuity: source.MarkDiscontinuity);
         _scheduler = scheduler;
         source.SetRealtimeScheduler(scheduler);
         _ = RunSchedulerAsync(scheduler, _streamCts.Token);
@@ -1418,11 +1420,11 @@ public sealed class ReceiverSession(
             _scheduler?.Flush();
         }
 
-        // Pause must reach the speakers too: Paused makes the pump flush the
-        // fan-out, silencing the group-latency's worth of audio already in
-        // flight (audibly: pause used to keep playing for the whole group
-        // latency). The re-anchor that follows marks Active again.
-        source.MarkPaused();
+        // FLUSH abandons the old position, including complete PCM already in
+        // the source/pump queues. Pause alone deliberately preserves those
+        // queues, so signal a cutover before holding the speakers. The next
+        // realtime frame or buffered rate anchor resumes the fresh timeline.
+        source.FlushDecodedPcm();
         logger.LogInformation("FLUSH — queued audio dropped, source paused until re-anchor");
         return RtspReply.Ok();
     }

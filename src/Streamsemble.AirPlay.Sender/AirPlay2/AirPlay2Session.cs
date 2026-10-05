@@ -681,10 +681,11 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         await _audioTcp.ConnectAsync(address, AudioEndpoint.Port, ct).ConfigureAwait(false);
         if (!_bufferedAlac)
         {
-            _aac = new AacEncoderPipe(logger);
+            _aac = new AacEncoderPipe(logger, FailBufferedStream);
         }
 
         _bufferedPump = BufferedPumpAsync(_audioTcp.GetStream(), _bufferedCts.Token);
+        _ = WatchBufferedPlaybackAsync(_bufferedCts.Token);
         logger.LogInformation("{Name}: AirPlay 2 buffered stream ready (TCP audio :{Audio})", DisplayName, AudioEndpoint.Port);
     }
 
@@ -797,6 +798,56 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     private CancellationTokenSource? _bufferedCts;
     private Task _bufferedPump = Task.CompletedTask;
     private ulong _bufferedNonce;
+    private int _bufferedFailed;
+    private readonly BufferedPlaybackHealth _bufferedHealth = new();
+
+    /// <summary>Discard a failed buffered pipeline; the group health loop reconnects it.</summary>
+    public void RequestBufferedReconnect(string reason)
+    {
+        if (IsBuffered)
+        {
+            FailBufferedStream(new IOException(reason));
+        }
+    }
+
+    private void FailBufferedStream(Exception error)
+    {
+        if (Interlocked.Exchange(ref _bufferedFailed, 1) != 0)
+        {
+            return;
+        }
+
+        IsAlive = false;
+        _bufferedCts?.Cancel();
+        _aac?.Abort(error);
+        _audioTcp?.Dispose();
+        logger.LogWarning(error, "{Name}: buffered stream failed — reconnect required", DisplayName);
+    }
+
+    private async Task WatchBufferedPlaybackAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false) && IsAlive)
+            {
+                CheckBufferedPlayback(Timing.Ptp.PtpReceiverClock.NowNanos);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+    }
+
+    internal void CheckBufferedPlayback(long nowNanos)
+    {
+        var lead = _anchored && !_anchorHeld && !_reanchorPending ? BufferAheadMs : null;
+        if (_bufferedHealth.ShouldReconnect(lead, nowNanos))
+        {
+            FailBufferedStream(new TimeoutException(
+                $"Buffered audio has remained past its render deadline for 2 seconds (lead {lead:F0} ms)"));
+        }
+    }
 
     /// <summary>Set by the group: returns (PTP now in UNIX nanos, grandmaster clock id) once timing is up.</summary>
     public Func<(ulong Nanos, byte[] ClockId)?>? AnchorClock { get; set; }
@@ -807,6 +858,9 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     /// timeline instead of re-anchoring against "now".
     /// </summary>
     public GroupTimelineAnchor? GroupAnchor { get; set; }
+
+    /// <summary>Ask the group to replace an unusable shared epoch for every speaker together.</summary>
+    public Action<string>? RequestGroupRecovery { get; set; }
 
     /// <summary>
     /// Set by the group: wall-true age (samples) of a capture index, measured
@@ -838,7 +892,7 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         {
             SingleReader = true,
             SingleWriter = true,
-            FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest,
+            FullMode = System.Threading.Channels.BoundedChannelFullMode.Wait,
         });
 
     /// <summary>
@@ -849,13 +903,21 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
     /// </summary>
     public async ValueTask WritePcmAsync(ReadOnlyMemory<byte> pcm, long captureTimestamp, CancellationToken ct)
     {
+        if (!IsAlive)
+        {
+            return;
+        }
+
         if (_bufferedAlac)
         {
             Volatile.Write(ref _pcmCaptureEnd, captureTimestamp + pcm.Length / 4);
             // One PcmFrame (352 samples) per call — pack directly, no encoder.
             var packed = new byte[Raop.AlacPacker.PackedLength(pcm.Length / 4)];
             var length = Raop.AlacPacker.Pack(pcm.Span, packed);
-            _alacFrames.Writer.TryWrite(packed[..length]);
+            if (!_alacFrames.Writer.TryWrite(packed[..length]))
+            {
+                FailBufferedStream(new IOException("Buffered ALAC output queue exceeded 256 frames"));
+            }
             return;
         }
 
@@ -867,6 +929,11 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
         await _pcmInputGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (!IsAlive)
+            {
+                return;
+            }
+
             await aac.WritePcmAsync(pcm, ct).ConfigureAwait(false);
             Volatile.Write(ref _pcmCaptureEnd, captureTimestamp + pcm.Length / 4);
         }
@@ -1005,14 +1072,18 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                     logger.LogInformation("{Name}: buffered audio: {Count} packets (~{Secs:F0}s) sent", DisplayName, _bufferedPacketsSent, _bufferedPacketsSent * 1024.0 / 44100);
                 }
             }
+
+            if (!ct.IsCancellationRequested)
+            {
+                FailBufferedStream(new EndOfStreamException("Buffered encoder output ended unexpectedly"));
+            }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "{Name}: buffered audio pump stopped", DisplayName);
-            IsAlive = false;
+            FailBufferedStream(ex);
         }
     }
 
@@ -1141,19 +1212,16 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
                 logger.LogInformation(
                     "{Name}: anchor mapped onto group epoch ({Debt:F0} ms source-gap debt inherited)",
                     DisplayName, debtMs);
-                // A mapped render time at/behind "now" can't be played: the
-                // epoch anchor is stale (a missed group reset) or the debt
-                // outgrew the presentation window. Re-establish from now —
-                // audibly out of group sync, but playing, and loud in the log.
-                if (baseNanos < anchor.Nanos + 500_000_000UL)
-                {
-                    logger.LogWarning(
-                        "{Name}: group epoch anchor unusable (mapped anchor {Ms:F0} ms behind now) — re-establishing",
-                        DisplayName, ((long)anchor.Nanos - (long)baseNanos) / 1e6);
-                    groupAnchor.Reset();
-                    (baseNanos, _, _) = groupAnchor.Map(captureSample, proposed);
-                }
             }
+        }
+
+        if (baseNanos < anchor.Nanos + 500_000_000UL)
+        {
+            // A single session cannot replace the shared epoch: incumbents
+            // would keep playing against the old one and split the group.
+            var reason = $"{DisplayName}: group anchor leaves only {((long)baseNanos - (long)anchor.Nanos) / 1e6:F0} ms of playback lead";
+            RequestGroupRecovery?.Invoke(reason);
+            throw new InvalidOperationException(reason);
         }
 
         var nanos = baseNanos + (ulong)(LatencyTrimMs * 1_000_000L);
@@ -1235,7 +1303,11 @@ public sealed class AirPlay2Session(string displayName, IPAddress address, int r
             EncoderAgeMs: IsBuffered ? encoderAgeMs : null,
             InheritedDebtMs: _lastInheritedDebtMs,
             BufferedPacketsSent: _bufferedPacketsSent,
-            TimelineId: _lastTimelineId);
+            TimelineId: _lastTimelineId,
+            EncoderFramesProduced: _aac?.FramesProduced,
+            EncoderQueueDepth: _aac?.QueueDepth,
+            EncoderQueueOverflows: _aac?.QueueOverflows,
+            EncoderFailure: _aac?.Failure);
     }
 
     /// <summary>Cutover: the buffered pump discards its queued (abandoned-track) frames and re-anchors.</summary>

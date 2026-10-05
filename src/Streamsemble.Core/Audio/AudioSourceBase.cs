@@ -16,14 +16,21 @@ public abstract class AudioSourceBase(string name) : IAudioSource
         new BoundedChannelOptions(ChannelCapacityFrames)
         {
             FullMode = BoundedChannelFullMode.DropOldest,
-            SingleReader = true,
+            // Explicit cutovers also discard queued PCM from the source's
+            // thread, while the pump may already be waiting on a read.
+            SingleReader = false,
         });
 
     private long _sampleClock;
+    private readonly object _pcmStateGate = new();
+    private long _generation;
+    private bool _cutoverPrepared;
 
     public string Name { get; } = name;
 
     public SourceState State { get; private set; } = SourceState.Idle;
+
+    public long Generation => Volatile.Read(ref _generation);
 
     public ChannelReader<PcmFrame> Frames => _channel.Reader;
 
@@ -44,9 +51,13 @@ public abstract class AudioSourceBase(string name) : IAudioSource
     /// </summary>
     protected void EmitPcm(ReadOnlyMemory<byte> pcm, long targetNanos)
     {
-        var frame = new PcmFrame(pcm, _sampleClock, targetNanos);
-        _sampleClock += frame.SampleCount;
-        _channel.Writer.TryWrite(frame);
+        lock (_pcmStateGate)
+        {
+            var frame = new PcmFrame(pcm, _sampleClock, targetNanos) { Generation = _generation };
+            _sampleClock += frame.SampleCount;
+            _channel.Writer.TryWrite(frame);
+            _cutoverPrepared = false;
+        }
     }
 
     protected void SetState(SourceState newState)
@@ -61,7 +72,41 @@ public abstract class AudioSourceBase(string name) : IAudioSource
         StateChanged?.Invoke(this, change);
     }
 
-    protected void RaiseDiscontinuity() => Discontinuity?.Invoke(this, EventArgs.Empty);
+    /// <summary>
+    /// Abandons completed PCM from the old timeline. The generation also
+    /// invalidates a frame the pump read just before this queue was drained.
+    /// Call before publishing a discontinuity, never for an ordinary pause.
+    /// </summary>
+    protected void DiscardQueuedPcm()
+    {
+        lock (_pcmStateGate)
+        {
+            _generation++;
+            while (_channel.Reader.TryRead(out _))
+            {
+            }
+
+            _cutoverPrepared = true;
+        }
+    }
+
+    protected void RaiseDiscontinuity()
+    {
+        lock (_pcmStateGate)
+        {
+            // Existing sources can announce a cutover directly. A protocol
+            // that already discarded its queue need not advance twice.
+            if (!_cutoverPrepared)
+            {
+                DiscardQueuedPcm();
+            }
+
+            _cutoverPrepared = false;
+            // Publish the pump's flush barrier before the next EmitPcm can
+            // expose a fresh frame from this generation.
+            Discontinuity?.Invoke(this, EventArgs.Empty);
+        }
+    }
 
     protected void RaiseMetadata(TrackMetadata metadata) => MetadataChanged?.Invoke(this, metadata);
 

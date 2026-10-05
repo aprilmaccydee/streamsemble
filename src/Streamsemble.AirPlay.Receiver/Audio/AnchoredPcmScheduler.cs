@@ -24,7 +24,8 @@ public sealed class AnchoredPcmScheduler(
     Action<ReadOnlyMemory<byte>, long> emit,
     ILogger logger,
     long leadNanos = 0,
-    Func<long>? clockNanos = null)
+    Func<long>? clockNanos = null,
+    Action? onDiscontinuity = null)
 {
     // Ordinary packet loss must occupy time in the outgoing sample clock.
     // Bound concealment so a seek or a new RTP epoch cannot enqueue hours
@@ -34,8 +35,8 @@ public sealed class AnchoredPcmScheduler(
     private sealed record Anchor(uint Frame, long Nanos);
 
     private readonly object _enqueueGate = new();
-    private readonly Channel<(uint Rtp, byte[] Pcm, long Generation)> _frames =
-        Channel.CreateUnbounded<(uint, byte[], long)>();
+    private readonly Channel<(uint Rtp, byte[] Pcm, long Generation, bool Discontinuity)> _frames =
+        Channel.CreateUnbounded<(uint, byte[], long, bool)>();
     private readonly Func<long> _now = clockNanos ?? (() => PtpReceiverClock.NowNanos);
     private Anchor? _anchor;
     private bool _fallback;
@@ -64,6 +65,7 @@ public sealed class AnchoredPcmScheduler(
 
         lock (_enqueueGate)
         {
+            var discontinuity = false;
             if (_nextRtp is { } next)
             {
                 // Signed subtraction follows the RTP cursor across uint wrap.
@@ -99,7 +101,7 @@ public sealed class AnchoredPcmScheduler(
                     while (gap > 0)
                     {
                         var missing = Math.Min(gap, PcmFrame.SamplesPerFrame);
-                        _frames.Writer.TryWrite((next, new byte[missing * blockAlign], _generation));
+                        _frames.Writer.TryWrite((next, new byte[missing * blockAlign], _generation, false));
                         next = unchecked(next + (uint)missing);
                         gap -= missing;
                     }
@@ -107,12 +109,18 @@ public sealed class AnchoredPcmScheduler(
                 else
                 {
                     logger.LogWarning(
-                        "realtime RTP discontinuity of {GapMs:F0} ms exceeds concealment limit; restarting receive cursor",
+                        "realtime RTP discontinuity of {GapMs:F0} ms exceeds concealment limit; restarting playback timeline",
                         gap * 1000.0 / AudioFormat.Canonical.SampleRate);
+                    // Omitting a long outage from the source sample counter
+                    // would leave every buffered speaker behind its original
+                    // clock. Abandon old queued/in-flight audio and ask the
+                    // source to cut over before this first fresh frame emits.
+                    ResetQueue();
+                    discontinuity = true;
                 }
             }
 
-            _frames.Writer.TryWrite((rtp, pcm, _generation));
+            _frames.Writer.TryWrite((rtp, pcm, _generation, discontinuity));
             _nextRtp = unchecked(rtp + (uint)samples);
         }
     }
@@ -122,19 +130,25 @@ public sealed class AnchoredPcmScheduler(
     {
         lock (_enqueueGate)
         {
-            _generation++;
-            while (_frames.Reader.TryRead(out _))
-            {
-            }
-
-            _nextRtp = null;
+            ResetQueue();
         }
+    }
+
+    // Caller owns _enqueueGate so a reset cannot race an enqueue or emit.
+    private void ResetQueue()
+    {
+        _generation++;
+        while (_frames.Reader.TryRead(out _))
+        {
+        }
+
+        _nextRtp = null;
     }
 
     public async Task RunAsync(CancellationToken ct)
     {
         long firstFrameAt = 0;
-        await foreach (var (rtp, pcm, generation) in _frames.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+        await foreach (var (rtp, pcm, generation, discontinuity) in _frames.Reader.ReadAllAsync(ct).ConfigureAwait(false))
         {
             var anchor = Volatile.Read(ref _anchor);
             if (anchor is null && !_fallback)
@@ -190,6 +204,11 @@ public sealed class AnchoredPcmScheduler(
                 // paused playback or contaminate the new decoder generation.
                 if (generation == _generation)
                 {
+                    if (discontinuity)
+                    {
+                        onDiscontinuity?.Invoke();
+                    }
+
                     emit(pcm, audibleAt);
                 }
             }

@@ -70,7 +70,6 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
             Forward(() => sink.SetMetadataAsync(metadata, ct), "metadata");
         }
 
-        var dropQueued = 0;
         var controlChain = Task.CompletedTask;
         var controlGate = new object();
 
@@ -99,7 +98,11 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
 
                     try
                     {
+                        ct.ThrowIfCancellationRequested();
                         await op().ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
                     }
                     catch (Exception ex)
                     {
@@ -133,11 +136,17 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
 
         void OnDiscontinuity(object? _, EventArgs __)
         {
-            // Skip/new load: the queued tail belongs to the abandoned track.
-            // Drop it everywhere — the sink's queues via the drop-flush, the
-            // source's own queue via the frame loop (its single reader).
-            Interlocked.Exchange(ref dropQueued, 1);
-            EnqueueControl(() => sink.FlushAsync(dropQueuedAudio: true, ct), "drop-flush");
+            // The source already discarded the abandoned generation. Keep
+            // fresh frames queued until the sink has finished its cutover;
+            // draining here could consume the first frame of the new timeline.
+            EnqueueControl(async () =>
+            {
+                await sink.FlushAsync(dropQueuedAudio: true, ct).ConfigureAwait(false);
+                if (source.State == SourceState.Active)
+                {
+                    await sink.ResumeAsync(ct).ConfigureAwait(false);
+                }
+            }, "drop-flush");
         }
 
         try
@@ -154,16 +163,41 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
 
             await foreach (var frame in source.Frames.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                if (Interlocked.Exchange(ref dropQueued, 0) == 1)
+                while (true)
                 {
-                    while (source.Frames.TryRead(out _))
+                    Task pendingControl;
+                    ValueTask write = default;
+                    var writing = false;
+                    lock (controlGate)
                     {
+                        if (frame.Generation != source.Generation)
+                        {
+                            break;
+                        }
+
+                        pendingControl = controlChain;
+                        if (pendingControl.IsCompleted)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            // Begin the write under the same short lock that
+                            // publishes cutovers. A preceding write is tagged
+                            // by the sink's old generation; a following write
+                            // must wait for the entire flush/resume barrier.
+                            write = sink.WriteAsync(frame, ct);
+                            writing = true;
+                        }
                     }
 
-                    continue; // the in-hand frame predates the cutover too
-                }
+                    if (writing)
+                    {
+                        await write.ConfigureAwait(false);
+                        break;
+                    }
 
-                await sink.WriteAsync(frame, ct).ConfigureAwait(false);
+                    await pendingControl.WaitAsync(ct).ConfigureAwait(false);
+                    // A newer cutover may have arrived while this one waited.
+                    // Re-check both the source generation and control chain.
+                }
             }
         }
         catch (OperationCanceledException)
@@ -180,6 +214,9 @@ public sealed class AudioPump(ISourceArbiter arbiter, IAudioSink sink, PlaybackS
             source.MetadataChanged -= OnMetadata;
             source.StateChanged -= OnState;
             source.Discontinuity -= OnDiscontinuity;
+            Task pendingControl;
+            lock (controlGate) { pendingControl = controlChain; }
+            await pendingControl.ConfigureAwait(false);
             // Only clear if a newer loop hasn't already claimed the display.
             if (status.ActiveSource == source.Name)
             {

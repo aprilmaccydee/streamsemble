@@ -501,6 +501,7 @@
         <td>${fmtMs(sp.aheadMs)}</td>
         <td>${fmtMs(sp.targetLeadMs)}</td>
         <td>${fmtMs(sp.encoderAgeMs)}</td>
+        <td title="${escapeAttr(sp.encoderFailure || 'Encoded AAC frames waiting to be sent')}">${sp.encoderQueueDepth == null ? '—' : `${sp.encoderQueueDepth}/256`}${sp.encoderFailure ? ' ⚠' : ''}</td>
         <td>${fmtMs(sp.inheritedDebtMs)}</td>
         <td>${sp.latencyTrimMs || 0} ms</td>
         <td>${sp.reportedLatencyMs ? fmtMs(sp.reportedLatencyMs) : "—"}</td>
@@ -510,7 +511,7 @@
       </tr>`).join("");
       $("techsessions").innerHTML = `<table class="techtable">
         <thead><tr><th>speaker</th><th>proto</th><th>mode</th><th>pairing</th><th>alive</th><th>volume</th>
-        <th>anchored</th><th>lead</th><th>target</th><th>enc age</th><th>join debt</th><th>trim</th>
+        <th>anchored</th><th>lead</th><th>target</th><th>enc age</th><th>enc queue</th><th>join debt</th><th>trim</th>
         <th>dev latency</th><th>buf pkts</th><th>PTP req</th><th>timeline</th></tr></thead>
         <tbody>${rows}</tbody></table>`;
     }

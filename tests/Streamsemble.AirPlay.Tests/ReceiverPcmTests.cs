@@ -1,5 +1,8 @@
 using Streamsemble.AirPlay.Receiver;
+using Streamsemble.AirPlay.Receiver.Audio;
 using Streamsemble.Core.Audio;
+using Streamsemble.Core.Abstractions;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace Streamsemble.AirPlay.Tests;
@@ -109,6 +112,108 @@ public class ReceiverPcmTests
         Assert.Equal(Samples(352, 2), frame.Data.ToArray());
         Assert.Equal(352, frame.Timestamp);
         Assert.Equal(9_000_000_000, frame.TargetNanos);
+    }
+
+    [Fact]
+    public void DiscontinuityDiscardsCompleteFramesAndPartialTailBeforeFreshAudio()
+    {
+        var source = new AirPlayReceiverSource();
+        source.MarkActive();
+        source.PushDecodedPcm(Samples(804, 1), 5_000_000_000);
+        var oldGeneration = source.Generation;
+        var cutovers = 0;
+        source.Discontinuity += (_, _) =>
+        {
+            cutovers++;
+            Assert.False(source.Frames.TryPeek(out _));
+        };
+
+        source.MarkDiscontinuity();
+        source.PushDecodedPcm(Samples(352, 2), 9_000_000_000);
+
+        var frame = Assert.Single(Drain(source));
+        Assert.Equal(1, cutovers);
+        Assert.Equal(Samples(352, 2), frame.Data.ToArray());
+        Assert.Equal(704, frame.Timestamp);
+        Assert.Equal(9_000_000_000, frame.TargetNanos);
+        Assert.NotEqual(oldGeneration, frame.Generation);
+        Assert.Equal(source.Generation, frame.Generation);
+        Assert.Equal(SourceState.Active, source.State);
+    }
+
+    [Fact]
+    public void AirPlayFlushAbandonsThePreviousPositionBeforePausing()
+    {
+        var source = new AirPlayReceiverSource();
+        source.MarkActive();
+        source.PushDecodedPcm(Samples(452, 1), 5_000_000_000);
+        var oldGeneration = source.Generation;
+        var events = new List<string>();
+        source.Discontinuity += (_, _) => events.Add("cutover");
+        source.StateChanged += (_, change) => events.Add(change.NewState.ToString());
+
+        source.FlushDecodedPcm();
+
+        Assert.Equal(new[] { "cutover", "Paused" }, events);
+        Assert.False(source.Frames.TryPeek(out _));
+        source.MarkActive();
+        source.PushDecodedPcm(Samples(352, 2), 9_000_000_000);
+        var frame = Assert.Single(Drain(source));
+        Assert.Equal(Samples(352, 2), frame.Data.ToArray());
+        Assert.Equal(352, frame.Timestamp);
+        Assert.NotEqual(oldGeneration, frame.Generation);
+    }
+
+    [Fact]
+    public void OrdinaryPauseKeepsQueuedAudioAndItsGeneration()
+    {
+        var source = new AirPlayReceiverSource();
+        source.MarkActive();
+        source.PushDecodedPcm(Samples(352, 1));
+        var generation = source.Generation;
+
+        source.MarkPaused();
+        source.MarkActive();
+        source.PushDecodedPcm(Samples(352, 2));
+
+        var frames = Drain(source);
+        Assert.Equal(new byte[] { 1, 2 }, frames.Select(frame => frame.Data.Span[0]));
+        Assert.All(frames, frame => Assert.Equal(generation, frame.Generation));
+    }
+
+    [Fact]
+    public async Task LongReceiveOutageCutsOverTheSourceBeforeNewFrames()
+    {
+        const long anchorNanos = 5_000_000_000_000;
+        var source = new AirPlayReceiverSource();
+        var cutovers = 0;
+        source.Discontinuity += (_, _) => cutovers++;
+        var scheduler = new AnchoredPcmScheduler(
+            (pcm, target) => source.PushDecodedPcm(pcm, target),
+            NullLogger.Instance,
+            clockNanos: () => anchorNanos + 10_000_000_000,
+            onDiscontinuity: source.MarkDiscontinuity);
+        scheduler.SetAnchor(0, anchorNanos);
+        scheduler.Enqueue(0, Samples(352, 1));
+        await DrainSchedulerAsync();
+        Assert.True(source.Frames.TryPeek(out var oldFrame));
+
+        scheduler.Enqueue(352 + 3 * 44100, Samples(352, 2));
+        await DrainSchedulerAsync();
+
+        var fresh = Assert.Single(Drain(source));
+        Assert.Equal(1, cutovers);
+        Assert.Equal(Samples(352, 2), fresh.Data.ToArray());
+        Assert.NotEqual(oldFrame.Generation, fresh.Generation);
+        Assert.Equal(anchorNanos + (352L + 3 * 44100) * 1_000_000_000 / 44100, fresh.TargetNanos);
+
+        async Task DrainSchedulerAsync()
+        {
+            using var cts = new CancellationTokenSource();
+            var running = scheduler.RunAsync(cts.Token);
+            cts.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => running);
+        }
     }
 
     private static byte[] Samples(int count, byte value)

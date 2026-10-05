@@ -88,6 +88,33 @@ public sealed class AirPlayReceiverSource() : AudioSourceBase("AirPlay")
 
     internal void MarkIdle() => ResetPcm(Core.Abstractions.SourceState.Idle);
 
+    /// <summary>Discard abandoned audio and re-anchor the group before fresh PCM is forwarded.</summary>
+    internal void MarkDiscontinuity()
+    {
+        lock (_pcmGate)
+        {
+            DiscardPcmAndNotify();
+        }
+    }
+
+    /// <summary>An AirPlay FLUSH abandons queued audio; a seek must not replay the old position.</summary>
+    internal void FlushDecodedPcm()
+    {
+        lock (_pcmGate)
+        {
+            DiscardPcmAndNotify();
+            SetState(Core.Abstractions.SourceState.Paused);
+        }
+    }
+
+    private void DiscardPcmAndNotify()
+    {
+        _pendingBytes = 0;
+        _pendingTargetNanos = 0;
+        DiscardQueuedPcm();
+        RaiseDiscontinuity();
+    }
+
     private void ResetPcm(Core.Abstractions.SourceState state)
     {
         lock (_pcmGate)

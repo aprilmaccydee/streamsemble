@@ -145,71 +145,182 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         {
             while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
             {
-                List<KeyValuePair<string, ITargetSession>> dead;
-                lock (_gate)
+                try
                 {
-                    dead = _sessions.Where(kv => !kv.Value.IsAlive).ToList();
-                }
-
-                foreach (var (key, session) in dead)
-                {
-                    lock (_gate)
+                    if (Interlocked.Exchange(ref _timelineRecoveryRequested, 0) != 0)
                     {
-                        _sessions.Remove(key);
+                        await RecoverGroupTimelineAsync(ct).ConfigureAwait(false);
                     }
 
-                    _logger.LogWarning("{Name}: session dead — will reconnect", session.DisplayName);
+                    await _reconcileLock.WaitAsync(ct).ConfigureAwait(false);
                     try
                     {
-                        session.Dispose();
-                    }
-                    catch
-                    {
-                        // Already broken; nothing useful to do.
-                    }
-
-                    if (session.RequiresPtp)
-                    {
-                        _gmClock.RemovePeer(session.DeviceAddress);
-                    }
-                }
-
-                bool anyMissing;
-                lock (_gate)
-                {
-                    anyMissing = _selectedTargets.Current.Any(t => !_sessions.ContainsKey(TargetKey(t)));
-                }
-
-                if (Streaming && anyMissing)
-                {
-                    await ReconcileAsync(ct).ConfigureAwait(false);
-                }
-
-                // Keep per-speaker volumes fresh for the UI: immediately for
-                // sessions never read, every ~15 s for the rest (a device's
-                // volume can change under us via its own app/buttons).
-                // Read-only — this never SETS anything on a speaker.
-                var refreshAll = ++_volumeRefreshTick % 3 == 0;
-                await Task.WhenAll(SessionSnapshot()
-                    .Where(s => s.LastKnownVolume is null || refreshAll)
-                    .Select(async s =>
-                    {
-                        try
+                        List<KeyValuePair<string, ITargetSession>> dead;
+                        lock (_gate)
                         {
-                            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                            timeout.CancelAfter(TimeSpan.FromSeconds(2));
-                            await s.GetVolumeAsync(timeout.Token).ConfigureAwait(false);
+                            dead = _sessions.Where(kv => !kv.Value.IsAlive).ToList();
                         }
-                        catch
+
+                        foreach (var (key, session) in dead)
                         {
-                            // Best-effort — a slow session just stays unknown.
+                            lock (_gate)
+                            {
+                                if (!_sessions.TryGetValue(key, out var current) || !ReferenceEquals(current, session))
+                                {
+                                    continue;
+                                }
+
+                                _sessions.Remove(key);
+                            }
+
+                            _logger.LogWarning("{Name}: session dead — will reconnect", session.DisplayName);
+                            try
+                            {
+                                session.Dispose();
+                            }
+                            catch
+                            {
+                                // Already broken; nothing useful to do.
+                            }
+
+                            if (session.RequiresPtp)
+                            {
+                                _gmClock.RemovePeer(session.DeviceAddress);
+                            }
                         }
-                    })).ConfigureAwait(false);
+
+                    }
+                    finally
+                    {
+                        _reconcileLock.Release();
+                    }
+
+                    bool anyMissing;
+                    lock (_gate)
+                    {
+                        anyMissing = _selectedTargets.Current.Any(t => !_sessions.ContainsKey(TargetKey(t)));
+                    }
+
+                    if (Streaming && anyMissing)
+                    {
+                        await ReconcileAsync(ct).ConfigureAwait(false);
+                    }
+
+                    // Keep per-speaker volumes fresh for the UI: immediately for
+                    // sessions never read, every ~15 s for the rest (a device's
+                    // volume can change under us via its own app/buttons).
+                    // Read-only — this never SETS anything on a speaker.
+                    var refreshAll = ++_volumeRefreshTick % 3 == 0;
+                    await Task.WhenAll(SessionSnapshot()
+                        .Where(s => s.LastKnownVolume is null || refreshAll)
+                        .Select(async s =>
+                        {
+                            try
+                            {
+                                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                                timeout.CancelAfter(TimeSpan.FromSeconds(2));
+                                await s.GetVolumeAsync(timeout.Token).ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                                // Best-effort — a slow session just stays unknown.
+                            }
+                        })).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "speaker recovery sweep failed; retrying on the next sweep");
+                }
             }
         }
         catch (OperationCanceledException)
         {
         }
+    }
+
+    private int _timelineRecoveryRequested;
+
+    private void RequestTimelineRecovery(string reason)
+    {
+        if (Streaming && Interlocked.Exchange(ref _timelineRecoveryRequested, 1) == 0)
+        {
+            _logger.LogWarning("coordinated speaker timeline recovery requested: {Reason}", reason);
+        }
+    }
+
+    private async Task RecoverGroupTimelineAsync(CancellationToken ct)
+    {
+        await _reconcileLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!Streaming)
+            {
+                return;
+            }
+
+            Interlocked.Increment(ref _queueGeneration);
+            await _dispatchGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var sessions = SessionSnapshot();
+                lock (_gate)
+                {
+                    _sessions.Clear();
+                    _retryAt.Clear();
+                }
+
+                // Retired buffered pumps may still finish an anchor callback
+                // after cancellation. Give the replacement sessions their own
+                // epoch so those callbacks cannot seed the new group timeline.
+                Volatile.Write(ref _groupAnchor, new AirPlay2.GroupTimelineAnchor());
+                ResetCaptureTimeline();
+                foreach (var session in sessions)
+                {
+                    try
+                    {
+                        session.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "{Name}: failed session disposal during recovery", session.DisplayName);
+                    }
+                    finally
+                    {
+                        if (session.RequiresPtp)
+                        {
+                            _gmClock.RemovePeer(session.DeviceAddress);
+                        }
+                    }
+                }
+                _logger.LogWarning("discarded expired group timeline; reconnecting selected speakers to fresh audio");
+            }
+            finally
+            {
+                _dispatchGate.Release();
+            }
+        }
+        finally
+        {
+            _reconcileLock.Release();
+        }
+    }
+
+    private void ResetCaptureTimeline()
+    {
+        _timestampBase = null;
+        _sourceEpochNanos = long.MaxValue;
+        _sourceTargetBase = null;
+        _stampShiftNanos = 0;
+        _staleDroppedSamples = 0;
+        _sendMarker = true;
+        _sendFirstSync = true;
+        _syncPending = true;
+        _lastSyncRtp = 0;
+        _groupAnchor.Reset();
     }
 
     /// <summary>Display names of speakers currently connected and receiving audio.</summary>
@@ -320,11 +431,13 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     }
 
     private ControlChannel? _control;
-    private volatile bool _dropQueuedFrames;
     private volatile bool _holdFrames;
     private int _pacingLog;
     private UdpClient? _audioSocket;
-    private Channel<PcmFrame>? _sendQueue;
+    private readonly SemaphoreSlim _dispatchGate = new(1, 1);
+    private long _queueGeneration;
+    private readonly record struct QueuedFrame(PcmFrame Frame, long Generation);
+    private Channel<QueuedFrame>? _sendQueue;
     private CancellationTokenSource? _streamCts;
     private Task _sendLoop = Task.CompletedTask;
 
@@ -427,7 +540,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
     /// Reset wherever the WHOLE group re-anchors (the same places that null
     /// _timestampBase); never on per-session joins/reconnects.
     /// </summary>
-    private readonly AirPlay2.GroupTimelineAnchor _groupAnchor = new();
+    private AirPlay2.GroupTimelineAnchor _groupAnchor = new();
     private uint _rtpHead;
     private long _packetsSent;
     private long _rateCount;
@@ -467,7 +580,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         // and the release could never come because resume only fired on
         // Paused→Active. A fresh stream starts with a clean slate.
         _holdFrames = false;
-        _dropQueuedFrames = false;
+        Interlocked.Increment(ref _queueGeneration);
 
         _seq = (ushort)Random.Shared.Next(ushort.MaxValue);
         _rtpBase = (uint)Random.Shared.Next();
@@ -490,7 +603,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         _audioSocket.Client.DualMode = true;
         _audioSocket.Client.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
 
-        _sendQueue = Channel.CreateBounded<PcmFrame>(new BoundedChannelOptions(128) { SingleReader = true, SingleWriter = true });
+        _sendQueue = Channel.CreateBounded<QueuedFrame>(new BoundedChannelOptions(128) { SingleReader = true, SingleWriter = true });
         _streamCts = new CancellationTokenSource();
         _sendLoop = SendLoopAsync(_sendQueue.Reader, _streamCts.Token);
 
@@ -641,12 +754,18 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 // flowing.
                 if (!anyLive && missing.Any(m => !m.Target.Protocol.Equals("Raop", StringComparison.OrdinalIgnoreCase)))
                 {
-                    _timestampBase = null;
-                    _sourceEpochNanos = long.MaxValue;
-                    _sourceTargetBase = null;
-                    _sendMarker = true;
-                    _lastSyncRtp = 0;
-                    _groupAnchor.Reset();
+                    await _dispatchGate.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        // Every former session has gone. A cancelled pump
+                        // still finishing an anchor must retain its old epoch.
+                        Volatile.Write(ref _groupAnchor, new AirPlay2.GroupTimelineAnchor());
+                        ResetCaptureTimeline();
+                    }
+                    finally
+                    {
+                        _dispatchGate.Release();
+                    }
                 }
 
                 // Sessions are fully independent (own TCP/pairing/SETUP), so
@@ -875,9 +994,17 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
                 // through the group's epoch anchor so late joiners land on
                 // the incumbents' timeline.
                 ap2.AnchorClock = () => ((ulong)Timing.Ptp.PtpReceiverClock.NowNanos, _gmClock.ClockId);
-                ap2.GroupAnchor = _groupAnchor;
+                var sessionAnchor = Volatile.Read(ref _groupAnchor);
+                ap2.GroupAnchor = sessionAnchor;
                 ap2.TrueContentAgeSamples = TrueCaptureAgeSamples;
                 ap2.TargetNanosForCapture = TargetNanosForCapture;
+                ap2.RequestGroupRecovery = reason =>
+                {
+                    if (ReferenceEquals(sessionAnchor, Volatile.Read(ref _groupAnchor)))
+                    {
+                        RequestTimelineRecovery(reason);
+                    }
+                };
                 await ap2.ConnectAsync(_timingResponder.Port, control.Port, _seq, startRtp, ct).ConfigureAwait(false);
                 session = ap2;
             }
@@ -955,7 +1082,7 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
 
         if (_sendQueue is { } queue)
         {
-            await queue.Writer.WriteAsync(frame, ct).ConfigureAwait(false);
+            await queue.Writer.WriteAsync(new QueuedFrame(frame, Volatile.Read(ref _queueGeneration)), ct).ConfigureAwait(false);
         }
     }
 
@@ -976,245 +1103,256 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         return (Timing.Ptp.PtpReceiverClock.NowNanos - epoch) * 441 / 10_000_000 - captureSample;
     }
 
-    private async Task SendLoopAsync(ChannelReader<PcmFrame> queue, CancellationToken ct)
+    private async Task SendLoopAsync(ChannelReader<QueuedFrame> queue, CancellationToken ct)
     {
         try
         {
-            await foreach (var frame in queue.ReadAllAsync(ct).ConfigureAwait(false))
+            await foreach (var queued in queue.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                // Pause hold: keep the in-hand frame and everything queued
-                // until resume (or a cutover drop) releases the pipeline.
-                if (_holdFrames)
+                while (true)
                 {
-                    _logger.LogInformation("send loop holding");
-                    while (_holdFrames && !_dropQueuedFrames && !ct.IsCancellationRequested)
+                    if (!await AcquireDispatchAsync(queued.Generation, ct).ConfigureAwait(false))
                     {
-                        await Task.Delay(50, ct).ConfigureAwait(false);
+                        break;
                     }
 
-                    _logger.LogInformation("send loop released");
-                }
-
-                if (_dropQueuedFrames)
-                {
-                    _dropQueuedFrames = false;
-                    var dropped = 1; // the in-hand frame predates the cutover
-                    while (queue.TryRead(out _))
+                    var ownsDispatch = true;
+                    try
                     {
-                        dropped++;
-                    }
-
-                    _logger.LogDebug("dropped {Count} queued frames at cutover", dropped);
-                    continue;
-                }
-
-                if (_timestampBase is null)
-                {
-                    // Skip backlog that predates the (re)start: playing it
-                    // would set the whole timeline late by its age. Staleness
-                    // is the frame's wall-true EMIT age — how long ago the
-                    // source produced it — never its render deadline: a live
-                    // realtime mirror emits frames whose deadlines lead by
-                    // less than the group latency, and measuring those against
-                    // deliverability declared every frame it would ever send
-                    // stale and dropped the stream whole. An unmeetable
-                    // deadline on a FRESH frame is the anchor clamp's job
-                    // below (uniform lateness), not a reason to skip. Order is
-                    // monotonic, so once a fresh frame arrives nothing older
-                    // follows.
-                    var nowNs = Timing.Ptp.PtpReceiverClock.NowNanos;
-                    var groupLatencyNs = (long)(AirPlay2.AirPlay2Session.GroupPresentationLatencySeconds * 1_000_000_000);
-                    var epochNs = Volatile.Read(ref _sourceEpochNanos);
-                    var stale = epochNs != long.MaxValue
-                        && nowNs - (epochNs + frame.Timestamp * 1_000_000_000L / 44100)
-                            > (long)(MaxStartBacklogSeconds * 1_000_000_000);
-                    if (stale)
-                    {
-                        _staleDroppedSamples += frame.SampleCount;
-                        continue;
-                    }
-
-                    if (_staleDroppedSamples > 0)
-                    {
-                        _logger.LogInformation(
-                            "skipped {Ms:F0} ms of pre-start backlog — the timeline joins the source live instead of late",
-                            _staleDroppedSamples * 1000.0 / 44100);
-                        _staleDroppedSamples = 0;
-                    }
-
-                    _timestampBase = frame.Timestamp;
-                    _anchorOffset = 0;
-                    if (frame.TargetNanos > 0)
-                    {
-                        // The source stated when this frame must turn audible;
-                        // send it exactly one group latency before that, and
-                        // every receiver mode — buffered anchor and realtime
-                        // pacing alike — presents it on the stated instant.
-                        // No StartLead, no dwell estimate: the timeline IS the
-                        // source's intent. The clamp fires when the stamps
-                        // lead by less than the group latency (a realtime
-                        // mirror's do): the whole timeline then runs uniformly
-                        // late by the deficit — logged, and published as
-                        // StampShiftNanos so the picture and the lights trail
-                        // by the same amount — never silence.
-                        var dueOffset = (frame.TargetNanos - nowNs - groupLatencyNs) / 1e9;
-                        var clampedOffset = Math.Max(dueOffset, 0.01);
-                        if (dueOffset < 0.01)
+                        var frame = queued.Frame;
+                        if (_timestampBase is null)
                         {
-                            _logger.LogWarning(
-                                "source render stamp leaves no send margin ({Deficit:F0} ms short) — the whole timeline (audio, picture, lights) trails by that much",
-                                (clampedOffset - dueOffset) * 1000);
+                            // Skip backlog that predates the (re)start: playing it
+                            // would set the whole timeline late by its age. Staleness
+                            // is the frame's wall-true EMIT age — how long ago the
+                            // source produced it — never its render deadline: a live
+                            // realtime mirror emits frames whose deadlines lead by
+                            // less than the group latency, and measuring those against
+                            // deliverability declared every frame it would ever send
+                            // stale and dropped the stream whole. An unmeetable
+                            // deadline on a FRESH frame is the anchor clamp's job
+                            // below (uniform lateness), not a reason to skip. Order is
+                            // monotonic, so once a fresh frame arrives nothing older
+                            // follows.
+                            var nowNs = Timing.Ptp.PtpReceiverClock.NowNanos;
+                            var groupLatencyNs = (long)(AirPlay2.AirPlay2Session.GroupPresentationLatencySeconds * 1_000_000_000);
+                            var epochNs = Volatile.Read(ref _sourceEpochNanos);
+                            var stale = epochNs != long.MaxValue
+                                && nowNs - (epochNs + frame.Timestamp * 1_000_000_000L / 44100)
+                                    > (long)(MaxStartBacklogSeconds * 1_000_000_000);
+                            if (stale)
+                            {
+                                _staleDroppedSamples += frame.SampleCount;
+                                break;
+                            }
+
+                            if (_staleDroppedSamples > 0)
+                            {
+                                _logger.LogInformation(
+                                    "skipped {Ms:F0} ms of pre-start backlog — the timeline joins the source live instead of late",
+                                    _staleDroppedSamples * 1000.0 / 44100);
+                                _staleDroppedSamples = 0;
+                            }
+
+                            _timestampBase = frame.Timestamp;
+                            _anchorOffset = 0;
+                            if (frame.TargetNanos > 0)
+                            {
+                                // The source stated when this frame must turn audible;
+                                // send it exactly one group latency before that, and
+                                // every receiver mode — buffered anchor and realtime
+                                // pacing alike — presents it on the stated instant.
+                                // No StartLead, no dwell estimate: the timeline IS the
+                                // source's intent. The clamp fires when the stamps
+                                // lead by less than the group latency (a realtime
+                                // mirror's do): the whole timeline then runs uniformly
+                                // late by the deficit — logged, and published as
+                                // StampShiftNanos so the picture and the lights trail
+                                // by the same amount — never silence.
+                                var dueOffset = (frame.TargetNanos - nowNs - groupLatencyNs) / 1e9;
+                                var clampedOffset = Math.Max(dueOffset, 0.01);
+                                if (dueOffset < 0.01)
+                                {
+                                    _logger.LogWarning(
+                                        "source render stamp leaves no send margin ({Deficit:F0} ms short) — the whole timeline (audio, picture, lights) trails by that much",
+                                        (clampedOffset - dueOffset) * 1000);
+                                }
+
+                                Volatile.Write(ref _stampShiftNanos, (long)((clampedOffset - dueOffset) * 1e9));
+                                _anchorSeconds = _clock.NowSeconds + clampedOffset;
+                                Volatile.Write(ref _sourceTargetBase, new TargetBase(frame.Timestamp, frame.TargetNanos));
+                                _logger.LogInformation(
+                                    "send timeline derived from source render stamps (first frame audible in {Ms:F0} ms, ts={Ts})",
+                                    (frame.TargetNanos + Volatile.Read(ref _stampShiftNanos) - nowNs) / 1e6, frame.Timestamp);
+                            }
+                            else
+                            {
+                                _anchorSeconds = _clock.NowSeconds + StartLeadSeconds;
+                                Volatile.Write(ref _stampShiftNanos, 0);
+                                Volatile.Write(ref _sourceTargetBase, null);
+                                _logger.LogInformation("send timeline re-based (frame ts={Ts})", frame.Timestamp);
+                            }
                         }
 
-                        Volatile.Write(ref _stampShiftNanos, (long)((clampedOffset - dueOffset) * 1e9));
-                        _anchorSeconds = _clock.NowSeconds + clampedOffset;
-                        Volatile.Write(ref _sourceTargetBase, new TargetBase(frame.Timestamp, frame.TargetNanos));
-                        _logger.LogInformation(
-                            "send timeline derived from source render stamps (first frame audible in {Ms:F0} ms, ts={Ts})",
-                            (frame.TargetNanos + Volatile.Read(ref _stampShiftNanos) - nowNs) / 1e6, frame.Timestamp);
-                    }
-                    else
-                    {
-                        _anchorSeconds = _clock.NowSeconds + StartLeadSeconds;
-                        Volatile.Write(ref _stampShiftNanos, 0);
-                        Volatile.Write(ref _sourceTargetBase, null);
-                        _logger.LogInformation("send timeline re-based (frame ts={Ts})", frame.Timestamp);
-                    }
-                }
+                        var offset = frame.Timestamp - _timestampBase.Value;
+                        var rtpTime = (uint)(_rtpBase + offset);
 
-                var offset = frame.Timestamp - _timestampBase.Value;
-                var rtpTime = (uint)(_rtpBase + offset);
-
-                // Pace against the master clock: packet with sample-offset N is
-                // due at anchor + (N - anchorOffset)/rate.
-                var due = _anchorSeconds + (offset - _anchorOffset) / (double)SampleRate;
-                _lastDueSeconds = due;
-                var wait = due - _clock.NowSeconds;
-                if (wait > 1.0 && ++_pacingLog % 50 == 1)
-                {
-                    _logger.LogWarning("pacing anomaly: frame due {Wait:F2}s ahead (offset={Offset})", wait, offset);
-                }
-
-                if (wait > 0.002)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(wait), ct).ConfigureAwait(false);
-                }
-
-                var header = BuildRtpHeader(_seq, rtpTime, _sendMarker);
-                _sendMarker = false;
-                var pcm = frame.Data.ToArray();
-                // Ring stores header+PCM; each target re-frames it on retransmit.
-                var plain = new byte[12 + pcm.Length];
-                header.CopyTo(plain, 0);
-                pcm.CopyTo(plain, 12);
-                _plainRing.Add(_seq, plain);
-
-                // Anchor playback the way OwnTone/airplay2-rs do: send a sync
-                // packet (this RTP time renders at now + RenderDelay) with the
-                // first packet, whenever a new target joins, and ~once a second.
-                if (_syncPending || _lastSyncRtp == 0 || rtpTime - _lastSyncRtp >= (uint)SampleRate)
-                {
-                    var first = _sendFirstSync;
-                    _sendFirstSync = false;
-                    _syncPending = false;
-                    _lastSyncRtp = rtpTime;
-                    var nextRtp = (uint)(rtpTime + PcmFrame.SamplesPerFrame);
-                    foreach (var session in SessionSnapshot())
-                    {
-                        if (session is AirPlay2.AirPlay2Session { IsBuffered: true })
+                        // Pace against the master clock: packet with sample-offset N is
+                        // due at anchor + (N - anchorOffset)/rate.
+                        var due = _anchorSeconds + (offset - _anchorOffset) / (double)SampleRate;
+                        _lastDueSeconds = due;
+                        var wait = due - _clock.NowSeconds;
+                        if (wait > 1.0 && ++_pacingLog % 50 == 1)
                         {
-                            // Buffered receivers are anchored once via
-                            // SETRATEANCHORTIME and follow PTP; no sync packets.
+                            _logger.LogWarning("pacing anomaly: frame due {Wait:F2}s ahead (offset={Offset})", wait, offset);
+                        }
+
+                        if (wait > 0.002)
+                        {
+                            // Never hold the flush barrier while waiting on a
+                            // render deadline. Pause can retain this frame;
+                            // a cutover invalidates its generation on the retry.
+                            _dispatchGate.Release();
+                            ownsDispatch = false;
+                            await Task.Delay(TimeSpan.FromSeconds(Math.Min(wait, 0.05)), ct).ConfigureAwait(false);
                             continue;
                         }
 
-                        if (session.RequiresPtp)
+                        if (queued.Generation != Volatile.Read(ref _queueGeneration))
                         {
-                            // PTP anchor semantics (per the working Rust sender):
-                            // "this RTP timestamp corresponds to PTP-clock NOW" —
-                            // the receiver adds its own negotiated latency. Only
-                            // the per-device trim shifts the mapping.
-                            var anchorNanos = (ulong)(Timing.Ptp.PtpReceiverClock.NowNanos + session.LatencyTrimMs * 1_000_000L);
-                            await _control!.SendPtpSyncAsync(session.ControlEndpoint, rtpTime, anchorNanos, nextRtp, _gmClock.ClockId, first, ct).ConfigureAwait(false);
+                            break;
                         }
-                        else
+
+                        var header = BuildRtpHeader(_seq, rtpTime, _sendMarker);
+                        _sendMarker = false;
+                        var pcm = frame.Data.ToArray();
+                        // Ring stores header+PCM; each target re-frames it on retransmit.
+                        var plain = new byte[12 + pcm.Length];
+                        header.CopyTo(plain, 0);
+                        pcm.CopyTo(plain, 12);
+                        _plainRing.Add(_seq, plain);
+
+                        // Anchor playback the way OwnTone/airplay2-rs do: send a sync
+                        // packet (this RTP time renders at now + RenderDelay) with the
+                        // first packet, whenever a new target joins, and ~once a second.
+                        if (_syncPending || _lastSyncRtp == 0 || rtpTime - _lastSyncRtp >= (uint)SampleRate)
                         {
-                            // Positive per-device trim renders that speaker later.
-                            var renderNtp = _clock.NtpInSeconds(RenderDelaySeconds + session.LatencyTrimMs / 1000.0);
-                            await _control!.SendSyncAsync(session.ControlEndpoint, rtpTime, renderNtp, first, ct).ConfigureAwait(false);
+                            var first = _sendFirstSync;
+                            _sendFirstSync = false;
+                            _syncPending = false;
+                            _lastSyncRtp = rtpTime;
+                            var nextRtp = (uint)(rtpTime + PcmFrame.SamplesPerFrame);
+                            foreach (var session in SessionSnapshot())
+                            {
+                                if (session is AirPlay2.AirPlay2Session { IsBuffered: true })
+                                {
+                                    // Buffered receivers are anchored once via
+                                    // SETRATEANCHORTIME and follow PTP; no sync packets.
+                                    continue;
+                                }
+
+                                if (session.RequiresPtp)
+                                {
+                                    // PTP anchor semantics (per the working Rust sender):
+                                    // "this RTP timestamp corresponds to PTP-clock NOW" —
+                                    // the receiver adds its own negotiated latency. Only
+                                    // the per-device trim shifts the mapping.
+                                    var anchorNanos = (ulong)(Timing.Ptp.PtpReceiverClock.NowNanos + session.LatencyTrimMs * 1_000_000L);
+                                    await _control!.SendPtpSyncAsync(session.ControlEndpoint, rtpTime, anchorNanos, nextRtp, _gmClock.ClockId, first, ct).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    // Positive per-device trim renders that speaker later.
+                                    var renderNtp = _clock.NtpInSeconds(RenderDelaySeconds + session.LatencyTrimMs / 1000.0);
+                                    await _control!.SendSyncAsync(session.ControlEndpoint, rtpTime, renderNtp, first, ct).ConfigureAwait(false);
+                                }
+                            }
+                        }
+
+                        foreach (var session in SessionSnapshot())
+                        {
+                            if (!session.IsAlive)
+                            {
+                                continue;
+                            }
+
+                            // Buffered sessions consume raw PCM; they encode (AAC),
+                            // packetize and ship over their own TCP connection.
+                            if (session is AirPlay2.AirPlay2Session { IsBuffered: true } bufferedSession)
+                            {
+                                try
+                                {
+                                    await bufferedSession.WritePcmAsync(pcm, frame.Timestamp, ct).ConfigureAwait(false);
+                                }
+                                catch (Exception ex) when (ex is not OperationCanceledException)
+                                {
+                                    _logger.LogWarning(ex, "{Name}: buffered PCM write failed", session.DisplayName);
+                                }
+
+                                continue;
+                            }
+
+                            // Each target frames the shared header+PCM its own way
+                            // (RAOP AES-CBC ALAC vs AirPlay 2 ChaCha20 PCM), same seq/timestamp.
+                            var bytes = session.PrepareWirePacket(header, pcm, _seq, rtpTime);
+                            if (_packetsSent == 0)
+                            {
+                                var rms = PcmRms(pcm);
+                                _logger.LogInformation(
+                                    "DIAG first audio packet: dest={Dest}, wire_len={Len}, seq={Seq}, rtp_ts={Rtp}, marker={Marker}, pcm_rms={Rms:F1}, header_first4={Header}",
+                                    session.AudioEndpoint, bytes.Length, _seq, rtpTime, (header[1] & 0x80) != 0, rms, Convert.ToHexString(bytes.AsSpan(0, 4)));
+                            }
+                            try
+                            {
+                                var sent = await _audioSocket!.SendAsync(bytes, session.AudioEndpoint, ct).ConfigureAwait(false);
+                                _packetsSent++;
+                                _rateCount++;
+                                var elapsed = _clock.NowSeconds - _rateWindowStart;
+                                if (elapsed >= 1.0)
+                                {
+                                    _lastMeasuredRate = _rateCount / elapsed;
+                                    _logger.LogInformation("Audio rate: {Rate:F0} pkt/s to {Name} ({Bytes} B/pkt) — realtime is ~125", _rateCount / elapsed, session.DisplayName, sent);
+                                    _rateCount = 0;
+                                    _rateWindowStart = _clock.NowSeconds;
+                                }
+                            }
+                            catch (Exception ex) when (ex is not OperationCanceledException)
+                            {
+                                _logger.LogWarning(ex, "{Name}: audio send failed", session.DisplayName);
+                            }
+
+                            session.NoteRtpTime(rtpTime);
+                        }
+
+                        // The mirrored display is not a session — it gets this same
+                        // frame through the mirror's companion audio stream, stamped
+                        // with the instant the group turns it audible.
+                        if (MirrorCarriesAudio && MirrorAudioSink is { } mirrorAudio
+                            && SecondsUntilAudible(frame.Timestamp) is { } untilAudible)
+                        {
+                            var audibleNanos = Timing.Ptp.PtpReceiverClock.NowNanos + (long)(untilAudible * 1e9);
+                            try
+                            {
+                                await mirrorAudio(pcm, audibleNanos, ct).ConfigureAwait(false);
+                            }
+                            catch (Exception ex) when (ex is not OperationCanceledException)
+                            {
+                                _logger.LogDebug(ex, "mirror audio forward failed");
+                            }
+                        }
+
+                        _seq++;
+                        _rtpHead = (uint)(rtpTime + frame.SampleCount);
+                        break;
+                    }
+                    finally
+                    {
+                        if (ownsDispatch)
+                        {
+                            _dispatchGate.Release();
                         }
                     }
                 }
-
-                foreach (var session in SessionSnapshot())
-                {
-                    // Buffered sessions consume raw PCM; they encode (AAC),
-                    // packetize and ship over their own TCP connection.
-                    if (session is AirPlay2.AirPlay2Session { IsBuffered: true } bufferedSession)
-                    {
-                        try
-                        {
-                            await bufferedSession.WritePcmAsync(pcm, frame.Timestamp, ct).ConfigureAwait(false);
-                        }
-                        catch (Exception ex) when (ex is not OperationCanceledException)
-                        {
-                            _logger.LogWarning(ex, "{Name}: buffered PCM write failed", session.DisplayName);
-                        }
-
-                        continue;
-                    }
-
-                    // Each target frames the shared header+PCM its own way
-                    // (RAOP AES-CBC ALAC vs AirPlay 2 ChaCha20 PCM), same seq/timestamp.
-                    var bytes = session.PrepareWirePacket(header, pcm, _seq, rtpTime);
-                    if (_packetsSent == 0)
-                    {
-                        var rms = PcmRms(pcm);
-                        _logger.LogInformation(
-                            "DIAG first audio packet: dest={Dest}, wire_len={Len}, seq={Seq}, rtp_ts={Rtp}, marker={Marker}, pcm_rms={Rms:F1}, header_first4={Header}",
-                            session.AudioEndpoint, bytes.Length, _seq, rtpTime, (header[1] & 0x80) != 0, rms, Convert.ToHexString(bytes.AsSpan(0, 4)));
-                    }
-                    try
-                    {
-                        var sent = await _audioSocket!.SendAsync(bytes, session.AudioEndpoint, ct).ConfigureAwait(false);
-                        _packetsSent++;
-                        _rateCount++;
-                        var elapsed = _clock.NowSeconds - _rateWindowStart;
-                        if (elapsed >= 1.0)
-                        {
-                            _lastMeasuredRate = _rateCount / elapsed;
-                            _logger.LogInformation("Audio rate: {Rate:F0} pkt/s to {Name} ({Bytes} B/pkt) — realtime is ~125", _rateCount / elapsed, session.DisplayName, sent);
-                            _rateCount = 0;
-                            _rateWindowStart = _clock.NowSeconds;
-                        }
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        _logger.LogWarning(ex, "{Name}: audio send failed", session.DisplayName);
-                    }
-
-                    session.NoteRtpTime(rtpTime);
-                }
-
-                // The mirrored display is not a session — it gets this same
-                // frame through the mirror's companion audio stream, stamped
-                // with the instant the group turns it audible.
-                if (MirrorCarriesAudio && MirrorAudioSink is { } mirrorAudio
-                    && SecondsUntilAudible(frame.Timestamp) is { } untilAudible)
-                {
-                    var audibleNanos = Timing.Ptp.PtpReceiverClock.NowNanos + (long)(untilAudible * 1e9);
-                    try
-                    {
-                        await mirrorAudio(pcm, audibleNanos, ct).ConfigureAwait(false);
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        _logger.LogDebug(ex, "mirror audio forward failed");
-                    }
-                }
-
-                _seq++;
-                _rtpHead = (uint)(rtpTime + frame.SampleCount);
             }
         }
         catch (OperationCanceledException)
@@ -1224,6 +1362,30 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
         {
             _logger.LogError(ex, "AirPlay send loop failed");
         }
+    }
+
+    // A paused frame stays in hand; a cutover invalidates it even if its
+    // bounded-channel write completed after the flush started.
+    private async Task<bool> AcquireDispatchAsync(long generation, CancellationToken ct)
+    {
+        while (generation == Volatile.Read(ref _queueGeneration))
+        {
+            if (_holdFrames)
+            {
+                await Task.Delay(25, ct).ConfigureAwait(false);
+                continue;
+            }
+
+            await _dispatchGate.WaitAsync(ct).ConfigureAwait(false);
+            if (generation == Volatile.Read(ref _queueGeneration) && !_holdFrames)
+            {
+                return true;
+            }
+
+            _dispatchGate.Release();
+        }
+
+        return false;
     }
 
     private static double PcmRms(ReadOnlySpan<byte> pcmS16Le)
@@ -1350,125 +1512,127 @@ public sealed class AirPlayTargetGroup : IAudioSink, IAsyncDisposable
 
     public async Task FlushAsync(bool dropQueuedAudio, CancellationToken ct = default)
     {
-        if (!Streaming || _timestampBase is null)
-        {
-            _logger.LogDebug("flush skipped (streaming={Streaming}, anchored={Anchored})", Streaming, _timestampBase is not null);
-            return;
-        }
-
         if (dropQueuedAudio)
         {
-            // Cutover (skip): everything queued belongs to the abandoned
-            // track. The send loop (the queue's single reader) drains on this
-            // flag; buffered sessions drop their encoder-pipe backlog too.
-            _dropQueuedFrames = true;
-            foreach (var session in SessionSnapshot())
-            {
-                (session as AirPlay2.AirPlay2Session)?.RequestStaleDrop();
-            }
-        }
-        else
-        {
-            // Pause: HOLD the pipeline. The queued tail is unheard audio the
-            // listener resumes into — but letting it stream out during the
-            // pause consumed the pending re-anchor seconds early (the tail
-            // audibly played) and left the eventual resume mapped to a stale
-            // timeline: every post-resume packet counted as late and was
-            // dropped — silence. Frames wait here and anchors stay suppressed
-            // until ResumeAsync releases both.
-            _holdFrames = true;
-            foreach (var session in SessionSnapshot())
-            {
-                (session as AirPlay2.AirPlay2Session)?.HoldAnchor();
-            }
+            // Invalidate queued and in-flight writes before waiting for the
+            // dispatcher. Fresh source frames wait for this cutover in AudioPump.
+            Interlocked.Increment(ref _queueGeneration);
         }
 
-        // Reset the timeline FIRST — the next packet re-anchors and re-marks
-        // the stream regardless of how the per-speaker flushes fare. Holding
-        // this hostage to every speaker's RTSP responsiveness meant one slow
-        // receiver silently kept the whole group on the stale timeline.
-        // (The source epoch resets with it: an idling source's sample counter
-        // freezes while wall time doesn't, so the old epoch would overstate
-        // the age of everything after resume.)
-        _timestampBase = null;
-        _sourceEpochNanos = long.MaxValue;
-        _sourceTargetBase = null;
-        _stampShiftNanos = 0;
-        _sendMarker = true;
-        _sendFirstSync = true;
-        _syncPending = true;
-        _lastSyncRtp = 0;
-        _groupAnchor.Reset();
-
-        var sessions = SessionSnapshot();
-        _logger.LogInformation("flushing {Count} target(s) (drop buffered audio, re-anchor)", sessions.Length);
-        await Task.WhenAll(sessions.Select(async session =>
+        await _dispatchGate.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            try
+            if (!Streaming)
             {
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                timeout.CancelAfter(TimeSpan.FromSeconds(2));
-                await session.FlushAsync(_seq, _rtpHead, timeout.Token).ConfigureAwait(false);
-                _logger.LogDebug("{Name}: flushed", session.DisplayName);
+                return;
             }
-            catch (Exception ex)
+
+            if (!dropQueuedAudio)
             {
-                _logger.LogWarning(ex, "{Name}: flush failed", session.DisplayName);
+                _holdFrames = true;
             }
-        })).ConfigureAwait(false);
+
+            var sessions = SessionSnapshot();
+            foreach (var session in sessions.OfType<AirPlay2.AirPlay2Session>())
+            {
+                session.HoldAnchor();
+                if (dropQueuedAudio)
+                {
+                    session.RequestStaleDrop();
+                }
+            }
+
+            ResetCaptureTimeline();
+
+            _logger.LogInformation("flushing {Count} target(s), dispatch held until anchors are invalidated", sessions.Length);
+            await Task.WhenAll(sessions.Select(async session =>
+            {
+                try
+                {
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(2));
+                    await session.FlushAsync(_seq, _rtpHead, timeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "{Name}: flush failed", session.DisplayName);
+                }
+            })).ConfigureAwait(false);
+
+            if (dropQueuedAudio && !_holdFrames)
+            {
+                foreach (var session in sessions.OfType<AirPlay2.AirPlay2Session>())
+                {
+                    session.ReleaseAnchorHold();
+                }
+            }
+        }
+        finally
+        {
+            _dispatchGate.Release();
+        }
     }
 
     public async Task StopStreamAsync(CancellationToken ct = default)
     {
-        CancellationTokenSource? cts;
-        lock (_gate)
-        {
-            cts = _streamCts;
-            _streamCts = null;
-        }
-
-        if (cts is null)
-        {
-            return;
-        }
-
-        cts.Cancel();
+        await _reconcileLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            await _sendLoop.ConfigureAwait(false);
-        }
-        catch
-        {
-            // Loop errors already logged.
-        }
-
-        foreach (var session in SessionSnapshot())
-        {
-            await session.TeardownAsync(CancellationToken.None).ConfigureAwait(false);
-            session.Dispose();
-        }
-
-        lock (_gate)
-        {
-            _sessions.Clear();
-        }
-
-        _control?.Dispose();
-        _control = null;
-        foreach (var session in SessionSnapshot())
-        {
-            if (session.RequiresPtp)
+            CancellationTokenSource? cts;
+            lock (_gate)
             {
-                _gmClock.RemovePeer(session.DeviceAddress);
+                cts = _streamCts;
+                _streamCts = null;
             }
+
+            if (cts is null)
+            {
+                return;
+            }
+
+            cts.Cancel();
+            try
+            {
+                await _sendLoop.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Loop errors already logged.
+            }
+
+            var sessions = SessionSnapshot();
+            foreach (var session in sessions)
+            {
+                await session.TeardownAsync(CancellationToken.None).ConfigureAwait(false);
+                session.Dispose();
+            }
+
+            lock (_gate)
+            {
+                _sessions.Clear();
+            }
+
+            _control?.Dispose();
+            _control = null;
+            foreach (var session in sessions)
+            {
+                if (session.RequiresPtp)
+                {
+                    _gmClock.RemovePeer(session.DeviceAddress);
+                }
+            }
+            _audioSocket?.Dispose();
+            _audioSocket = null;
+            _sendQueue = null;
+            _plainRing.Clear();
+            _lastMeasuredRate = 0;
+            cts.Dispose();
+            _logger.LogInformation("AirPlay stream stopped");
         }
-        _audioSocket?.Dispose();
-        _audioSocket = null;
-        _sendQueue = null;
-        _plainRing.Clear();
-        _lastMeasuredRate = 0;
-        cts.Dispose();
-        _logger.LogInformation("AirPlay stream stopped");
+        finally
+        {
+            _reconcileLock.Release();
+        }
     }
 
     public async ValueTask DisposeAsync()

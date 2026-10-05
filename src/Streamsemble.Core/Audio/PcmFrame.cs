@@ -21,6 +21,9 @@ namespace Streamsemble.Core.Audio;
 /// </param>
 public readonly record struct PcmFrame(ReadOnlyMemory<byte> Data, long Timestamp, long TargetNanos = 0)
 {
+    /// <summary>The source cutover generation that produced these samples.</summary>
+    public long Generation { get; init; }
+
     /// <summary>Native RAOP packet size; the pipeline's standard frame length.</summary>
     public const int SamplesPerFrame = 352;
 

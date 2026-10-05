@@ -1,8 +1,5 @@
-using System.Diagnostics;
 using System.Net;
 using System.Reflection;
-using System.Runtime.CompilerServices;
-using System.Threading.Channels;
 using Microsoft.Extensions.Logging.Abstractions;
 using Streamsemble.AirPlay.Common;
 using Streamsemble.AirPlay.Sender.AirPlay2;
@@ -37,26 +34,15 @@ public class BufferedAnchorSnapshotTests
     private static async Task<long> ObserveAnchorAsync(bool inFlightWrite, long captureOrigin, bool cancelPump = false)
     {
         using var stdin = new GatedStream();
-        using var process = new Process();
-        // Inject a redirected stdin stream without launching ffmpeg. Both
-        // public PCM writes and the private buffered pump below remain the
-        // production methods, including their independent sample counters.
-        Set(process, "_standardInput", new StreamWriter(stdin));
-
-        var frames = Channel.CreateUnbounded<byte[]>();
-        for (var i = 0; i < 45; i++) frames.Writer.TryWrite([1]);
-        frames.Writer.TryComplete();
-
-        var encoder = (AacEncoderPipe)RuntimeHelpers.GetUninitializedObject(typeof(AacEncoderPipe));
-        Set(encoder, "_process", process);
-        Set(encoder, "_logger", NullLogger.Instance);
-        Set(encoder, "_frames", frames);
-        Set(encoder, "_pcmBytesIn", 48_000L * 4);
+        using var stdout = new AacEncoderTestStreams.HoldAfterStream(AacEncoderTestStreams.Frames(45));
+        using var encoder = new AacEncoderPipe(NullLogger.Instance, stdin, stdout);
+        await stdout.Drained.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var session = new AirPlay2Session("repro", IPAddress.Loopback, 7000, 0, NullLogger.Instance);
         Set(session, "_aac", encoder);
         Set(session, "_audioCipher", new AirPlay2AudioCipher(new byte[32]));
-        Set(session, "_pcmCaptureEnd", captureOrigin + 48_000L);
+        await session.WritePcmAsync(new byte[48_000 * 4], captureOrigin, CancellationToken.None);
+        stdin.BlockWrites = inFlightWrite;
         session.AnchorClock = () => (1_000_000_000_000UL, new byte[8]);
         long observedCapture = -1;
         var inputWasUnlockedAtAnchor = false;
@@ -132,11 +118,17 @@ public class BufferedAnchorSnapshotTests
 
     private sealed class GatedStream : MemoryStream
     {
+        public bool BlockWrites { get; set; }
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
         {
+            if (!BlockWrites)
+            {
+                return;
+            }
+
             Entered.TrySetResult();
             await Release.Task.WaitAsync(cancellationToken);
         }

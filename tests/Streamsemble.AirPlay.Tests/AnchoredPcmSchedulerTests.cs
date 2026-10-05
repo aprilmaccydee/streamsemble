@@ -269,17 +269,79 @@ public class AnchoredPcmSchedulerTests
     {
         const long anchorNanos = 5_000_000_000_000;
         var emitted = new List<byte>();
+        var cutovers = 0;
         var scheduler = new AnchoredPcmScheduler(
             (pcm, _) => emitted.Add(pcm.Span[0]),
             NullLogger.Instance,
-            clockNanos: () => anchorNanos + 3_601_000_000_000);
+            clockNanos: () => anchorNanos + 3_601_000_000_000,
+            onDiscontinuity: () => cutovers++);
         scheduler.SetAnchor(0, anchorNanos);
         scheduler.Enqueue(0, Frame(1));
         scheduler.Enqueue(44100 * 3600, Frame(2));
 
         await DrainAsync(scheduler);
 
-        Assert.Equal(new byte[] { 1, 2 }, emitted);
+        Assert.Equal(new byte[] { 2 }, emitted);
+        Assert.Equal(1, cutovers);
+        Assert.Equal(0, scheduler.ConcealedSamples);
+    }
+
+    [Fact]
+    public async Task ThreeSecondOutageStartsNewTimelineBeforeFreshAudio()
+    {
+        const long anchorNanos = 5_000_000_000_000;
+        var events = new List<string>();
+        var clock = anchorNanos;
+        var scheduler = new AnchoredPcmScheduler(
+            (pcm, _) => events.Add($"audio {pcm.Span[0]}"),
+            NullLogger.Instance,
+            clockNanos: () => Volatile.Read(ref clock),
+            onDiscontinuity: () => events.Add("cutover"));
+        scheduler.SetAnchor(0, anchorNanos);
+        scheduler.Enqueue(0, Frame(1));
+        await DrainAsync(scheduler);
+
+        Volatile.Write(ref clock, anchorNanos + 4_000_000_000);
+        scheduler.Enqueue(352 + 3 * 44100, Frame(2));
+        scheduler.Enqueue(704 + 3 * 44100, Frame(3));
+        await DrainAsync(scheduler);
+
+        Assert.Equal(new[] { "audio 1", "cutover", "audio 2", "audio 3" }, events);
+        Assert.Equal(0, scheduler.ConcealedSamples);
+    }
+
+    [Fact]
+    public async Task LargeGapInvalidatesOldFrameAlreadyWaitingForItsDeadline()
+    {
+        const long anchorNanos = 5_000_000_000_000;
+        const uint freshRtp = 352 + 3 * 44100;
+        var waiting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fresh = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var emitted = new List<byte>();
+        var cutovers = 0;
+        var scheduler = new AnchoredPcmScheduler(
+            (pcm, _) =>
+            {
+                lock (emitted) { emitted.Add(pcm.Span[0]); }
+                if (pcm.Span[0] == 2) fresh.TrySetResult();
+            },
+            NullLogger.Instance,
+            clockNanos: () => { waiting.TrySetResult(); return anchorNanos; },
+            onDiscontinuity: () => cutovers++);
+        scheduler.SetAnchor(0, anchorNanos + 10_000_000_000);
+        scheduler.Enqueue(0, Frame(1));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var run = scheduler.RunAsync(cts.Token);
+
+        await waiting.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        scheduler.Enqueue(freshRtp, Frame(2));
+        scheduler.SetAnchor(freshRtp, anchorNanos);
+        await fresh.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        lock (emitted) { Assert.Equal(new byte[] { 2 }, emitted); }
+        Assert.Equal(1, cutovers);
+
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
     }
 
     private static byte[] Frame(byte marker)

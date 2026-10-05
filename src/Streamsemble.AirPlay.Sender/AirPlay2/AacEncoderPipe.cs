@@ -30,15 +30,22 @@ public sealed class AacEncoderPipe : IDisposable
     /// <c>ffmpeg -f aac -i pipe:0 -f s16le -ar 44100 -ac 2 pipe:1</c>).
     /// </summary>
     public const int EncoderDelaySamples = 1024;
+    internal const int QueueCapacity = 256;
 
     private readonly ILogger _logger;
-    private readonly Process _process;
+    private readonly Process? _process;
+    private readonly Stream _stdin;
+    private readonly Action<Exception>? _onFailure;
+    private readonly CancellationTokenSource _lifetime = new();
+    private Exception? _failure;
+    private int _disposed;
     private readonly Channel<byte[]> _frames = Channel.CreateBounded<byte[]>(
-        new BoundedChannelOptions(256) { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest });
+        new BoundedChannelOptions(QueueCapacity) { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait });
 
-    public AacEncoderPipe(ILogger logger)
+    public AacEncoderPipe(ILogger logger, Action<Exception>? onFailure = null)
     {
         _logger = logger;
+        _onFailure = onFailure;
         _process = new Process
         {
             StartInfo = new ProcessStartInfo
@@ -53,14 +60,31 @@ public sealed class AacEncoderPipe : IDisposable
             },
         };
         _process.Start();
-        _ = ReadFramesAsync(_process.StandardOutput.BaseStream);
+        _stdin = _process.StandardInput.BaseStream;
+        _ = ReadFramesAsync(_process.StandardOutput.BaseStream, _lifetime.Token);
         _ = LogStderrAsync(_process.StandardError);
+    }
+
+    // Stream injection exercises the real parser, counters and failure path
+    // without requiring an ffmpeg executable. The caller owns these streams.
+    internal AacEncoderPipe(ILogger logger, Stream stdin, Stream stdout, Action<Exception>? onFailure = null)
+    {
+        _logger = logger;
+        _stdin = stdin;
+        _onFailure = onFailure;
+        _ = ReadFramesAsync(stdout, _lifetime.Token);
     }
 
     public ChannelReader<byte[]> Frames => _frames.Reader;
 
     private long _pcmBytesIn;
     private long _framesOut;
+    private long _queueOverflows;
+
+    public long FramesProduced => Interlocked.Read(ref _framesOut);
+    public int QueueDepth => _frames.Reader.Count;
+    public long QueueOverflows => Interlocked.Read(ref _queueOverflows);
+    public string? Failure => Volatile.Read(ref _failure)?.Message;
 
     /// <summary>
     /// Total PCM samples fed into the encoder so far. Compared against the
@@ -73,15 +97,33 @@ public sealed class AacEncoderPipe : IDisposable
     /// <summary>Feeds interleaved s16le stereo PCM; ffmpeg paces itself off the pipe.</summary>
     public async ValueTask WritePcmAsync(ReadOnlyMemory<byte> pcm, CancellationToken ct)
     {
-        await _process.StandardInput.BaseStream.WriteAsync(pcm, ct).ConfigureAwait(false);
-        var total = Interlocked.Add(ref _pcmBytesIn, pcm.Length);
-        if (total % (44100L * 4 * 10) < pcm.Length)
+        if (Volatile.Read(ref _failure) is { } failure)
         {
-            _logger.LogInformation("AAC pipe: {In} PCM bytes in (~{Secs:F0}s), {Out} frames out", total, total / (44100.0 * 4), _framesOut);
+            throw new IOException("AAC encoder is unavailable", failure);
+        }
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        try
+        {
+            await _stdin.WriteAsync(pcm, linked.Token).ConfigureAwait(false);
+            var total = Interlocked.Add(ref _pcmBytesIn, pcm.Length);
+            if (total % (44100L * 4 * 10) < pcm.Length)
+            {
+                _logger.LogInformation("AAC pipe: {In} PCM bytes in (~{Secs:F0}s), {Out} frames out", total, total / (44100.0 * 4), FramesProduced);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            Abort(ex);
+            throw;
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && _lifetime.IsCancellationRequested)
+        {
+            throw new IOException("AAC encoder stopped while accepting PCM", Volatile.Read(ref _failure) ?? ex);
         }
     }
 
-    private async Task ReadFramesAsync(Stream stdout)
+    private async Task ReadFramesAsync(Stream stdout, CancellationToken ct)
     {
         var buffer = new byte[32 * 1024];
         var pending = new List<byte>(8192);
@@ -89,10 +131,10 @@ public sealed class AacEncoderPipe : IDisposable
         {
             while (true)
             {
-                var read = await stdout.ReadAsync(buffer).ConfigureAwait(false);
+                var read = await stdout.ReadAsync(buffer, ct).ConfigureAwait(false);
                 if (read == 0)
                 {
-                    break;
+                    throw new EndOfStreamException("AAC encoder output ended unexpectedly");
                 }
 
                 pending.AddRange(buffer.AsSpan(0, read).ToArray());
@@ -118,10 +160,24 @@ public sealed class AacEncoderPipe : IDisposable
                     }
 
                     var headerLength = (pending[offset + 1] & 0x01) != 0 ? 7 : 9;
+                    if (frameLength < headerLength)
+                    {
+                        throw new InvalidDataException("AAC encoder emitted an invalid ADTS frame length");
+                    }
+
                     var frame = new byte[frameLength - headerLength];
                     pending.CopyTo(offset + headerLength, frame, 0, frame.Length);
-                    _frames.Writer.TryWrite(frame);
-                    _framesOut++;
+                    Interlocked.Increment(ref _framesOut);
+                    if (!_frames.Writer.TryWrite(frame))
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        Interlocked.Increment(ref _queueOverflows);
+                        // Never silently omit an AU: outgoing RTP would then
+                        // name the wrong content forever. Fail this session
+                        // instead of blocking the shared PCM fan-out.
+                        throw new IOException($"AAC output queue exceeded {QueueCapacity} frames");
+                    }
+
                     DumpFrame(frame);
                     offset += frameLength;
                 }
@@ -129,13 +185,42 @@ public sealed class AacEncoderPipe : IDisposable
                 pending.RemoveRange(0, offset);
             }
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+        }
+        catch (Exception ex)
+        {
+            Abort(ex);
         }
         finally
         {
-            _frames.Writer.TryComplete();
+            _frames.Writer.TryComplete(Volatile.Read(ref _failure));
         }
+    }
+
+    /// <summary>Fail once and release any pending input/output IO.</summary>
+    internal void Abort(Exception failure)
+    {
+        if (Volatile.Read(ref _disposed) != 0
+            || Interlocked.CompareExchange(ref _failure, failure, null) is not null)
+        {
+            return;
+        }
+
+        _frames.Writer.TryComplete(failure);
+        _lifetime.Cancel();
+        try
+        {
+            // A fatal pipeline can never resume. Terminate ffmpeg now so
+            // even a blocked OS stdin pipe releases before group reconnect.
+            _process?.Kill();
+        }
+        catch
+        {
+            // It may already have exited or been disposed by reconciliation.
+        }
+
+        _onFailure?.Invoke(failure);
     }
 
     // Diagnostic tap: STREAMSEMBLE_AAC_DUMP=<path> writes every raw frame as
@@ -181,12 +266,21 @@ public sealed class AacEncoderPipe : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _lifetime.Cancel();
         try
         {
-            _process.StandardInput.Close();
-            if (!_process.WaitForExit(500))
+            if (_process is { } process)
             {
-                _process.Kill();
+                process.StandardInput.Close();
+                if (!process.WaitForExit(500))
+                {
+                    process.Kill();
+                }
             }
         }
         catch
@@ -194,6 +288,8 @@ public sealed class AacEncoderPipe : IDisposable
             // Best effort; the process may already be gone.
         }
 
-        _process.Dispose();
+        _process?.Dispose();
+        // Pending reader/writer continuations still use this cancellation
+        // source. Leave it for GC rather than racing their cancellation path.
     }
 }

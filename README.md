@@ -91,6 +91,13 @@ English. This README is the deeper technical reference.
   to its packet, conceals missing samples with silence, then emits canonical
   352-sample PCM frames. The technical panel's **input loss concealed** counter
   reports the duration filled during the current realtime receive stream.
+- **Broken audio timelines recover instead of continuing with expired stamps.**
+  Encoded queue overflow and encoder failure stop the affected session for
+  reconnection. Buffered sessions also reconnect after two continuous seconds
+  without positive presentation lead. Long input gaps trigger a coordinated
+  cutover; queued audio from the abandoned timeline is discarded before fresh
+  frames resume. The technical panel shows the actual encoder queue depth;
+  `/api/state` also exposes encoded-frame production, overflow and failure data.
 - **Mirror video to a modern TV must be VCL-only, sealed with the ChaCha
   DataStream envelope.** SPS/PPS reach the TV solely via the unencrypted avcC
   config packet — inline parameter sets render as a black screen, and so does

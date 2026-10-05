@@ -20,7 +20,11 @@ public sealed record SessionTelemetry(
     double? EncoderAgeMs,
     double? InheritedDebtMs,
     long BufferedPacketsSent,
-    string? TimelineId);
+    string? TimelineId,
+    long? EncoderFramesProduced = null,
+    int? EncoderQueueDepth = null,
+    long? EncoderQueueOverflows = null,
+    string? EncoderFailure = null);
 
 /// <summary>
 /// A single speaker session in a fan-out group, abstracting over classic RAOP

@@ -25,6 +25,12 @@ public interface IAudioSource
     SourceState State { get; }
 
     /// <summary>
+    /// Current PCM cutover generation. Frames from older generations belong
+    /// to abandoned content, including a frame already held by the pump.
+    /// </summary>
+    long Generation => 0;
+
+    /// <summary>
     /// Canonical-format PCM. Bounded: when no consumer is draining (source is
     /// not the arbiter's live source), writers drop oldest frames rather than
     /// stall the protocol session.
@@ -34,8 +40,8 @@ public interface IAudioSource
     event EventHandler<SourceStateChanged>? StateChanged;
 
     /// <summary>
-    /// A user-initiated playback cutover (skip/new load): everything queued
-    /// from before it belongs to abandoned content and should be discarded.
+    /// A playback cutover (skip/new load or source timeline discontinuity):
+    /// earlier generations belong to abandoned content and are discarded.
     /// NOT raised for pause (the queued tail is unheard audio the listener
     /// resumes into) or natural gapless track endings (the tail is the end
     /// of the song).
