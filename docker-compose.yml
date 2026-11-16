@@ -24,7 +24,7 @@ services:
       context: .
       args:
         # LIBRESPOT_VARIANT: none   # skip the Rust build (then set Spotify__Enabled=false)
-        LIBRESPOT_REF: 9c7d756
+        LIBRESPOT_REF: 15e02e8
     image: streamsemble:latest
     container_name: streamsemble
     restart: unless-stopped

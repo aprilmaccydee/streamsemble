@@ -243,7 +243,7 @@ For Spotify, open the app and pick **Streamsemble** as the playback device.
 ### Docker
 
 `Dockerfile` + `docker-compose.yml` build the whole hub — .NET publish, plus
-librespot compiled from upstream `9c7d756` with `tools/librespot-resilience.patch`
+librespot compiled from upstream `15e02e8` with `tools/librespot-resilience.patch`
 applied, plus the `ffmpeg` the buffered AirPlay 2 encoder shells out to.
 
 ```bash

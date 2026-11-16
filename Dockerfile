@@ -12,11 +12,11 @@
 # have to live on the LAN the speakers are on. See docker-compose.yml.
 
 # librespot fork: "none" skips the Rust build entirely (no Spotify source;
-# run with Spotify__Enabled=false). Ref 9c7d756 is the upstream dev commit the
+# run with Spotify__Enabled=false). Ref 15e02e8 is the upstream dev commit the
 # repo's resilience patch was cut against — bump both together.
 ARG LIBRESPOT_VARIANT=fork
 ARG LIBRESPOT_REPO=https://github.com/librespot-org/librespot.git
-ARG LIBRESPOT_REF=9c7d756
+ARG LIBRESPOT_REF=15e02e8
 
 # ---------------------------------------------------------------- .NET build --
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS dotnet-build
