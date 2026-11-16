@@ -12,7 +12,7 @@ namespace Streamsemble.Wled;
 public readonly record struct LightWindow(long StartSample, float Level, float[] Bands);
 
 /// <summary>
-/// Turns canonical PCM into ~43 light windows per second: a loudness envelope
+/// Turns canonical PCM into ~86 light windows per second: a loudness envelope
 /// and a log-spaced spectrum, both normalized by slow-decaying auto gain so
 /// they use the full range at any source volume — no sensitivity knob.
 /// Single-threaded: feed it only from the lighting service's loop.
@@ -20,14 +20,31 @@ public readonly record struct LightWindow(long StartSample, float Level, float[]
 public sealed class AudioLightAnalyzer
 {
     public const int WindowSamples = 2048; // ~46 ms at 44.1 kHz → 21.5 Hz bins
-    public const int HopSamples = 1024;    // ~43 windows/s drive the strips
+    public const int HopSamples = 512;     // ~86 windows/s drive the strips: ±6 ms of onset quantization
+
+    // Loudness is measured over the window's central stretch — the same
+    // stretch the Hann taper weights heaviest — so the level and the spectrum
+    // of one window describe the same instant and a single onset offset
+    // serves every light mode. Measuring it over the whole window made the
+    // level react a window before the spectrum could see the same hit.
+    public const int LevelSamples = 1024;
+    private const int LevelStart = (WindowSamples - LevelSamples) / 2;
+
+    /// <summary>Where in a window a fresh hit sits when the lights first show
+    /// it: schedule a window at StartSample + this and the flash lands on the
+    /// audible onset. Geometry puts the level's first sight of an onset at
+    /// LevelStart + LevelSamples − Hop/2 = 1280 on average; that lands first
+    /// light ~2 ms and half brightness ~9 ms behind the hit, so it is backed
+    /// off a quarter hop to straddle the onset instead. Measured, not guessed
+    /// — OnsetTimingTests fails if the analyzer's geometry drifts from it.</summary>
+    public const int OnsetOffsetSamples = 1152;
     public const int BandCount = 64;
 
     private const float LowHz = 43f;      // first usable FFT bin
     private const float HighHz = 16000f;
     private const float ReferenceFloor = 0.02f;  // ≈ −34 dBFS: quiet rooms stay dark instead of flaring noise
-    private const float ReferenceDecay = 0.9990f; // per window ≈ 20 s half-life for the auto-gain peak
-    private const float EnvelopeDecay = 0.86f;    // per window ≈ fast fall, instant attack
+    private const float ReferenceDecay = 0.9995f; // per window ≈ 16 s half-life for the auto-gain peak
+    private const float EnvelopeDecay = 0.927f;   // per window ≈ 110 ms half-life: fast fall, instant attack
 
     private readonly float[] _window = new float[WindowSamples];
     private readonly float[] _hann = new float[WindowSamples];
@@ -118,12 +135,12 @@ public sealed class AudioLightAnalyzer
     {
         // Loudness: RMS → instant-attack, fast-fall envelope → auto gain.
         var sumSquares = 0f;
-        for (var i = 0; i < WindowSamples; i++)
+        for (var i = LevelStart; i < LevelStart + LevelSamples; i++)
         {
             sumSquares += _window[i] * _window[i];
         }
 
-        var rms = (float)Math.Sqrt(sumSquares / WindowSamples);
+        var rms = (float)Math.Sqrt(sumSquares / LevelSamples);
         _levelEnv = Math.Max(rms, _levelEnv * EnvelopeDecay);
         _levelRef = Math.Max(Math.Max(rms, ReferenceFloor), _levelRef * ReferenceDecay);
         var level = Math.Min(1f, _levelEnv / _levelRef);

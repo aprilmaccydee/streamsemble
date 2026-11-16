@@ -13,7 +13,9 @@ namespace Streamsemble.Wled;
 /// and HELD until the moment that audio turns audible — the sink's
 /// capture→audible mapping, the same timeline the speakers anchor on — so the
 /// lights land on the beat the listener hears, not the beat the pump saw a
-/// group latency earlier.
+/// group latency earlier. The mapping is asked again right up to the send:
+/// a window analyzed before the speakers anchored, or held across a
+/// re-anchor, still lands on the timeline that actually plays it.
 /// </summary>
 public sealed class WledLightingService : BackgroundService
 {
@@ -28,22 +30,21 @@ public sealed class WledLightingService : BackgroundService
         new BoundedChannelOptions(192) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true });
 
     private readonly Channel<Scheduled> _pending = Channel.CreateBounded<Scheduled>(
-        new BoundedChannelOptions(256) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true, SingleWriter = true });
+        new BoundedChannelOptions(512) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true, SingleWriter = true });
 
     private readonly AudioLightAnalyzer _analyzer = new();
     private int _epoch;
     private int _resetPending;
     private long _lateDropped;
 
-    // Where in a window a fresh onset actually sits. Half-overlapping windows
-    // mean a window's first half was already the previous window's second
-    // half, so the first window to contain an onset always holds it
-    // Hop..Window-1 samples in — expected position (Window+Hop)/2. Scheduling
-    // on StartSample made every flash lead the beat by that much (~23–46 ms);
-    // scheduling on the expected onset centers the residual to ±Hop/2.
-    private const int OnsetCenterSamples = (AudioLightAnalyzer.WindowSamples + AudioLightAnalyzer.HopSamples) / 2;
+    // How long the send loop sleeps before asking the sink again when a
+    // window's audio turns audible, and how close counts as "now".
+    private const double RecheckSeconds = 0.05;
+    private const double SendSlackSeconds = 0.001;
 
-    private sealed record Scheduled(int Epoch, long DueStopwatchTimestamp, LightWindow Window);
+    /// <param name="OnsetSample">Capture sample whose audible instant this window lands on.</param>
+    /// <param name="FallbackDueTimestamp">Stopwatch deadline used only while the sink has no timeline.</param>
+    private sealed record Scheduled(int Epoch, long OnsetSample, long FallbackDueTimestamp, LightWindow Window);
 
     public WledLightingService(
         WledDeviceGroup devices,
@@ -109,13 +110,12 @@ public sealed class WledLightingService : BackgroundService
                 var epoch = Volatile.Read(ref _epoch);
                 foreach (var window in _analyzer.Feed(frame))
                 {
-                    // The sink says when this window's audio turns audible;
-                    // convert to a local stopwatch deadline the send loop can
-                    // sleep toward. Unanchored (nothing playing yet, or a
-                    // WAV/null sink) falls back to the configured latency.
-                    var wait = _secondsUntilAudible(window.StartSample + OnsetCenterSamples) ?? _fallbackLatencySeconds;
-                    var due = Stopwatch.GetTimestamp() + (long)(wait * Stopwatch.Frequency);
-                    _pending.Writer.TryWrite(new Scheduled(epoch, due, window));
+                    // Only the fallback deadline is fixed here; the send
+                    // loop resolves the real one against the sink's timeline
+                    // as late as it can.
+                    var fallbackDue = Stopwatch.GetTimestamp() + (long)(_fallbackLatencySeconds * Stopwatch.Frequency);
+                    _pending.Writer.TryWrite(new Scheduled(
+                        epoch, window.StartSample + AudioLightAnalyzer.OnsetOffsetSamples, fallbackDue, window));
                 }
             }
         }
@@ -124,6 +124,14 @@ public sealed class WledLightingService : BackgroundService
             // Shutdown.
         }
     }
+
+    /// <summary>Seconds until this window's audio turns audible. The sink's
+    /// own timeline answers whenever it has one; unanchored (nothing playing
+    /// yet, or a WAV/null sink) falls back to the configured latency counted
+    /// from when the window was analyzed.</summary>
+    private double SecondsUntilDue(Scheduled item)
+        => _secondsUntilAudible(item.OnsetSample)
+           ?? (item.FallbackDueTimestamp - Stopwatch.GetTimestamp()) / (double)Stopwatch.Frequency;
 
     private async Task SendLoopAsync(CancellationToken ct)
     {
@@ -136,16 +144,29 @@ public sealed class WledLightingService : BackgroundService
                     continue; // scheduled before a flush — audio that will never sound
                 }
 
-                var wait = (item.DueStopwatchTimestamp - Stopwatch.GetTimestamp()) / (double)Stopwatch.Frequency;
-                if (wait > 0)
+                // Sleep toward the deadline in short steps, re-asking the
+                // sink each time: the answer given a group latency ago goes
+                // stale when the speakers anchor or re-anchor in between.
+                var wait = SecondsUntilDue(item);
+                var current = true;
+                while (wait > SendSlackSeconds)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(wait), ct).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(wait, RecheckSeconds)), ct).ConfigureAwait(false);
                     if (item.Epoch != Volatile.Read(ref _epoch))
                     {
-                        continue;
+                        current = false;
+                        break;
                     }
+
+                    wait = SecondsUntilDue(item);
                 }
-                else if (wait < -0.25)
+
+                if (!current)
+                {
+                    continue;
+                }
+
+                if (wait < -0.25)
                 {
                     // Late light frames would visibly trail the music — skip
                     // forward instead of replaying a stale show.

@@ -296,7 +296,7 @@ Edit the `environment:` block to name your speakers; every setting in
 - `Wled:Devices[]` — `{ Name, Host, Port, LedCount, Protocol, Mode, Color,
   Brightness, Palette, Decay, Mirror, Reverse, TimeoutSeconds }`: WLED strips
   that light to the music. The
-  lighting engine taps the exact PCM the speakers get, renders ~43 light
+  lighting engine taps the exact PCM the speakers get, renders ~86 light
   frames/s (loudness envelope + log-spaced FFT bands, slow-decay auto gain —
   no sensitivity knob), and schedules every frame on the group's
   capture→audible timeline (source render stamps → group epoch anchor → send
