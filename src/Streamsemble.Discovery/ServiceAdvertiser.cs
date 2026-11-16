@@ -15,6 +15,8 @@ public sealed class ServiceAdvertiser : IDisposable
     private readonly ILogger<ServiceAdvertiser> _logger;
     private readonly MulticastService _mdns;
     private readonly ServiceDiscovery _discovery;
+    private readonly object _startLock = new();
+    private bool _started;
 
     public ServiceAdvertiser(ILogger<ServiceAdvertiser> logger)
     {
@@ -50,10 +52,33 @@ public sealed class ServiceAdvertiser : IDisposable
         }
 
         _discovery.Advertise(profile);
+        lock (_startLock)
+        {
+            // Registered after the responder is already up: it would answer
+            // queries but never send the unsolicited announcement Start() does.
+            if (_started)
+            {
+                _discovery.Announce(profile);
+            }
+        }
+
         _logger.LogInformation("Advertising {Instance} {Type} on port {Port}", instanceName, serviceType, port);
     }
 
-    public void Start() => _mdns.Start();
+    /// <summary>Idempotent: every service that advertises calls this, in any order.</summary>
+    public void Start()
+    {
+        lock (_startLock)
+        {
+            if (_started)
+            {
+                return;
+            }
+
+            _started = true;
+            _mdns.Start();
+        }
+    }
 
     public void Dispose()
     {

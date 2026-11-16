@@ -19,4 +19,14 @@ public sealed class SpotifyOptions
     public int EventPort { get; set; }
 
     public string? ExtraArgs { get; set; }
+
+    /// <summary>
+    /// 0 (default): librespot announces itself with its own mDNS responder.
+    /// Non-zero: librespot serves its zeroconf login endpoint on this TCP port
+    /// with <c>--zeroconf-backend external</c> and the hub announces
+    /// <c>_spotify-connect._tcp</c> instead. Needed where the hub's advertiser
+    /// already holds UDP 5353 and librespot cannot bind beside it; requires
+    /// the librespot build from <c>tools/librespot-external-zeroconf.patch</c>.
+    /// </summary>
+    public int ZeroconfPort { get; set; }
 }

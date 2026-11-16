@@ -1,0 +1,53 @@
+diff --git a/discovery/src/lib.rs b/discovery/src/lib.rs
+index 0eaca82..9f0edd2 100644
+--- a/discovery/src/lib.rs
++++ b/discovery/src/lib.rs
+@@ -89,8 +89,35 @@ pub const BACKENDS: &[(
+     ("libmdns", Some(launch_libmdns)),
+     #[cfg(not(feature = "with-libmdns"))]
+     ("libmdns", None),
++    // Last, so it is never picked as the default.
++    ("external", Some(launch_external)),
+ ];
+ 
++/// No-op backend: only the zeroconf HTTP server runs, and the embedding
++/// application announces `_spotify-connect._tcp` for the port itself. For
++/// hosts where the embedder already owns a working mDNS responder and a second
++/// one in this process cannot come up.
++fn launch_external(
++    name: Cow<'static, str>,
++    _zeroconf_ip: Vec<std::net::IpAddr>,
++    port: u16,
++    _status_tx: mpsc::UnboundedSender<DiscoveryEvent>,
++) -> Result<DnsSdHandle, Error> {
++    let (shutdown_tx, shutdown_rx) = oneshot::channel();
++
++    let task_handle = tokio::spawn(async move {
++        log::info!(
++            "Zeroconf server for '{name}' on port {port}; announcement left to an external mDNS responder"
++        );
++        let _ = shutdown_rx.await;
++    });
++
++    Ok(DnsSdHandle {
++        shutdown_tx,
++        task_handle,
++    })
++}
++
+ pub fn find(name: Option<&str>) -> Result<DnsSdServiceBuilder, Error> {
+     if let Some(ref name) = name {
+         match BACKENDS.iter().find(|(id, _)| name == id) {
+diff --git a/src/main.rs b/src/main.rs
+index bd41519..3371602 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -660,7 +660,7 @@ async fn get_setup() -> Setup {
+     .optopt(
+         ZEROCONF_BACKEND_SHORT,
+         ZEROCONF_BACKEND,
+-        "Zeroconf (MDNS/DNS-SD) backend to use. Valid values are 'avahi', 'dns-sd' and 'libmdns', if librespot is compiled with the corresponding feature flags.",
++        "Zeroconf (MDNS/DNS-SD) backend to use. Valid values are 'avahi', 'dns-sd' and 'libmdns', if librespot is compiled with the corresponding feature flags, and 'external' (announce nothing; the embedder advertises the service).",
+         "BACKEND"
+     ).optmulti(
+         LOCAL_FILE_DIR_SHORT,

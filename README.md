@@ -289,6 +289,10 @@ Edit the `environment:` block to name your speakers; every setting in
 - `AirPlayReceiver:Enabled`, `AirPlayReceiver:Name` — the inbound AirPlay hub.
 - `Spotify:Enabled`, `Spotify:LibrespotPath`, `Spotify:Bitrate`,
   `Spotify:ExtraArgs` (passed through to librespot, e.g. `--volume-ctrl fixed`).
+  `Spotify:ZeroconfPort` (default 0 = librespot runs its own mDNS): set a free
+  TCP port to have the hub announce Spotify Connect instead — needed in the
+  container, where librespot cannot bind UDP 5353 beside the hub's advertiser.
+  Requires the fork build (`tools/librespot-external-zeroconf.patch`).
 - `Wled:Devices[]` — `{ Name, Host, Port, LedCount, Protocol, Mode, Color,
   Brightness, Palette, Decay, Mirror, Reverse, TimeoutSeconds }`: WLED strips
   that light to the music. The

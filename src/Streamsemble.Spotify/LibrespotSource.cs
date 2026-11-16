@@ -112,6 +112,16 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
         psi.ArgumentList.Add(cacheDir);
         psi.ArgumentList.Add("--onevent");
         psi.ArgumentList.Add(eventScriptPath);
+        if (options.ZeroconfPort > 0)
+        {
+            // The hub announces the service (see SpotifyConnectAdvertiser);
+            // librespot only serves the login endpoint the announcement points at.
+            psi.ArgumentList.Add("--zeroconf-port");
+            psi.ArgumentList.Add(options.ZeroconfPort.ToString());
+            psi.ArgumentList.Add("--zeroconf-backend");
+            psi.ArgumentList.Add("external");
+        }
+
         foreach (var arg in (options.ExtraArgs ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries))
         {
             psi.ArgumentList.Add(arg);

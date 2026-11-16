@@ -50,14 +50,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG LIBRESPOT_REPO
 ARG LIBRESPOT_REF
 WORKDIR /build
-COPY tools/librespot-resilience.patch /tmp/librespot-resilience.patch
+# Second patch: an "external" zeroconf backend that runs librespot's login
+# endpoint without an mDNS responder. The hub already holds UDP 5353 for its own
+# advertiser and librespot's libmdns cannot bind beside it ("Address already in
+# use"), so with Spotify__ZeroconfPort set the hub announces Spotify Connect.
+COPY tools/librespot-resilience.patch tools/librespot-external-zeroconf.patch /tmp/
 RUN git clone "$LIBRESPOT_REPO" librespot \
     && git -C librespot checkout --detach "$LIBRESPOT_REF" \
-    && git -C librespot apply --3way /tmp/librespot-resilience.patch
-# with-avahi adds the Avahi zeroconf backend (pure-Rust D-Bus client, no extra
-# libs) next to the default libmdns one; pick it at runtime with
-# `--zeroconf-backend avahi` when the host's avahi-daemon owns UDP 5353.
-RUN cargo build --release --features with-avahi --manifest-path librespot/Cargo.toml \
+    && git -C librespot apply --3way /tmp/librespot-resilience.patch \
+    && git -C librespot apply --3way /tmp/librespot-external-zeroconf.patch
+RUN cargo build --release --manifest-path librespot/Cargo.toml \
     && install -D -m 0755 librespot/target/release/librespot /out/librespot
 
 # Opt-out stage: same COPY shape, empty payload (reuses an image already pulled).

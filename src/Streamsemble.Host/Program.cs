@@ -86,6 +86,7 @@ builder.Services.AddSingleton<IAudioSource>(sp => sp.GetRequiredService<Librespo
 if (builder.Configuration.GetValue("Spotify:Enabled", true))
 {
     builder.Services.AddHostedService<LibrespotSourceService>();
+    builder.Services.AddHostedService<SpotifyConnectAdvertiser>();
 }
 
 if (builder.Configuration.GetValue("Streamsemble:TestTone", false))
