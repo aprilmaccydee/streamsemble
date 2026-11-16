@@ -54,7 +54,10 @@ COPY tools/librespot-resilience.patch /tmp/librespot-resilience.patch
 RUN git clone "$LIBRESPOT_REPO" librespot \
     && git -C librespot checkout --detach "$LIBRESPOT_REF" \
     && git -C librespot apply --3way /tmp/librespot-resilience.patch
-RUN cargo build --release --manifest-path librespot/Cargo.toml \
+# with-avahi adds the Avahi zeroconf backend (pure-Rust D-Bus client, no extra
+# libs) next to the default libmdns one; pick it at runtime with
+# `--zeroconf-backend avahi` when the host's avahi-daemon owns UDP 5353.
+RUN cargo build --release --features with-avahi --manifest-path librespot/Cargo.toml \
     && install -D -m 0755 librespot/target/release/librespot /out/librespot
 
 # Opt-out stage: same COPY shape, empty payload (reuses an image already pulled).

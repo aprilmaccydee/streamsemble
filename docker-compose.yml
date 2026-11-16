@@ -37,6 +37,11 @@ services:
       # HomeKit pairing identity, librespot credentials cache, WAV recordings.
       # Losing this means re-pairing PIN-verified receivers (TVs) and Spotify.
       - streamsemble-data:/data
+      # Host D-Bus, so librespot announces Spotify Connect through the host's
+      # avahi-daemon instead of fighting it for UDP 5353 (pairs with
+      # --zeroconf-backend avahi below). No avahi-daemon on the host? Remove
+      # this line and that flag to go back to librespot's built-in mDNS.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
     environment:
       # --- hub -----------------------------------------------------------
       - Streamsemble__DeviceName=Streamsemble
@@ -52,7 +57,7 @@ services:
       # --- inbound: Spotify Connect --------------------------------------
       - Spotify__Enabled=true
       - Spotify__Bitrate=320
-      - Spotify__ExtraArgs=--volume-ctrl fixed
+      - Spotify__ExtraArgs=--volume-ctrl fixed --zeroconf-backend avahi
       # - Spotify__DeviceName=Streamsemble      # defaults to Streamsemble__DeviceName
 
       # --- outbound: speakers ---------------------------------------------

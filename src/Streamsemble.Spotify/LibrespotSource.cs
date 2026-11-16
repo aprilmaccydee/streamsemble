@@ -132,6 +132,54 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
             {
                 process.Kill(entireProcessTree: true);
             }
+
+            if (Interlocked.Exchange(ref _credentialsRejected, 0) != 0)
+            {
+                DiscardCachedCredentials(cacheDir);
+            }
+        }
+    }
+
+    /// <summary>Set when librespot's stderr reports that Spotify rejected the cached login.</summary>
+    private int _credentialsRejected;
+
+    /// <summary>
+    /// True for the stderr line librespot prints when Spotify refuses the
+    /// stored login (revoked/expired reusable credentials, password change,
+    /// "sign out everywhere"). Not a transient failure: every relaunch with
+    /// the same cache fails identically.
+    /// </summary>
+    internal static bool IsCredentialRejection(string line) =>
+        line.Contains("INVALID_CREDENTIALS", StringComparison.OrdinalIgnoreCase)
+        || line.Contains("BadCredentials", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Moves the rejected credentials.json aside so the next launch has no
+    /// stored login and falls back to zeroconf discovery, where picking the
+    /// device in the Spotify app re-authenticates and rewrites the cache.
+    /// Without this librespot exits at startup on every restart, forever.
+    /// </summary>
+    private void DiscardCachedCredentials(string cacheDir)
+    {
+        var credentials = Path.Combine(cacheDir, "credentials.json");
+        try
+        {
+            if (!File.Exists(credentials))
+            {
+                logger.LogError(
+                    "Spotify rejected librespot's login but {Path} does not exist; check Spotify:ExtraArgs for explicit credentials",
+                    credentials);
+                return;
+            }
+
+            File.Move(credentials, credentials + ".rejected", overwrite: true);
+            logger.LogWarning(
+                "Spotify rejected the cached librespot credentials; moved {Path} aside. Select the device in the Spotify app to sign in again",
+                credentials);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogError(ex, "Could not discard rejected librespot credentials at {Path}; delete it manually", credentials);
         }
     }
 
@@ -226,6 +274,10 @@ public sealed class LibrespotSource(SpotifyOptions options, string defaultDevice
         while (await process.StandardError.ReadLineAsync(ct).ConfigureAwait(false) is { } line)
         {
             logger.LogDebug("librespot: {Line}", line);
+            if (IsCredentialRejection(line))
+            {
+                Interlocked.Exchange(ref _credentialsRejected, 1);
+            }
         }
     }
 
